@@ -80,6 +80,8 @@ async function poll($: any) {
     }
     if (!me) return
     const tries = { ...((((await read($, triesRef)) as Record<string, number> | undefined) ?? {})) }
+    const active = list.filter(l => l.owner_session === me && (l.status === 'running' || l.status === 'retry_wait')).length
+    $.ui.status(active > 0 ? `muse: ${active} running` : undefined)
 
     for (const l of list) {
       if (l.owner_session !== me) continue

@@ -312,6 +312,35 @@ test('two overlapping polls submit a lane once', async ($, on) => {
   expectStateShape(world)
 })
 
+test('status line shows owned running lanes and clears', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+  expect(world.statuses.at(-1)).toBe(undefined)
+
+  world.lanes.push(
+    { id: 'lane-4', label: 'delta', status: 'running', owner: ME, announced: false, orphanAnnounced: false },
+    { id: 'lane-5', label: 'echo', status: 'retry_wait', owner: ME, announced: false, orphanAnnounced: false },
+    { id: 'lane-6', label: 'foxtrot', status: 'running', owner: OTHER, announced: false, orphanAnnounced: false },
+    { id: 'lane-7', label: 'golf', status: 'queued', owner: ME, announced: false, orphanAnnounced: false },
+  )
+  await pollOnce($, clock)
+  expect(world.statuses.at(-1)).toBe('muse: 2 running')
+
+  world.lanes[0]!.status = 'done'
+  world.lanes[0]!.summary = 'delta summary'
+  await pollOnce($, clock)
+  expect(world.statuses.at(-1)).toBe('muse: 1 running')
+
+  world.lanes[1]!.status = 'done'
+  world.lanes[1]!.summary = 'echo summary'
+  await pollOnce($, clock)
+  expect(world.statuses.at(-1)).toBe(undefined)
+  expect(world.submits).toHaveLength(2)
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(2)
+  expectStateShape(world)
+})
+
 test('lane_start writes a unique brief path per inline prompt', async ($, on) => {
   const { world, clock } = setup(on)
   await begin($, clock)
