@@ -1,0 +1,25 @@
+{
+  "name": "muse",
+  "version": "0.1.0",
+  "description": "Run Muse lanes (headless muse exec, chained briefs, acceptance) under a supervisor that survives outages and stalls; one panel, one wake-up per finished lane.",
+  "userConfig": {
+    "envFile": {
+      "type": "string",
+      "title": "Env file with META_API_KEY",
+      "description": "Optional. A dotenv file whose values (e.g. META_API_KEY) are passed to muse exec; its values are redacted from every lane file and never logged.",
+      "default": ""
+    }
+  },
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "alexanderradahl"
+  },
+  "license": "MIT",
+  "keywords": [
+    "muse",
+    "agents",
+    "supervisor",
+    "background",
+    "workflow"
+  ]
+}

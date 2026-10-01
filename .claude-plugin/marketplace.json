@@ -1,0 +1,14 @@
+{
+  "name": "muse-lanes",
+  "owner": {
+    "name": "alexanderradahl"
+  },
+  "description": "The muse plugin: run Meta Muse CLI agents as supervised background lanes from Claude Code.",
+  "plugins": [
+    {
+      "name": "muse",
+      "source": "./",
+      "description": "Supervised Muse lanes for Claude Code: background muse exec runs with retries, stall detection, acceptance checks, a panel, and one wake-up per finished lane."
+    }
+  ]
+}

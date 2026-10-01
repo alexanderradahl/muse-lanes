@@ -1,0 +1,2787 @@
+#!/usr/bin/env python3
+"""muse-lane: supervisor for long headless Muse runs.
+
+One lane = one or more briefs run in sequence in one cwd, with retries,
+stall detection, optional acceptance command, and a summary.
+Stdlib only.
+"""
+import argparse
+import datetime
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+TERMINAL = {"done", "failed", "gave_up", "stopped"}
+NON_TERMINAL = {"queued", "running", "retry_wait", "accepting"}
+
+DEFAULT_POLL_SEC = 15.0
+DEFAULT_BACKOFF = [120.0, 300.0, 600.0, 1200.0, 1800.0, 1800.0]
+MAX_ATTEMPTS = 6
+ACCEPT_TIMEOUT_SEC = 2 * 3600
+LOCK_NAME = "supervisor.lock"
+STOP_MARKER = "stop.requested"
+ANNOUNCE_MARKER = "announced"
+ORPHAN_MARKER_PREFIX = "announced-orphan-"
+MIN_SECRET_LEN = 12
+QUEUED_ORPHAN_AFTER_SEC = 30.0
+LOCK_RETRY_SEC = 2.0
+ACK_EXISTS_EXIT = 3
+CLASSIFY_TAIL_LINES = 40
+
+
+def lanes_root():
+    p = os.environ.get("MUSE_LANES_ROOT") or os.path.expanduser("~/.muse-lanes")
+    return os.path.abspath(os.path.expanduser(p))
+
+
+def lane_dir(lane_id):
+    return os.path.join(lanes_root(), lane_id)
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def is_alive(pid):
+    if pid is None:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def slugify(label):
+    s = (label or "").lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    if not s:
+        return "lane"
+    s = s[:32].strip("-")
+    return s or "lane"
+
+
+def default_lane_id(label):
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return "%s-%s" % (ts, slugify(label) if label else "lane")
+
+
+def _chmod_0600(path):
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _ensure_lane_perms(ldir):
+    try:
+        os.chmod(ldir, 0o700)
+    except OSError:
+        pass
+
+
+def atomic_write_bytes(path, data):
+    d = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    tmp = "%s.tmp.%d.%d" % (path, os.getpid(), time.time_ns())
+    with open(tmp, "wb") as f:
+        f.write(data)
+    _chmod_0600(tmp)
+    os.replace(tmp, path)
+    _chmod_0600(path)
+
+
+def atomic_write_text(path, text):
+    if not isinstance(text, str):
+        text = str(text)
+    atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def atomic_write_json(path, obj):
+    atomic_write_text(path, json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+
+
+def load_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return json.load(f)
+    except (FileNotFoundError, OSError, ValueError):
+        return default
+
+
+def parse_env_file(path):
+    env = {}
+    if not path:
+        return env
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export") and (len(line) > 6 and line[6] in (" ", "\t")):
+                    line = line[6:].lstrip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if not k:
+                    continue
+                if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+                    v = v[1:-1]
+                env[k] = v
+    except (FileNotFoundError, OSError):
+        return {}
+    return env
+
+
+def secrets_from_env_file(env_file):
+    if not env_file:
+        return []
+    d = parse_env_file(env_file)
+    vals = [v for v in d.values() if v and len(v) >= MIN_SECRET_LEN]
+    vals.sort(key=len, reverse=True)
+    return vals
+
+
+def union_secrets(a, b):
+    merged = set(a or []) | set(b or [])
+    vals = [v for v in merged if v and len(v) >= MIN_SECRET_LEN]
+    vals.sort(key=len, reverse=True)
+    return vals
+
+
+def redact_text(text, secrets):
+    if not text or not secrets:
+        return text
+    if not isinstance(text, str):
+        text = str(text)
+    for s in secrets:
+        if not s or len(s) < MIN_SECRET_LEN:
+            continue
+        if s in text:
+            text = text.replace(s, "***")
+    return text
+
+
+def redact_json_value(obj, secrets):
+    if not secrets:
+        return obj
+    if isinstance(obj, str):
+        return redact_text(obj, secrets)
+    if isinstance(obj, list):
+        return [redact_json_value(v, secrets) for v in obj]
+    if isinstance(obj, dict):
+        return {k: redact_json_value(v, secrets) for k, v in obj.items()}
+    return obj
+
+
+def _redact_json_file(path, secrets):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (FileNotFoundError, OSError):
+        return
+    if not content.strip():
+        return
+    try:
+        obj = json.loads(content)
+    except ValueError:
+        red = redact_text(content, secrets)
+        if red != content:
+            try:
+                atomic_write_text(path, red)
+            except OSError:
+                pass
+        return
+    red_obj = redact_json_value(obj, secrets)
+    try:
+        atomic_write_text(path, json.dumps(red_obj, indent=2, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _redact_jsonl_file(path, secrets):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except (FileNotFoundError, OSError):
+        return
+    out = []
+    changed = False
+    for line in lines:
+        s = line.strip()
+        if not s:
+            out.append(line)
+            continue
+        try:
+            obj = json.loads(s)
+        except ValueError:
+            red = redact_text(line, secrets)
+            if red != line:
+                changed = True
+            out.append(red)
+            continue
+        red_obj = redact_json_value(obj, secrets)
+        dumped = json.dumps(red_obj, ensure_ascii=False)
+        if dumped != line:
+            # JSON dump normalises whitespace; only flag changed when the
+            # redacted value differs semantically.
+            if red_obj != obj:
+                changed = True
+        out.append(dumped)
+    if changed:
+        try:
+            atomic_write_text(path, "\n".join(out) + ("\n" if out else ""))
+        except OSError:
+            pass
+
+
+def redact_file_inplace(path, secrets):
+    if not secrets:
+        return
+    base = os.path.basename(path)
+    if base.endswith(".json"):
+        _redact_json_file(path, secrets)
+        return
+    if base.endswith(".jsonl"):
+        _redact_jsonl_file(path, secrets)
+        return
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (FileNotFoundError, OSError):
+        return
+    red = redact_text(content, secrets)
+    if red != content:
+        try:
+            atomic_write_text(path, red)
+        except OSError:
+            pass
+
+
+def redact_sweep_ldir(ldir, secrets):
+    """Redact every lane file in place, except briefs and lane.json."""
+    if not secrets:
+        return
+    try:
+        names = os.listdir(ldir)
+    except OSError:
+        return
+    for fname in names:
+        if fname.startswith("brief"):
+            continue
+        if fname in ("lane.json",):
+            continue
+        fp = os.path.join(ldir, fname)
+        if not os.path.isfile(fp):
+            continue
+        redact_file_inplace(fp, secrets)
+
+
+def lock_path_for_lane(ldir):
+    return os.path.join(ldir, LOCK_NAME)
+
+
+def supervisor_alive(ldir):
+    """True when a supervisor currently holds the lane's flock."""
+    lp = lock_path_for_lane(ldir)
+    try:
+        fd = os.open(lp, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as e:
+            if isinstance(e, OSError) and e.errno not in (errno.EACCES, errno.EAGAIN):
+                return False
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def wait_for_supervisor_lock(ldir, timeout_sec=10.0):
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while time.monotonic() < deadline:
+        if supervisor_alive(ldir):
+            return True
+        time.sleep(0.1)
+    return supervisor_alive(ldir)
+
+
+def _ps_env():
+    e = dict(os.environ)
+    e["LC_ALL"] = "C"
+    e["LANG"] = "C"
+    return e
+
+
+def _norm_start_time(s):
+    """Normalise a start-time string to one canonical format.
+
+    Applied to ps output and to every fallback, so values recorded by one
+    path compare equal with values re-read by another.
+    """
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        try:
+            s = str(s)
+        except Exception:
+            return None
+    s = " ".join(s.split())
+    return s or None
+
+
+def _start_time_fallback(pid):
+    """Process start time without exec, for sandboxes where ps is blocked."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    # Linux: /proc/<pid>/stat field 22 (starttime, clock ticks since boot).
+    try:
+        with open("/proc/%d/stat" % pid, "r") as f:
+            stat_s = f.read()
+        rparen = stat_s.rfind(")")
+        if rparen != -1:
+            fields = stat_s[rparen + 2:].split()
+            if len(fields) >= 20:
+                return "proc:%s" % fields[19]
+    except (FileNotFoundError, OSError, IndexError):
+        pass
+    except Exception:
+        pass
+    # macOS: proc_pidinfo(PROC_PIDTBSDINFO).pbi_start (no exec).
+    try:
+        import ctypes
+
+        class _BSDInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        try:
+            _libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        except OSError:
+            return None
+        info = _BSDInfo()
+        ret = _libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info),
+                                    ctypes.sizeof(info))
+        if ret != ctypes.sizeof(info) or int(info.pbi_pid) != pid:
+            return None
+        return "libproc:%d.%06d" % (int(info.pbi_start_tvsec),
+                                    int(info.pbi_start_tvusec))
+    except Exception:
+        return None
+
+
+def get_start_time(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        r = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            text=True,
+            env=_ps_env(),
+        )
+    except (PermissionError, FileNotFoundError, OSError):
+        return _norm_start_time(_start_time_fallback(pid))
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    s = (r.stdout or "").strip()
+    if s:
+        return _norm_start_time(s)
+    # ps ran but told us nothing (e.g. sandboxed stub): try fallback.
+    return _norm_start_time(_start_time_fallback(pid))
+
+
+def pid_is_ours(pid, started):
+    if pid is None or not started:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    cur = get_start_time(pid)
+    if cur is None:
+        return False
+    return cur == started
+
+
+def pid_unverifiable_but_alive(pid, started):
+    """True when pid is alive but cannot be checked against `started`.
+
+    That is: the pid is alive and either no start time was recorded or no
+    start time can currently be read for it. A live pid whose start time
+    reads fine but differs is verifiably NOT ours (False here): pid reuse,
+    safe to leave alone.
+    """
+    if pid is None:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if not is_alive(pid):
+        return False
+    if not started:
+        return True
+    return get_start_time(pid) is None
+
+
+def _wait_pid_gone(pid, timeout_sec=10.0):
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while time.monotonic() < deadline:
+        if not is_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not is_alive(pid)
+
+
+def kill_verified_group(pid, started, timeout_sec=10.0):
+    """SIGTERM then SIGKILL a pid/pgid only when its start time matches."""
+    if not pid_is_ours(pid, started):
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    if _wait_pid_gone(pid, timeout_sec=min(5.0, timeout_sec)):
+        return True
+    if not pid_is_ours(pid, started):
+        return True
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    _wait_pid_gone(pid, timeout_sec=timeout_sec)
+    return True
+
+
+def _git(args, cwd, timeout=10):
+    try:
+        r = subprocess.run(
+            ["git", "--no-optional-locks"] + list(args),
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            text=True,
+        )
+        return r
+    except Exception:
+        return None
+
+
+def get_git_head(cwd):
+    r = _git(["rev-parse", "HEAD"], cwd)
+    if r is None or r.returncode != 0:
+        return None
+    h = (r.stdout or "").strip()
+    return h or None
+
+
+def get_git_status_output(cwd):
+    r = _git(["status", "--porcelain"], cwd)
+    if r is None or r.returncode != 0:
+        return None
+    return r.stdout or ""
+
+
+def get_git_status_hash(cwd):
+    out = get_git_status_output(cwd)
+    if out is None:
+        return None
+    return hashlib.sha1(out.encode("utf-8")).hexdigest()
+
+
+def get_fingerprint(cwd):
+    head = get_git_head(cwd)
+    if head is None:
+        r = _git(["rev-parse", "--git-dir"], cwd)
+        if r is None or r.returncode != 0:
+            return None
+        sh = get_git_status_hash(cwd) or "nostatus"
+        return "nohead:%s" % sh
+    sh = get_git_status_hash(cwd)
+    if sh is None:
+        return head
+    return "%s:%s" % (head, sh)
+
+
+def get_commits_count(cwd, head_start, head):
+    if not head_start or not head or head_start == head:
+        return 0
+    r = _git(["rev-list", "--count", "%s..%s" % (head_start, head)], cwd)
+    if r is None or r.returncode != 0:
+        return 0
+    try:
+        return int((r.stdout or "0").strip() or "0")
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_commit_log(cwd, head_start, head, max_lines=40):
+    if head_start and head and head_start != head:
+        r = _git(["log", "--oneline", "%s..%s" % (head_start, head)], cwd)
+    elif head and not head_start:
+        r = _git(["log", "--oneline", "-n", str(max_lines)], cwd)
+    else:
+        return ""
+    if r is None or r.returncode != 0:
+        return ""
+    lines = (r.stdout or "").strip().splitlines()
+    return "\n".join(lines[:max_lines])
+
+
+def _parse_porcelain_paths(status_output):
+    paths = []
+    if not status_output:
+        return paths
+    for line in status_output.splitlines():
+        if len(line) < 4:
+            continue
+        rest = line[3:]
+        if " -> " in rest:
+            rest = rest.split(" -> ", 1)[1]
+        rest = rest.strip().strip('"')
+        if rest:
+            paths.append(rest)
+    return paths
+
+
+def get_dirty_file_stats(cwd, status_output):
+    stats = {}
+    if not cwd or not os.path.isdir(cwd):
+        return stats
+    for rel in _parse_porcelain_paths(status_output):
+        ap = os.path.join(cwd, rel)
+        try:
+            st = os.stat(ap)
+        except OSError:
+            continue
+        try:
+            stats[rel] = (st.st_mtime_ns, st.st_size)
+        except AttributeError:
+            stats[rel] = (int(getattr(st, "st_mtime", 0) * 1e9), st.st_size)
+    return stats
+
+
+def _parse_ps_time_to_sec(s):
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        days = 0
+        if "-" in s:
+            dpart, s = s.split("-", 1)
+            days = int(dpart.strip() or 0)
+        parts = s.split(":")
+        nums = []
+        for p in parts:
+            p = p.strip()
+            if not p:
+                nums.append(0.0)
+                continue
+            try:
+                nums.append(float(p))
+            except ValueError:
+                return None
+        total = 0.0
+        mult = 1.0
+        for n in reversed(nums):
+            total += n * mult
+            mult *= 60.0
+        total += days * 86400.0
+        return total
+    except Exception:
+        return None
+
+
+def get_tree_cpu_total(muse_pid):
+    """Total CPU seconds for the muse process group and its descendants.
+
+    Walks pid/ppid/pgid/time from muse_pid down, so a child that setsid()s
+    out of the group (e.g. a Unity batch run) still counts as activity.
+    """
+    try:
+        muse_pid = int(muse_pid)
+    except (TypeError, ValueError):
+        return None
+    if muse_pid <= 0:
+        return None
+    try:
+        r = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,time="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            text=True,
+            env=_ps_env(),
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    rows = []
+    children = {}
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            pgid = int(parts[2])
+        except ValueError:
+            continue
+        sec = _parse_ps_time_to_sec(parts[3])
+        rows.append((pid, ppid, pgid, sec))
+        children.setdefault(ppid, []).append(pid)
+    seen = {muse_pid}
+    stack = [muse_pid]
+    while stack:
+        p = stack.pop()
+        for c in children.get(p, []):
+            if c not in seen:
+                seen.add(c)
+                stack.append(c)
+    total = 0.0
+    found = False
+    for pid, _ppid, pgid, sec in rows:
+        if sec is None:
+            continue
+        if pgid != muse_pid and pid not in seen:
+            continue
+        found = True
+        total += sec
+    if not found:
+        return 0.0
+    return total
+
+
+def get_activity_snapshot(cwd, muse_pid):
+    snap = {}
+    try:
+        snap["head"] = get_git_head(cwd) if cwd and os.path.isdir(cwd) else None
+    except Exception:
+        snap["head"] = None
+    try:
+        out = get_git_status_output(cwd) if cwd and os.path.isdir(cwd) else None
+    except Exception:
+        out = None
+    snap["status"] = out
+    try:
+        snap["dirty"] = get_dirty_file_stats(cwd, out) if out is not None else {}
+    except Exception:
+        snap["dirty"] = {}
+    try:
+        snap["cpu"] = get_tree_cpu_total(muse_pid) if muse_pid else None
+    except Exception:
+        snap["cpu"] = None
+    return snap
+
+
+def read_tail_filtered(err_path, max_lines=20):
+    try:
+        with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except (FileNotFoundError, OSError):
+        return []
+    out = []
+    for ln in lines:
+        if "skill omitted" in ln or "was trimmed to fit" in ln:
+            continue
+        out.append(ln)
+    return out[-max_lines:]
+
+
+def read_last_json_info(jsonl_path):
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (FileNotFoundError, OSError):
+        return (None, None)
+    last_type = None
+    last_obj = None
+    for line in content.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except Exception:
+            continue
+        last_obj = obj
+        if isinstance(obj, dict):
+            pt = obj.get("payload_type")
+            if isinstance(pt, str):
+                last_type = pt
+    return (last_type, last_obj)
+
+
+def _is_run_terminal_event(obj):
+    if not isinstance(obj, dict):
+        return False
+    pt = obj.get("payload_type")
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    kind = payload.get("kind")
+    if kind == "run_terminal":
+        return True
+    if isinstance(pt, str) and pt.startswith("run.terminal."):
+        return True
+    return False
+
+
+def get_terminal_verdict(jsonl_path):
+    """Scan the whole JSONL; last run_terminal event wins.
+
+    Returns dict with terminal/text/reason/has_event. Accepts both the real
+    1.4.2 shape (payload.kind == "run_terminal") and the older fake shape
+    (payload_type run.terminal.* with terminal/text but no kind).
+    """
+    verdict = {"terminal": None, "text": "", "reason": "", "has_event": False,
+               "payload_type": None}
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (FileNotFoundError, OSError):
+        return verdict
+    for line in content.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except Exception:
+            continue
+        if not _is_run_terminal_event(obj):
+            continue
+        payload = obj.get("payload") or {}
+        term = payload.get("terminal")
+        if not isinstance(term, str) or not term:
+            # Derive from payload_type suffix when terminal missing.
+            pt = obj.get("payload_type")
+            if isinstance(pt, str) and pt.startswith("run.terminal."):
+                term = pt.split(".")[-1]
+            else:
+                continue
+        text = payload.get("text", "")
+        if not isinstance(text, str):
+            try:
+                text = str(text)
+            except Exception:
+                text = ""
+        reason = payload.get("reason", "") or payload.get("error", "") or payload.get("message", "") or ""
+        if not isinstance(reason, str):
+            try:
+                reason = str(reason)
+            except Exception:
+                reason = ""
+        verdict = {"terminal": term, "text": text, "reason": reason,
+                   "has_event": True, "payload_type": obj.get("payload_type")}
+    return verdict
+
+
+def check_completion(jsonl_path):
+    v = get_terminal_verdict(jsonl_path)
+    if v.get("has_event") and v.get("terminal") == "completed":
+        return (True, v.get("text") or "")
+    return (False, None)
+
+
+# Auth needs real HTTP/auth context: a bare 401/403 digit run (a SHA, a row
+# count, a test name) or a path containing "Authentication" must not match.
+_AUTH_RES = [
+    re.compile(r"\b(?:HTTP|status)[^\n]{0,20}\b40[13]\b", re.IGNORECASE),
+    re.compile(r"\b401 Unauthorized\b", re.IGNORECASE),
+    re.compile(r"\b403 Forbidden\b", re.IGNORECASE),
+    re.compile(r"invalid\s+api\s+key", re.IGNORECASE),
+    re.compile(r"authentication failed", re.IGNORECASE),
+    re.compile(r"not authenticated", re.IGNORECASE),
+    re.compile(r"\bunauthorized\b", re.IGNORECASE),
+]
+_RETRY_HTTP_RE = re.compile(r"\b429\b|\b(?:HTTP|status)[^\n]{0,20}\b5\d\d\b",
+                            re.IGNORECASE)
+# Network words as whole words only; bare "eof" (a SHA fragment, "end of
+# file" prose) must not match — only "unexpected eof".
+_NETWORK_RE = re.compile(
+    r"\bnetwork\b|\bconnections?\b|\bconnect\b|\beconn\w*\b|\betimedout\b|"
+    r"\benotfound\b|\bgetaddrinfo\b|\beai_again\b|\bsockets?\b|\bdns\b|"
+    r"\btls\b|\bssl\b|\bbroken pipe\b|\breset by peer\b|\bunexpected eof\b",
+    re.IGNORECASE,
+)
+
+
+def _mentions_auth(text):
+    if not text:
+        return False
+    return any(rx.search(text) for rx in _AUTH_RES)
+
+
+def _mentions_retry_http(text):
+    if not text:
+        return False
+    return bool(_RETRY_HTTP_RE.search(text))
+
+
+def _mentions_network(text):
+    if not text:
+        return False
+    return bool(_NETWORK_RE.search(text))
+
+
+def _stderr_tail(stderr_text, max_lines=CLASSIFY_TAIL_LINES):
+    return "\n".join((stderr_text or "").splitlines()[-max_lines:])
+
+
+def classify_failure(terminal, reason_text, stderr_text, exit_code, stalled=False,
+                     spawn_failed=False):
+    """Return (cls, reason) with cls in {"fatal","retryable","once"}.
+
+    Order: spawn failure, stalled, terminal interrupted/timed_out, auth,
+    rate/5xx, network, model failed/cancelled, other. Only the terminal
+    reason plus the last 40 stderr lines are matched, never the full file.
+    For model failed/cancelled, rate/network context counts only when it is
+    in the terminal reason itself.
+    """
+    reason = reason_text or ""
+    tail = _stderr_tail(stderr_text)
+    blob = "\n".join([t for t in (reason, tail) if t])
+    if spawn_failed:
+        return ("fatal", reason.strip() or "spawn failed")
+    if stalled:
+        return ("retryable", "stalled")
+    if terminal in ("interrupted", "timed_out"):
+        return ("retryable", reason.strip() or terminal)
+    if _mentions_auth(blob):
+        base = reason.strip()
+        if not base:
+            # Keep the first matching tail line as the reason.
+            for ln in tail.splitlines():
+                if _mentions_auth(ln):
+                    base = ln.strip()[:300]
+                    break
+            base = base or "auth failure"
+        return ("fatal", base)
+    if terminal in ("failed", "cancelled"):
+        if _mentions_retry_http(reason) or _mentions_network(reason):
+            return ("retryable", reason.strip() or terminal)
+        return ("once", reason.strip() or terminal)
+    if _mentions_retry_http(blob) or _mentions_network(blob):
+        base = reason.strip()
+        if not base:
+            for ln in tail.splitlines():
+                if _mentions_retry_http(ln) or _mentions_network(ln):
+                    base = ln.strip()[:300]
+                    break
+            base = base or (terminal or "transient error")
+        return ("retryable", base)
+    if exit_code is not None and exit_code != 0 and not terminal:
+        base = reason.strip() or ("exit %s" % exit_code)
+        return ("retryable", base)
+    if terminal in ("failed", "cancelled"):
+        return ("once", reason.strip() or terminal)
+    base = reason.strip() or (terminal or ("exit %s" % exit_code if exit_code is not None else "failed"))
+    return ("once", base)
+
+
+def load_lane(lane_id):
+    lp = os.path.join(lane_dir(lane_id), "lane.json")
+    return load_json(lp, None)
+
+
+def load_state(lane_id):
+    sp = os.path.join(lane_dir(lane_id), "state.json")
+    return load_json(sp, None)
+
+
+def _iso_age_sec(ts):
+    """Seconds since an ISO timestamp, or None when unparseable."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(ts))
+    except (TypeError, ValueError):
+        return None
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (now - dt).total_seconds()
+    except Exception:
+        return None
+
+
+def display_status(stored_status, supervisor_pid=None, lane_id=None, ldir=None,
+                   state=None, lane=None):
+    if stored_status not in NON_TERMINAL:
+        return stored_status
+    if ldir is None and lane_id is not None:
+        ldir = lane_dir(lane_id)
+    # Liveness by lock, not pid. A fresh queued lane with no supervisor yet
+    # is still queued; one older than 30 s with no lock held is orphaned.
+    if stored_status == "queued":
+        if ldir is None:
+            return "queued"
+        try:
+            alive = supervisor_alive(ldir)
+        except Exception:
+            return "queued"
+        if alive:
+            return "queued"
+        st = state
+        if st is None:
+            st = load_json(os.path.join(ldir, "state.json"), {}) or {}
+        ln = lane
+        if ln is None and lane_id is not None:
+            ln = load_lane(lane_id) or {}
+        elif ln is None:
+            ln = {}
+        ts = (st or {}).get("started_at") or (ln or {}).get("created_at")
+        age = _iso_age_sec(ts)
+        if age is not None and age > QUEUED_ORPHAN_AFTER_SEC:
+            return "orphaned"
+        return "queued"
+    if ldir is not None:
+        try:
+            alive = supervisor_alive(ldir)
+        except Exception:
+            alive = is_alive(supervisor_pid)
+        if not alive:
+            return "orphaned"
+        return stored_status
+    if not is_alive(supervisor_pid):
+        return "orphaned"
+    return stored_status
+
+
+def _sanitize_marker_part(s):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(s))
+
+
+def orphan_marker_name(state):
+    """Marker name for the supervisor incarnation recorded in state."""
+    st = state or {}
+    pid = st.get("supervisor_pid")
+    started = st.get("supervisor_started")
+    p = str(pid) if pid is not None else "none"
+    s = _sanitize_marker_part(started) if started else "none"
+    return "%s%s-%s" % (ORPHAN_MARKER_PREFIX, p, s)
+
+
+def is_announced(ldir):
+    return os.path.exists(os.path.join(ldir, ANNOUNCE_MARKER))
+
+
+def is_orphan_announced(ldir, state):
+    return os.path.exists(os.path.join(ldir, orphan_marker_name(state)))
+
+
+def list_lane_ids_newest_first():
+    root = lanes_root()
+    try:
+        names = os.listdir(root)
+    except FileNotFoundError:
+        return []
+    infos = []
+    for n in names:
+        d = os.path.join(root, n)
+        if not os.path.isdir(d):
+            continue
+        lane = load_json(os.path.join(d, "lane.json"), None)
+        if lane is None:
+            continue
+        created = lane.get("created_at") or ""
+        infos.append((created, n))
+    infos.sort(key=lambda t: t[0], reverse=True)
+    return [n for _, n in infos]
+
+
+def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
+                     extra_secrets=None):
+    lane = load_json(os.path.join(ldir, "lane.json"), {}) or {}
+    history = load_json(os.path.join(ldir, "history.json"), {}) or {}
+    state = load_json(os.path.join(ldir, "state.json"), {}) or {}
+    if isinstance(final_state, dict):
+        merged = dict(state)
+        merged.update(final_state)
+        state = merged
+    secrets = union_secrets(secrets_from_env_file(lane.get("env_file")),
+                            extra_secrets)
+    steps = len(lane.get("briefs") or [])
+    started_at = state.get("started_at") or lane.get("created_at") or (ended_at or now_iso())
+    if ended_at is None:
+        ended_at = now_iso()
+    wall_str = "unknown"
+    try:
+        s = datetime.datetime.fromisoformat(str(started_at))
+        e = datetime.datetime.fromisoformat(str(ended_at))
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=datetime.timezone.utc)
+        if e.tzinfo is None:
+            e = e.replace(tzinfo=datetime.timezone.utc)
+        wall = (e - s).total_seconds()
+        if wall < 0:
+            wall = 0
+        if wall < 120:
+            wall_str = "%.1fs" % wall
+        elif wall < 3600:
+            wall_str = "%dm %.0fs" % (int(wall // 60), wall % 60)
+        else:
+            wall_str = "%dh %dm" % (int(wall // 3600), int((wall % 3600) // 60))
+    except Exception:
+        pass
+    cwd = lane.get("cwd") or ""
+    head_start = state.get("head_start")
+    try:
+        head = get_git_head(cwd) if cwd and os.path.isdir(cwd) else state.get("head")
+    except Exception:
+        head = state.get("head")
+    if head is None:
+        head = state.get("head")
+    try:
+        commits = get_commits_count(cwd, head_start, head) if cwd and os.path.isdir(cwd) else int(state.get("commits") or 0)
+    except Exception:
+        commits = int(state.get("commits") or 0)
+    try:
+        clog = get_commit_log(cwd, head_start, head, 40) if cwd and os.path.isdir(cwd) else ""
+    except Exception:
+        clog = ""
+    accept_cmd = lane.get("accept")
+    accept_exit = state.get("accept_exit")
+    lines = []
+    lines.append("# Lane %s (%s)" % (lane.get("label") or "", lane.get("id") or os.path.basename(ldir)))
+    lines.append("")
+    lines.append("Status: %s" % final_status)
+    lines.append("ID: %s" % (lane.get("id") or os.path.basename(ldir)))
+    lines.append("Label: %s" % (lane.get("label") or ""))
+    lines.append("Started: %s" % started_at)
+    lines.append("Ended: %s" % ended_at)
+    lines.append("Wall time: %s" % wall_str)
+    lines.append("Cwd: %s" % cwd)
+    lines.append("")
+    lines.append("## Attempts")
+    if steps <= 0:
+        lines.append("(no steps)")
+    for k in range(1, steps + 1):
+        h = history.get(str(k)) or history.get(k) or []
+        if not h:
+            fp = os.path.join(ldir, "step%d-final.md" % k)
+            if os.path.exists(fp):
+                lines.append("- Step %d: 1 attempt(s) (attempt 1: ok)" % k)
+            else:
+                lines.append("- Step %d: 0 attempt(s) (not run)" % k)
+            continue
+        parts = []
+        for e in h:
+            try:
+                n = int(e.get("attempt", "?"))
+            except Exception:
+                n = "?"
+            if e.get("ok"):
+                parts.append("attempt %s: ok" % n)
+            else:
+                xc = e.get("exit")
+                term = e.get("terminal")
+                cls = e.get("class")
+                rsn = e.get("reason") or "failed"
+                parts.append("attempt %s: exit %s terminal %s class %s %s" % (
+                    n, xc if xc is not None else "?", term or "none",
+                    cls or "?", rsn))
+        lines.append("- Step %d: %d attempt(s) (%s)" % (k, len(h), "; ".join(parts)))
+        for e in h:
+            try:
+                n = int(e.get("attempt", "?"))
+            except Exception:
+                n = "?"
+            xc = e.get("exit")
+            term = e.get("terminal")
+            cls = e.get("class")
+            rsn = e.get("reason") or ("ok" if e.get("ok") else "failed")
+            lines.append("  - step %d attempt %s: exit=%s terminal=%s class=%s reason=%s" % (
+                k, n, xc if xc is not None else "-", term or "-",
+                cls or ("ok" if e.get("ok") else "-"), rsn))
+    # Last 15 redacted stderr lines of the final attempt.
+    try:
+        fk, fn = None, None
+        for k in range(steps, 0, -1):
+            h = history.get(str(k)) or history.get(k) or []
+            if h:
+                try:
+                    fn = int(h[-1].get("attempt", len(h)))
+                except Exception:
+                    fn = len(h)
+                fk = k
+                break
+        if fk is not None and fn is not None:
+            ferr = os.path.join(ldir, "step%d-attempt%d.err" % (fk, fn))
+            try:
+                with open(ferr, "r", encoding="utf-8", errors="replace") as f:
+                    err_lines = f.read().splitlines()
+                tail15 = err_lines[-15:]
+            except (FileNotFoundError, OSError):
+                tail15 = []
+            lines.append("")
+            lines.append("## Final stderr (step %d attempt %d, last %d)" % (fk, fn, len(tail15)))
+            if tail15:
+                lines.append("```")
+                lines.extend(tail15)
+                lines.append("```")
+            else:
+                lines.append("(none)")
+    except Exception:
+        pass
+    lines.append("")
+    lines.append("## Commits (%d)" % commits)
+    lines.append("head_start: %s" % (head_start or "(none)"))
+    lines.append("head: %s" % (head or "(none)"))
+    if clog:
+        lines.append("```")
+        for ln in clog.splitlines()[:40]:
+            lines.append(ln)
+        lines.append("```")
+    else:
+        lines.append("(none)")
+    lines.append("")
+    lines.append("## Acceptance")
+    if accept_cmd:
+        lines.append("Command: %s" % accept_cmd)
+        lines.append("Exit: %s" % (accept_exit if accept_exit is not None else "(none)"))
+        try:
+            with open(os.path.join(ldir, "accept.log"), "r", encoding="utf-8", errors="replace") as f:
+                alog = f.read().splitlines()
+            tail = alog[-20:]
+        except (FileNotFoundError, OSError):
+            tail = []
+        if tail:
+            lines.append("Last %d line(s):" % len(tail))
+            lines.append("```")
+            lines.extend(tail)
+            lines.append("```")
+        else:
+            lines.append("(no output)")
+    else:
+        lines.append("(none)")
+    lines.append("")
+    for k in range(1, steps + 1):
+        lines.append("## Step %d final" % k)
+        try:
+            with open(os.path.join(ldir, "step%d-final.md" % k), "r", encoding="utf-8", errors="replace") as f:
+                final = f.read()
+        except (FileNotFoundError, OSError):
+            final = "(no final)"
+        final = (final or "").rstrip()
+        lines.append(final if final else "(empty)")
+        lines.append("")
+    text = "\n".join(lines)
+    text = redact_text(text, secrets)
+    atomic_write_text(os.path.join(ldir, "summary.md"), text if text.endswith("\n") else text + "\n")
+    return text
+
+
+def spawn_supervisor(lane_id):
+    ldir = lane_dir(lane_id)
+    log_path = os.path.join(ldir, "supervisor.log")
+    try:
+        os.makedirs(ldir, exist_ok=True)
+        _ensure_lane_perms(ldir)
+        logf = open(log_path, "ab")
+        try:
+            os.fchmod(logf.fileno(), 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        print("muse-lane: cannot open supervisor.log: %s" % e, file=sys.stderr)
+        return None
+    try:
+        p = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "_run", lane_id],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+    except Exception as e:
+        try:
+            logf.close()
+        except Exception:
+            pass
+        print("muse-lane: failed to start supervisor: %s" % e, file=sys.stderr)
+        return None
+    # Parent must not hold the log fd; child has its own dup.
+    try:
+        logf.close()
+    except Exception:
+        pass
+    return p.pid
+
+
+def cmd_start(args):
+    cwd = os.path.abspath(os.path.expanduser(args.cwd))
+    if not os.path.isdir(cwd):
+        print("muse-lane: --cwd does not exist or is not a directory: %s" % args.cwd, file=sys.stderr)
+        return 1
+    briefs = args.briefs or []
+    if not briefs:
+        print("muse-lane: at least one --brief is required", file=sys.stderr)
+        return 1
+    for b in briefs:
+        if not os.path.isfile(b):
+            print("muse-lane: brief not readable: %s" % b, file=sys.stderr)
+            return 1
+        try:
+            with open(b, "r", encoding="utf-8", errors="replace") as f:
+                f.read(1)
+        except OSError:
+            print("muse-lane: brief not readable: %s" % b, file=sys.stderr)
+            return 1
+    env_file = None
+    if args.env_file:
+        env_file = os.path.abspath(os.path.expanduser(args.env_file))
+        if not os.path.isfile(env_file):
+            print("muse-lane: --env-file not readable: %s" % args.env_file, file=sys.stderr)
+            return 1
+    label = args.label or ""
+    root = lanes_root()
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as e:
+        print("muse-lane: cannot create lanes root: %s" % e, file=sys.stderr)
+        return 1
+    lane_id = args.id
+    if lane_id:
+        if "/" in lane_id or lane_id in (".", "..") or not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", lane_id):
+            print("muse-lane: invalid --id: %s" % lane_id, file=sys.stderr)
+            return 1
+        if os.path.exists(os.path.join(root, lane_id)):
+            print("muse-lane: id already in use: %s" % lane_id, file=sys.stderr)
+            return 1
+    else:
+        base = default_lane_id(label)
+        lane_id = base
+        i = 2
+        while os.path.exists(os.path.join(root, lane_id)):
+            lane_id = "%s-%d" % (base, i)
+            i += 1
+    ldir = os.path.join(root, lane_id)
+    try:
+        os.makedirs(ldir, mode=0o700, exist_ok=False)
+    except OSError as e:
+        print("muse-lane: cannot create lane dir: %s" % e, file=sys.stderr)
+        return 1
+    _ensure_lane_perms(ldir)
+    for idx, src in enumerate(briefs, start=1):
+        dst = os.path.join(ldir, "brief%d.md" % idx)
+        try:
+            shutil.copyfile(src, dst)
+            _chmod_0600(dst)
+        except OSError as e:
+            print("muse-lane: cannot copy brief %s: %s" % (src, e), file=sys.stderr)
+            return 1
+    try:
+        stall_min = float(args.stall_min)
+    except (TypeError, ValueError):
+        print("muse-lane: invalid --stall-min", file=sys.stderr)
+        return 1
+    stall_sec = stall_min * 60.0
+    exec_env = {}
+    try:
+        exec_env["MUSE_BIN"] = os.environ.get("MUSE_BIN", "") or ""
+    except Exception:
+        exec_env["MUSE_BIN"] = ""
+    try:
+        exec_env["PATH"] = os.environ.get("PATH", "") or ""
+    except Exception:
+        exec_env["PATH"] = ""
+    for k, v in os.environ.items():
+        if k.startswith("MUSE_LANE_"):
+            try:
+                exec_env[k] = v
+            except Exception:
+                pass
+    lane = {
+        "id": lane_id,
+        "label": label,
+        "cwd": cwd,
+        "briefs": [os.path.abspath(os.path.expanduser(b)) for b in briefs],
+        "accept": args.accept,
+        "effort": args.effort or "max",
+        "env_file": env_file,
+        "accept_env": bool(getattr(args, "accept_env", False)),
+        "stall_sec": stall_sec,
+        "created_at": now_iso(),
+        "exec_env": exec_env,
+        "owner_session": getattr(args, "owner_session", None),
+    }
+    atomic_write_json(os.path.join(ldir, "lane.json"), lane)
+    # Write queued state before spawning so stop/status never see a gap.
+    created = lane.get("created_at")
+    try:
+        head_start = get_git_head(cwd) if os.path.isdir(cwd) else None
+    except Exception:
+        head_start = None
+    queued_state = {
+        "status": "queued",
+        "step": 1,
+        "steps": len(briefs),
+        "attempt": 1,
+        "supervisor_pid": None,
+        "supervisor_started": None,
+        "muse_pid": None,
+        "muse_started": None,
+        "accept_pid": None,
+        "accept_started": None,
+        "started_at": created,
+        "updated_at": created,
+        "last_activity_at": created,
+        "last_event": None,
+        "head_start": head_start,
+        "head": head_start,
+        "commits": 0,
+        "stderr_tail": "",
+        "accept_exit": None,
+        "retry_at": None,
+        "reason": None,
+    }
+    atomic_write_json(os.path.join(ldir, "state.json"), queued_state)
+    pid = spawn_supervisor(lane_id)
+    if pid is None:
+        return 1
+    print(lane_id)
+    return 0
+
+
+def cmd_status(args):
+    want_id = getattr(args, "id", None)
+    as_json = bool(getattr(args, "json", False))
+    if want_id:
+        ids = [want_id]
+        lane = load_lane(want_id)
+        if lane is None:
+            print("muse-lane: unknown lane: %s" % want_id, file=sys.stderr)
+            return 1
+    else:
+        ids = list_lane_ids_newest_first()
+    objs = []
+    for lid in ids:
+        lane = load_lane(lid)
+        if lane is None:
+            continue
+        state = load_state(lid)
+        if state is None:
+            state = {
+                "status": "queued",
+                "step": 1,
+                "steps": len(lane.get("briefs") or []),
+                "attempt": 1,
+                "supervisor_pid": None,
+                "supervisor_started": None,
+                "muse_pid": None,
+                "muse_started": None,
+                "accept_pid": None,
+                "accept_started": None,
+                "started_at": lane.get("created_at"),
+                "updated_at": lane.get("created_at"),
+                "last_activity_at": lane.get("created_at"),
+                "last_event": None,
+                "head_start": None,
+                "head": None,
+                "commits": 0,
+                "stderr_tail": "",
+                "accept_exit": None,
+                "retry_at": None,
+                "reason": None,
+            }
+            disp = "queued"
+        else:
+            disp = display_status(state.get("status"), state.get("supervisor_pid"),
+                                  lane_id=lid, state=state, lane=lane)
+        ldir = lane_dir(lid)
+        obj = dict(state)
+        obj["id"] = lid
+        obj["label"] = lane.get("label") or ""
+        obj["cwd"] = lane.get("cwd") or ""
+        obj["status"] = disp
+        obj["owner_session"] = lane.get("owner_session")
+        obj["announced"] = is_announced(ldir)
+        obj["orphan_announced"] = is_orphan_announced(ldir, state)
+        # Redact anything printable using this lane's secrets.
+        secrets = secrets_from_env_file(lane.get("env_file"))
+        if secrets:
+            for k, v in list(obj.items()):
+                if isinstance(v, str):
+                    obj[k] = redact_text(v, secrets)
+        objs.append(obj)
+    if as_json:
+        print(json.dumps(objs, indent=2))
+        return 0
+    if want_id:
+        o = objs[0] if objs else {}
+        print("id: %s" % o.get("id", want_id))
+        print("label: %s" % o.get("label", ""))
+        print("cwd: %s" % o.get("cwd", ""))
+        print("status: %s" % o.get("status", "?"))
+        print("step: %s/%s attempt: %s" % (o.get("step"), o.get("steps"), o.get("attempt")))
+        print("supervisor_pid: %s muse_pid: %s" % (o.get("supervisor_pid"), o.get("muse_pid")))
+        print("owner_session: %s announced: %s orphan_announced: %s" % (
+            o.get("owner_session"), o.get("announced"), o.get("orphan_announced")))
+        print("started: %s updated: %s" % (o.get("started_at"), o.get("updated_at")))
+        print("last_activity: %s last_event: %s" % (o.get("last_activity_at"), o.get("last_event")))
+        print("head_start: %s head: %s commits: %s" % (o.get("head_start"), o.get("head"), o.get("commits")))
+        print("accept_exit: %s retry_at: %s reason: %s" % (o.get("accept_exit"), o.get("retry_at"), o.get("reason")))
+        tail = o.get("stderr_tail") or ""
+        if tail:
+            print("stderr_tail:")
+            for ln in str(tail).splitlines()[-20:]:
+                print("  %s" % ln)
+        return 0
+    if not objs:
+        print("(no lanes)")
+        return 0
+    for o in objs:
+        print("%s  %s  step %s/%s att %s  updated %s  %s" % (
+            o.get("id"), o.get("status"), o.get("step"), o.get("steps"),
+            o.get("attempt"), o.get("updated_at"), o.get("reason") or "",
+        ))
+    return 0
+
+
+def _kill_pgid(pgid, sig):
+    try:
+        pgid = int(pgid)
+    except (TypeError, ValueError):
+        return False
+    if pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _kill_pid(pid, sig):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _kill_verified_orphans(state):
+    st = state or {}
+    for pid_key, started_key in (("muse_pid", "muse_started"),
+                                 ("accept_pid", "accept_started")):
+        try:
+            kill_verified_group(st.get(pid_key), st.get(started_key), timeout_sec=10.0)
+        except Exception:
+            pass
+
+
+def _build_stopped_state(lane, state):
+    state = state or {}
+    lane = lane or {}
+    secrets = secrets_from_env_file(lane.get("env_file"))
+    cwd = lane.get("cwd") or ""
+    try:
+        head = get_git_head(cwd) if cwd and os.path.isdir(cwd) else state.get("head")
+    except Exception:
+        head = state.get("head")
+    try:
+        commits = get_commits_count(cwd, state.get("head_start"), head) if cwd and os.path.isdir(cwd) else int(state.get("commits") or 0)
+    except Exception:
+        commits = int(state.get("commits") or 0)
+    ended = now_iso()
+    new_state = {
+        "status": "stopped",
+        "step": int(state.get("step") or 1),
+        "steps": len(lane.get("briefs") or []) or int(state.get("steps") or 1),
+        "attempt": int(state.get("attempt") or 1),
+        "supervisor_pid": state.get("supervisor_pid"),
+        "supervisor_started": state.get("supervisor_started"),
+        "muse_pid": None,
+        "muse_started": None,
+        "accept_pid": None,
+        "accept_started": None,
+        "started_at": state.get("started_at") or lane.get("created_at") or ended,
+        "updated_at": ended,
+        "last_activity_at": state.get("last_activity_at") or ended,
+        "last_event": state.get("last_event"),
+        "head_start": state.get("head_start"),
+        "head": head,
+        "commits": commits,
+        "stderr_tail": state.get("stderr_tail") or "",
+        "accept_exit": state.get("accept_exit"),
+        "retry_at": None,
+        "reason": "stopped",
+    }
+    for k, v in list(new_state.items()):
+        if isinstance(v, str):
+            new_state[k] = redact_text(v, secrets)
+    return new_state, ended
+
+
+def _wait_lock_released(ldir, timeout_sec):
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while time.monotonic() < deadline:
+        try:
+            if not supervisor_alive(ldir):
+                return True
+        except Exception:
+            return True
+        time.sleep(0.2)
+    try:
+        return not supervisor_alive(ldir)
+    except Exception:
+        return True
+
+
+def cmd_stop(args):
+    lane_id = args.id
+    ldir = lane_dir(lane_id)
+    lane = load_lane(lane_id)
+    if lane is None:
+        print("muse-lane: unknown lane: %s" % lane_id, file=sys.stderr)
+        return 1
+    state = load_state(lane_id)
+    if state is not None and state.get("status") in TERMINAL:
+        print("%s already %s" % (lane_id, state.get("status")))
+        return 0
+    live = False
+    try:
+        live = supervisor_alive(ldir)
+    except Exception:
+        live = is_alive((state or {}).get("supervisor_pid"))
+    sup_pid = (state or {}).get("supervisor_pid") if state else None
+    sup_started = (state or {}).get("supervisor_started") if state else None
+    if live:
+        # Marker FIRST, so any supervisor — even one we cannot safely
+        # signal — stops itself on its next check.
+        try:
+            atomic_write_text(os.path.join(ldir, STOP_MARKER), now_iso() + "\n")
+        except OSError:
+            pass
+        # Signal only a supervisor verified by pid + recorded start time.
+        if pid_is_ours(sup_pid, sup_started):
+            _kill_pgid(sup_pid, signal.SIGTERM)
+            _kill_pid(sup_pid, signal.SIGTERM)
+            _wait_lock_released(ldir, 10.0)
+            # Escalate once if the lock is still held, re-verifying first.
+            try:
+                still_live = supervisor_alive(ldir)
+            except Exception:
+                still_live = is_alive(sup_pid)
+            if still_live and pid_is_ours(sup_pid, sup_started):
+                _kill_pgid(sup_pid, signal.SIGKILL)
+                _kill_pid(sup_pid, signal.SIGKILL)
+                _wait_lock_released(ldir, 5.0)
+        else:
+            # Unverified pid: never signal it; wait for the marker-driven
+            # exit instead.
+            _wait_lock_released(ldir, 15.0)
+        # Re-read; supervisor may have written stopped itself.
+        state = load_state(lane_id) or state or {}
+        if state.get("status") in TERMINAL:
+            # Ensure a summary exists for the terminal state.
+            sp = os.path.join(ldir, "summary.md")
+            if not os.path.exists(sp):
+                try:
+                    write_summary_file(ldir, state.get("status"), state.get("updated_at"))
+                except Exception as e:
+                    print("muse-lane: failed to write summary: %s" % e, file=sys.stderr)
+            print("%s stopped" % lane_id)
+            return 0
+        try:
+            still_live = supervisor_alive(ldir)
+        except Exception:
+            still_live = False
+        if still_live:
+            print("muse-lane: supervisor still alive; stop not completed",
+                  file=sys.stderr)
+            return 1
+        # Supervisor is gone but left non-terminal state: kill verified
+        # orphans, then write summary BEFORE stopped state, then sweep.
+        _kill_verified_orphans(state)
+        new_state, ended = _build_stopped_state(lane, state)
+        try:
+            write_summary_file(ldir, "stopped", ended, final_state=new_state)
+        except Exception as e:
+            print("muse-lane: failed to write summary: %s" % e, file=sys.stderr)
+        atomic_write_json(os.path.join(ldir, "state.json"), new_state)
+        redact_sweep_ldir(ldir, secrets_from_env_file(lane.get("env_file")))
+        print("%s stopped" % lane_id)
+        return 0
+    # No live supervisor: kill verified orphans, write marker + stopped,
+    # then run the same final redaction sweep as a normal end.
+    _kill_verified_orphans(state)
+    new_state, ended = _build_stopped_state(lane, state)
+    try:
+        atomic_write_text(os.path.join(ldir, STOP_MARKER), ended + "\n")
+    except OSError:
+        pass
+    try:
+        write_summary_file(ldir, "stopped", ended, final_state=new_state)
+    except Exception as e:
+        print("muse-lane: failed to write summary: %s" % e, file=sys.stderr)
+    atomic_write_json(os.path.join(ldir, "state.json"), new_state)
+    redact_sweep_ldir(ldir, secrets_from_env_file(lane.get("env_file")))
+    print("%s stopped" % lane_id)
+    return 0
+
+
+def cmd_resume(args):
+    lane_id = args.id
+    ldir = lane_dir(lane_id)
+    lane = load_lane(lane_id)
+    if lane is None:
+        print("muse-lane: unknown lane: %s" % lane_id, file=sys.stderr)
+        return 1
+    state = load_state(lane_id)
+    if state is None:
+        print("muse-lane: lane has no state (nothing to resume): %s" % lane_id, file=sys.stderr)
+        return 1
+    stored = state.get("status")
+    if stored in TERMINAL:
+        print("muse-lane: lane is %s, not orphaned" % stored, file=sys.stderr)
+        return 1
+    try:
+        live = supervisor_alive(ldir)
+    except Exception:
+        live = is_alive(state.get("supervisor_pid"))
+    if live:
+        print("muse-lane: supervisor still alive; not orphaned", file=sys.stderr)
+        return 1
+    # Refuse while a recorded child is alive but its start time cannot be
+    # verified: never start a second muse beside an unverifiable live one.
+    for pid_key, started_key in (("muse_pid", "muse_started"),
+                                 ("accept_pid", "accept_started")):
+        if pid_unverifiable_but_alive(state.get(pid_key), state.get(started_key)):
+            print("muse-lane: refusing resume: recorded %s %s is alive but "
+                  "its start time cannot be verified" % (pid_key, state.get(pid_key)),
+                  file=sys.stderr)
+            return 1
+    # Kill still-live orphaned children (verified by start time) and wait
+    # for them to exit before anything new starts.
+    _kill_verified_orphans(state)
+    # A previous stop request must not kill the resumed run.
+    try:
+        mp = os.path.join(ldir, STOP_MARKER)
+        if os.path.exists(mp):
+            os.remove(mp)
+    except OSError:
+        pass
+    pid = spawn_supervisor(lane_id)
+    if pid is None:
+        return 1
+    if not wait_for_supervisor_lock(ldir, timeout_sec=10.0):
+        print("muse-lane: supervisor did not take the lock in 10s", file=sys.stderr)
+        return 1
+    print(lane_id)
+    return 0
+
+
+def cmd_summary(args):
+    lane_id = args.id
+    ldir = lane_dir(lane_id)
+    lane = load_lane(lane_id)
+    if lane is None:
+        print("muse-lane: unknown lane: %s" % lane_id, file=sys.stderr)
+        return 1
+    sp = os.path.join(ldir, "summary.md")
+    try:
+        with open(sp, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except FileNotFoundError:
+        print("muse-lane: no summary yet for %s" % lane_id, file=sys.stderr)
+        return 1
+    secrets = secrets_from_env_file(lane.get("env_file"))
+    print(redact_text(text, secrets), end="" if text.endswith("\n") else "\n")
+    return 0
+
+
+def cmd_ack(args):
+    lane_id = args.id
+    ldir = lane_dir(lane_id)
+    lane = load_lane(lane_id)
+    if lane is None:
+        print("muse-lane: unknown lane: %s" % lane_id, file=sys.stderr)
+        return 1
+    state = load_state(lane_id)
+    if state is None:
+        print("muse-lane: lane has no state: %s" % lane_id, file=sys.stderr)
+        return 1
+    want_orphan = bool(getattr(args, "orphan", False))
+    if want_orphan:
+        disp = display_status(state.get("status"), state.get("supervisor_pid"),
+                              lane_id=lane_id, state=state, lane=lane)
+        if disp != "orphaned":
+            print("muse-lane: lane is %s, not orphaned" % disp, file=sys.stderr)
+            return 2
+        marker = orphan_marker_name(state)
+    else:
+        if state.get("status") not in TERMINAL:
+            print("muse-lane: lane is %s, not terminal" % state.get("status"),
+                  file=sys.stderr)
+            return 2
+        marker = ANNOUNCE_MARKER
+    path = os.path.join(ldir, marker)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return ACK_EXISTS_EXIT
+    except OSError as e:
+        print("muse-lane: cannot create ack marker: %s" % e, file=sys.stderr)
+        return 1
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
+            f.write("%s pid=%d\n" % (now_iso(), os.getpid()))
+    except OSError:
+        pass
+    _chmod_0600(path)
+    return 0
+
+
+# ---------------- supervisor ----------------
+
+def _parse_poll_sec(env=None):
+    src = env if env is not None else os.environ
+    try:
+        v = float(src.get("MUSE_LANE_POLL_SEC", str(DEFAULT_POLL_SEC)))
+    except (TypeError, ValueError):
+        return DEFAULT_POLL_SEC
+    if v <= 0:
+        return 0.1
+    return v
+
+
+def _parse_backoff(env=None):
+    src = env if env is not None else os.environ
+    raw = src.get("MUSE_LANE_BACKOFF", "")
+    if not str(raw).strip():
+        return list(DEFAULT_BACKOFF)
+    out = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(float(part))
+        except ValueError:
+            continue
+    return out or list(DEFAULT_BACKOFF)
+
+
+def _kill_process_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.send_signal(sig)
+    except Exception:
+        pass
+
+
+def cmd_run(lane_id):
+    ldir = lane_dir(lane_id)
+    lane_path = os.path.join(ldir, "lane.json")
+    lane = load_json(lane_path, None)
+    if lane is None:
+        print("muse-lane _run: unknown lane: %s" % lane_id, file=sys.stderr)
+        return 1
+    # One supervisor per lane: hold an exclusive flock for our whole life.
+    lock_fd = None
+    try:
+        _ensure_lane_perms(ldir)
+        lock_fd = os.open(lock_path_for_lane(ldir), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(lock_fd, 0o600)
+        except OSError:
+            pass
+        # Retry briefly: status/resume probes take the lock for a moment.
+        lock_deadline = time.monotonic() + LOCK_RETRY_SEC
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                pass
+            except OSError as e:
+                if e.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+            if time.monotonic() >= lock_deadline:
+                print("muse-lane _run: another supervisor holds the lock", file=sys.stderr)
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+                return 1
+            time.sleep(0.05)
+    except OSError as e:
+        print("muse-lane _run: cannot take supervisor lock: %s" % e, file=sys.stderr)
+        return 1
+    # A stop that landed before we started: exit stopped without
+    # overwriting the marker or a terminal state stop already wrote.
+    if os.path.exists(os.path.join(ldir, STOP_MARKER)):
+        st0 = load_json(os.path.join(ldir, "state.json"), None)
+        if isinstance(st0, dict) and st0.get("status") in TERMINAL:
+            return 0
+        # Marker with non-terminal state (crash between marker and state):
+        # write summary BEFORE stopped state, keep the marker.
+        try:
+            tmp_lane = lane or {}
+            tmp_state = st0 or {}
+            new_state, ended = _build_stopped_state(tmp_lane, tmp_state)
+            try:
+                write_summary_file(ldir, "stopped", ended, final_state=new_state)
+            except Exception:
+                pass
+            atomic_write_json(os.path.join(ldir, "state.json"), new_state)
+        except Exception:
+            pass
+        return 0
+    cwd = lane.get("cwd") or os.getcwd()
+    steps = len(lane.get("briefs") or [])
+    if steps <= 0:
+        print("muse-lane _run: lane has no briefs", file=sys.stderr)
+        return 1
+    effort = lane.get("effort") or "max"
+    accept_cmd = lane.get("accept")
+    env_file = lane.get("env_file")
+    try:
+        lane_stall_sec = float(lane.get("stall_sec", 40 * 60))
+    except (TypeError, ValueError):
+        lane_stall_sec = 40 * 60
+
+    # Resume environment: stored MUSE_BIN/PATH/MUSE_LANE_* win over ours.
+    exec_env = lane.get("exec_env") if isinstance(lane.get("exec_env"), dict) else {}
+    eff = dict(os.environ)
+    for k, v in exec_env.items():
+        if k == "MUSE_BIN" or k == "PATH" or k.startswith("MUSE_LANE_"):
+            eff[k] = v
+    poll_sec = _parse_poll_sec(eff)
+    backoff = _parse_backoff(eff)
+    stall_env = eff.get("MUSE_LANE_STALL_SEC")
+    if stall_env is not None and str(stall_env).strip() != "":
+        try:
+            stall_sec = float(stall_env)
+        except ValueError:
+            stall_sec = lane_stall_sec
+    else:
+        stall_sec = lane_stall_sec
+    if stall_sec <= 0:
+        stall_sec = 1.0
+    muse_bin = (eff.get("MUSE_BIN", "") or "muse") or "muse"
+
+    secrets = secrets_from_env_file(env_file)
+    # In-memory snapshot (never on disk): redaction always uses the union
+    # of this and the current env file, so rotated-out values stay redacted.
+    secret_snapshot = list(secrets)
+    try:
+        self_started = get_start_time(os.getpid())
+    except Exception:
+        self_started = None
+    env_file_vars = parse_env_file(env_file) if env_file else {}
+    muse_env = dict(os.environ)
+    if eff.get("PATH"):
+        muse_env["PATH"] = eff["PATH"]
+    if env_file_vars:
+        muse_env.update(env_file_vars)
+    if lane.get("accept_env"):
+        accept_env = dict(muse_env)
+    else:
+        accept_env = dict(os.environ)
+        if eff.get("PATH"):
+            accept_env["PATH"] = eff["PATH"]
+        # Do not leak env-file keys into acceptance without --accept-env.
+
+    state_path = os.path.join(ldir, "state.json")
+    history_path = os.path.join(ldir, "history.json")
+    history = load_json(history_path, {}) or {}
+    if not isinstance(history, dict):
+        history = {}
+
+    def slog(msg):
+        try:
+            print("[%s] %s" % (now_iso(), redact_text(str(msg), secrets)), flush=True)
+        except Exception:
+            pass
+
+    # ---- resume / fresh-start resolution ----
+    prev_state = load_json(state_path, None)
+    started_at = None
+    head_start = None
+    start_step = 1
+    start_attempt = 1
+    last_reason = None
+    accept_exit = None
+    if prev_state is not None and isinstance(prev_state, dict):
+        if prev_state.get("status") in TERMINAL:
+            slog("lane already %s; _run exiting" % prev_state.get("status"))
+            return 0
+        if prev_state.get("status") in NON_TERMINAL:
+            started_at = prev_state.get("started_at")
+            head_start = prev_state.get("head_start")
+            last_reason = prev_state.get("reason")
+            accept_exit = prev_state.get("accept_exit")
+            try:
+                prev_step = int(prev_state.get("step") or 1)
+            except (TypeError, ValueError):
+                prev_step = 1
+            try:
+                prev_attempt = int(prev_state.get("attempt") or 1)
+            except (TypeError, ValueError):
+                prev_attempt = 1
+            prev_status = prev_state.get("status")
+            if prev_status == "queued":
+                start_step = max(1, min(prev_step, steps))
+                start_attempt = 1
+            elif prev_status == "accepting":
+                start_step = steps + 1
+                start_attempt = 1
+            else:
+                final_p = os.path.join(ldir, "step%d-final.md" % prev_step)
+                if os.path.exists(final_p):
+                    start_step = prev_step + 1
+                    start_attempt = 1
+                else:
+                    start_step = max(1, min(prev_step, steps))
+                    probe = os.path.join(ldir, "step%d-attempt%d.jsonl" % (start_step, prev_attempt))
+                    if os.path.exists(probe):
+                        start_attempt = prev_attempt + 1
+                    else:
+                        start_attempt = prev_attempt
+                    if start_attempt < 1:
+                        start_attempt = 1
+            slog("resuming from step %d attempt %d (prev %s step %d att %d)" % (
+                start_step, start_attempt, prev_status, prev_step, prev_attempt))
+    if not started_at:
+        started_at = now_iso()
+    if head_start is None and not (prev_state and "head_start" in (prev_state or {})):
+        try:
+            head_start = get_git_head(cwd) if os.path.isdir(cwd) else None
+        except Exception:
+            head_start = None
+    elif head_start is None and prev_state is not None:
+        head_start = prev_state.get("head_start")
+
+    stop_requested = {"flag": False}
+
+    def _on_term(signum, frame):
+        stop_requested["flag"] = True
+
+    try:
+        signal.signal(signal.SIGTERM, _on_term)
+        signal.signal(signal.SIGINT, _on_term)
+    except Exception:
+        pass
+
+    def git_snapshot():
+        try:
+            head = get_git_head(cwd) if os.path.isdir(cwd) else None
+        except Exception:
+            head = None
+        try:
+            commits = get_commits_count(cwd, head_start, head) if os.path.isdir(cwd) else 0
+        except Exception:
+            commits = 0
+        return head, commits
+
+    def write_state(status, step, attempt, muse_pid, last_activity_at,
+                    last_event, head, commits, stderr_tail, accept_exit_v,
+                    retry_at, reason, muse_started=None, accept_pid=None,
+                    accept_started=None):
+        st = {
+            "status": status,
+            "step": int(step),
+            "steps": int(steps),
+            "attempt": int(attempt),
+            "supervisor_pid": os.getpid(),
+            "supervisor_started": self_started,
+            "muse_pid": muse_pid,
+            "muse_started": muse_started,
+            "accept_pid": accept_pid,
+            "accept_started": accept_started,
+            "started_at": started_at,
+            "updated_at": now_iso(),
+            "last_activity_at": last_activity_at or now_iso(),
+            "last_event": last_event,
+            "head_start": head_start,
+            "head": head,
+            "commits": int(commits or 0),
+            "stderr_tail": stderr_tail or "",
+            "accept_exit": accept_exit_v,
+            "retry_at": retry_at,
+            "reason": reason,
+        }
+        for k, v in list(st.items()):
+            if isinstance(v, str):
+                st[k] = redact_text(v, secrets)
+        atomic_write_json(state_path, st)
+        return st
+
+    def save_history():
+        try:
+            atomic_write_json(history_path, history)
+        except OSError:
+            pass
+
+    def _stop_marker_present():
+        return os.path.exists(os.path.join(ldir, STOP_MARKER))
+
+    def _redact_sweep():
+        redact_sweep_ldir(ldir, secrets)
+
+    def finish_terminal(status, step, attempt, reason, accept_exit_v, last_event=None, stderr_tail=""):
+        nonlocal secrets
+        # A pending stop (TERM flag or marker) turns any terminal outcome
+        # into stopped: our own stop is never reclassified as a failure.
+        if status != "stopped" and (stop_requested["flag"] or _stop_marker_present()):
+            status = "stopped"
+            reason = "stopped"
+        secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
+        head, commits = git_snapshot()
+        ended = now_iso()
+        prev = load_json(state_path, {}) or {}
+        final = {
+            "status": status,
+            "step": int(step),
+            "steps": int(steps),
+            "attempt": int(attempt),
+            "supervisor_pid": os.getpid(),
+            "supervisor_started": self_started,
+            "muse_pid": None,
+            "muse_started": None,
+            "accept_pid": None,
+            "accept_started": None,
+            "started_at": started_at,
+            "updated_at": ended,
+            "last_activity_at": prev.get("last_activity_at") or ended,
+            "last_event": last_event if last_event is not None else prev.get("last_event"),
+            "head_start": head_start,
+            "head": head,
+            "commits": int(commits or 0),
+            "stderr_tail": stderr_tail if stderr_tail is not None else (prev.get("stderr_tail") or ""),
+            "accept_exit": accept_exit_v,
+            "retry_at": None,
+            "reason": redact_text(reason, secrets) if reason else reason,
+        }
+        # Summary BEFORE terminal state on every exit path.
+        try:
+            write_summary_file(ldir, status, ended, final_state=final,
+                               extra_secrets=secret_snapshot)
+        except Exception as e:
+            slog("failed to write summary: %s" % e)
+        atomic_write_json(state_path, final)
+        _redact_sweep()
+        slog("lane %s -> %s" % (lane_id, status))
+        return 0
+
+    def sleep_with_state_updates(delay, status, step, attempt, retry_at, reason, err_path_for_tail):
+        end = time.monotonic() + max(0.0, delay)
+        last_update = 0.0
+        while True:
+            if stop_requested["flag"] or _stop_marker_present():
+                return "stopped"
+            now_m = time.monotonic()
+            if now_m >= end:
+                return "ok"
+            if now_m - last_update >= poll_sec:
+                head, commits = git_snapshot()
+                tail = "\n".join(read_tail_filtered(err_path_for_tail))
+                tail = redact_text(tail, secrets)
+                write_state(status, step, attempt, None, now_iso(), None,
+                            head, commits, tail, accept_exit, retry_at,
+                            redact_text(reason, secrets) if reason else reason)
+                last_update = now_m
+            remain = end - now_m
+            time.sleep(min(0.2, max(0.05, min(poll_sec, remain))))
+
+    # If resume landed past the last step, jump straight to acceptance.
+    if start_step > steps:
+        pass
+    else:
+        if start_attempt > MAX_ATTEMPTS:
+            slog("step %d already exhausted %d attempts before resume; giving up" % (start_step, MAX_ATTEMPTS))
+            return finish_terminal("gave_up", start_step, MAX_ATTEMPTS, last_reason or "out of attempts", accept_exit)
+
+    # ---- main step loop ----
+    current_last_event = (prev_state or {}).get("last_event")
+    for k in range(start_step if start_step <= steps else steps + 1, steps + 1):
+        if stop_requested["flag"] or _stop_marker_present():
+            return finish_terminal("stopped", k, 1 if k != start_step else start_attempt,
+                                   "stopped", accept_exit, current_last_event, "")
+        n_start = start_attempt if k == start_step else 1
+        step_done = False
+        for n in range(n_start, MAX_ATTEMPTS + 1):
+            if stop_requested["flag"] or _stop_marker_present():
+                return finish_terminal("stopped", k, n, "stopped", accept_exit,
+                                       current_last_event, "")
+            secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
+            jsonl_path = os.path.join(ldir, "step%d-attempt%d.jsonl" % (k, n))
+            err_path = os.path.join(ldir, "step%d-attempt%d.err" % (k, n))
+            brief_path = os.path.join(ldir, "brief%d.md" % k)
+            cmd = [muse_bin, "exec", "--prompt-file", brief_path,
+                   "--trust-workspace", "--approval-mode", "never",
+                   "--disable-approval", "--reasoning-effort", effort, "--json"]
+            slog("step %d attempt %d: %s" % (k, n, " ".join(cmd)))
+            head0, commits0 = git_snapshot()
+            last_activity_iso = now_iso()
+            write_state("running", k, n, None, last_activity_iso, current_last_event,
+                        head0, commits0, "", accept_exit, None, last_reason)
+            try:
+                jf = open(jsonl_path, "w", encoding="utf-8", errors="replace")
+                try:
+                    os.fchmod(jf.fileno(), 0o600)
+                except OSError:
+                    pass
+                ef = open(err_path, "w", encoding="utf-8", errors="replace")
+                try:
+                    os.fchmod(ef.fileno(), 0o600)
+                except OSError:
+                    pass
+            except OSError as e:
+                try:
+                    jf.close()
+                except Exception:
+                    pass
+                try:
+                    ef.close()
+                except Exception:
+                    pass
+                reason = redact_text("cannot open output files: %s" % e, secrets)
+                last_reason = reason
+                history.setdefault(str(k), []).append({
+                    "attempt": n, "reason": reason, "ok": False,
+                    "class": "fatal", "terminal": None, "exit": None})
+                save_history()
+                return finish_terminal("gave_up", k, n, reason, accept_exit,
+                                       current_last_event, "")
+            try:
+                proc = subprocess.Popen(cmd, cwd=cwd, env=muse_env,
+                                        stdin=subprocess.DEVNULL, stdout=jf, stderr=ef,
+                                        start_new_session=True)
+            except Exception as e:
+                try:
+                    jf.close()
+                except Exception:
+                    pass
+                try:
+                    ef.close()
+                except Exception:
+                    pass
+                raw_reason = "spawn failed: %s" % e
+                cls, reason = classify_failure(None, raw_reason, "", None,
+                                               spawn_failed=True)
+                reason = redact_text(reason, secrets)
+                last_reason = reason
+                history.setdefault(str(k), []).append({
+                    "attempt": n, "reason": reason, "ok": False,
+                    "class": cls, "terminal": None, "exit": None})
+                save_history()
+                redact_file_inplace(jsonl_path, secrets)
+                redact_file_inplace(err_path, secrets)
+                return finish_terminal("gave_up", k, n, reason, accept_exit,
+                                       current_last_event, "")
+            # Poll loop for this attempt.
+            try:
+                muse_started = get_start_time(proc.pid)
+            except Exception:
+                muse_started = None
+            last_activity_m = time.monotonic()
+            last_activity_iso = now_iso()
+            try:
+                last_jsonl_size = os.path.getsize(jsonl_path)
+            except OSError:
+                last_jsonl_size = 0
+            try:
+                last_err_size = os.path.getsize(err_path)
+            except OSError:
+                last_err_size = 0
+            try:
+                snap = get_activity_snapshot(cwd, proc.pid)
+            except Exception:
+                snap = {"head": None, "status": None, "dirty": {}, "cpu": None}
+            last_head = snap.get("head")
+            last_status_out = snap.get("status")
+            last_dirty = snap.get("dirty") or {}
+            last_cpu = snap.get("cpu")
+            stalled = False
+            exit_code = None
+            last_update_m = 0.0
+            last_snap_m = time.monotonic()
+            head_cur, commits_cur = head0, commits0
+            tail_cur = ""
+            while True:
+                if stop_requested["flag"] or _stop_marker_present():
+                    _kill_process_group(proc, signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        _kill_process_group(proc, signal.SIGKILL)
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            pass
+                    try:
+                        jf.close()
+                    except Exception:
+                        pass
+                    try:
+                        ef.close()
+                    except Exception:
+                        pass
+                    redact_file_inplace(jsonl_path, secrets)
+                    redact_file_inplace(err_path, secrets)
+                    tail = "\n".join(read_tail_filtered(err_path))
+                    return finish_terminal("stopped", k, n, "stopped", accept_exit,
+                                           current_last_event, redact_text(tail, secrets))
+                ret = proc.poll()
+                now_m = time.monotonic()
+                if ret is None:
+                    activity = False
+                    try:
+                        cur_jsonl = os.path.getsize(jsonl_path)
+                    except OSError:
+                        cur_jsonl = last_jsonl_size
+                    try:
+                        cur_err = os.path.getsize(err_path)
+                    except OSError:
+                        cur_err = last_err_size
+                    if cur_jsonl > last_jsonl_size:
+                        activity = True
+                        last_jsonl_size = cur_jsonl
+                    if cur_err > last_err_size:
+                        activity = True
+                        last_err_size = cur_err
+                    # Heavy signals (git + CPU) at most once per poll_sec.
+                    if now_m - last_snap_m >= poll_sec:
+                        try:
+                            snap = get_activity_snapshot(cwd, proc.pid)
+                        except Exception:
+                            snap = None
+                        if isinstance(snap, dict):
+                            if snap.get("head") != last_head:
+                                activity = True
+                                last_head = snap.get("head")
+                            if snap.get("status") != last_status_out:
+                                activity = True
+                                last_status_out = snap.get("status")
+                            cur_dirty = snap.get("dirty") or {}
+                            if cur_dirty != last_dirty:
+                                activity = True
+                                last_dirty = cur_dirty
+                            cur_cpu = snap.get("cpu")
+                            if (isinstance(cur_cpu, (int, float)) and
+                                    isinstance(last_cpu, (int, float)) and
+                                    cur_cpu > last_cpu):
+                                activity = True
+                            if isinstance(cur_cpu, (int, float)):
+                                last_cpu = cur_cpu
+                        last_snap_m = now_m
+                    if activity:
+                        last_activity_m = now_m
+                        last_activity_iso = now_iso()
+                    else:
+                        if now_m - last_activity_m >= stall_sec:
+                            # Completed-then-hung: the JSONL already has a
+                            # completion, the process just never exited. Kill
+                            # it and treat the attempt as completed.
+                            hung_ok, _ = check_completion(jsonl_path)
+                            slog("step %d attempt %d stalled after %.1fs; killing pgid %d" % (k, n, now_m - last_activity_m, proc.pid))
+                            _kill_process_group(proc, signal.SIGTERM)
+                            try:
+                                proc.wait(timeout=5)
+                            except Exception:
+                                _kill_process_group(proc, signal.SIGKILL)
+                                try:
+                                    proc.wait(timeout=5)
+                                except Exception:
+                                    pass
+                            try:
+                                exit_code = proc.returncode
+                            except Exception:
+                                exit_code = None
+                            if hung_ok:
+                                slog("step %d attempt %d had completed before the stall; treating as completed" % (k, n))
+                                break
+                            stalled = True
+                            break
+                should_update = (now_m - last_update_m >= poll_sec) or (ret is not None)
+                if should_update:
+                    head_cur, commits_cur = git_snapshot()
+                    tail_cur = "\n".join(read_tail_filtered(err_path))
+                    tail_cur = redact_text(tail_cur, secrets)
+                    ev, _ = read_last_json_info(jsonl_path)
+                    if ev is not None:
+                        current_last_event = redact_text(ev, secrets)
+                    write_state("running", k, n, proc.pid if ret is None else None,
+                                last_activity_iso, current_last_event,
+                                head_cur, commits_cur, tail_cur, accept_exit, None, last_reason,
+                                muse_started=muse_started if ret is None else None)
+                    last_update_m = now_m
+                if ret is not None:
+                    exit_code = ret
+                    break
+                time.sleep(min(0.2, poll_sec))
+            try:
+                jf.close()
+            except Exception:
+                pass
+            try:
+                ef.close()
+            except Exception:
+                pass
+            _chmod_0600(jsonl_path)
+            _chmod_0600(err_path)
+            # Refresh tail/event one last time for this attempt.
+            try:
+                with open(err_path, "r", encoding="utf-8", errors="replace") as _ef:
+                    stderr_full = _ef.read()
+            except (FileNotFoundError, OSError):
+                stderr_full = ""
+            tail_final = "\n".join(read_tail_filtered(err_path))
+            tail_final = redact_text(tail_final, secrets)
+            ev, _ = read_last_json_info(jsonl_path)
+            if ev is not None:
+                current_last_event = redact_text(ev, secrets)
+            verdict = get_terminal_verdict(jsonl_path)
+            v_term = verdict.get("terminal") if verdict.get("has_event") else None
+            v_reason = verdict.get("reason") or ""
+            if stalled:
+                cls, reason = classify_failure(v_term, v_reason or "stalled",
+                                               stderr_full, exit_code, stalled=True)
+                reason = redact_text(reason, secrets)
+                last_reason = reason
+                redact_file_inplace(jsonl_path, secrets)
+                redact_file_inplace(err_path, secrets)
+                history.setdefault(str(k), []).append({
+                    "attempt": n, "reason": reason, "ok": False,
+                    "class": cls, "terminal": v_term, "exit": exit_code})
+                save_history()
+                slog("step %d attempt %d failed: %s [%s]" % (k, n, reason, cls))
+                if cls == "fatal":
+                    return finish_terminal("gave_up", k, n, reason, accept_exit,
+                                           current_last_event, tail_final)
+                if n >= MAX_ATTEMPTS:
+                    return finish_terminal("gave_up", k, n, reason, accept_exit,
+                                           current_last_event, tail_final)
+                delay = backoff[min(n - 1, len(backoff) - 1)]
+                retry_at = (datetime.datetime.now(datetime.timezone.utc) +
+                            datetime.timedelta(seconds=delay)).isoformat()
+                head_cur, commits_cur = git_snapshot()
+                write_state("retry_wait", k, n, None, last_activity_iso, current_last_event,
+                            head_cur, commits_cur, tail_final, accept_exit, retry_at, reason)
+                res = sleep_with_state_updates(delay, "retry_wait", k, n, retry_at, reason, err_path)
+                prev = load_json(state_path, {}) or {}
+                if current_last_event is not None:
+                    prev["last_event"] = current_last_event
+                    try:
+                        atomic_write_json(state_path, prev)
+                    except OSError:
+                        pass
+                if res == "stopped":
+                    return finish_terminal("stopped", k, n, "stopped", accept_exit,
+                                           current_last_event, tail_final)
+                continue
+            ok, text = check_completion(jsonl_path)
+            redact_file_inplace(jsonl_path, secrets)
+            redact_file_inplace(err_path, secrets)
+            tail_final = "\n".join(read_tail_filtered(err_path))
+            tail_final = redact_text(tail_final, secrets)
+            try:
+                with open(err_path, "r", encoding="utf-8", errors="replace") as _ef2:
+                    stderr_full = _ef2.read()
+            except (FileNotFoundError, OSError):
+                pass
+            if ok:
+                red_text = redact_text(text or "", secrets)
+                try:
+                    atomic_write_text(os.path.join(ldir, "step%d-final.md" % k), red_text)
+                except OSError as e:
+                    slog("failed to write final: %s" % e)
+                history.setdefault(str(k), []).append({
+                    "attempt": n, "reason": None, "ok": True,
+                    "class": "ok", "terminal": "completed", "exit": exit_code})
+                save_history()
+                slog("step %d completed on attempt %d" % (k, n))
+                step_done = True
+                head_cur, commits_cur = git_snapshot()
+                write_state("running", k, n, None, now_iso(), current_last_event,
+                            head_cur, commits_cur, tail_final, accept_exit, None, last_reason)
+                break
+            if exit_code is not None and exit_code < 0:
+                base_reason = "signal %d" % (-exit_code)
+            elif exit_code == 0:
+                base_reason = v_reason.strip() or "exit 0 without terminal completion"
+            else:
+                base_reason = v_reason.strip() or ("exit %s" % (exit_code if exit_code is not None else "unknown"))
+            cls, reason = classify_failure(v_term, base_reason, stderr_full, exit_code)
+            reason = redact_text(reason, secrets)
+            last_reason = reason
+            history.setdefault(str(k), []).append({
+                "attempt": n, "reason": reason, "ok": False,
+                "class": cls, "terminal": v_term, "exit": exit_code})
+            save_history()
+            slog("step %d attempt %d failed: %s [%s terminal=%s]" % (k, n, reason, cls, v_term))
+            if cls == "fatal":
+                return finish_terminal("gave_up", k, n, reason, accept_exit,
+                                       current_last_event, tail_final)
+            if cls == "once":
+                # At most one more attempt after a "once" failure: count
+                # "once" failures in this step; the second one gives up.
+                once_count = sum(1 for e in history.get(str(k), [])
+                                 if not e.get("ok") and e.get("class") == "once")
+                if once_count >= 2 or n >= MAX_ATTEMPTS:
+                    return finish_terminal("gave_up", k, n, reason, accept_exit,
+                                           current_last_event, tail_final)
+            else:
+                if n >= MAX_ATTEMPTS:
+                    return finish_terminal("gave_up", k, n, reason, accept_exit,
+                                           current_last_event, tail_final)
+            delay = backoff[min(n - 1, len(backoff) - 1)]
+            retry_at = (datetime.datetime.now(datetime.timezone.utc) +
+                        datetime.timedelta(seconds=delay)).isoformat()
+            head_cur, commits_cur = git_snapshot()
+            write_state("retry_wait", k, n, None, now_iso(), current_last_event,
+                        head_cur, commits_cur, tail_final, accept_exit, retry_at, reason)
+            res = sleep_with_state_updates(delay, "retry_wait", k, n, retry_at, reason, err_path)
+            prev = load_json(state_path, {}) or {}
+            if current_last_event is not None:
+                prev["last_event"] = current_last_event
+                try:
+                    atomic_write_json(state_path, prev)
+                except OSError:
+                    pass
+            if res == "stopped":
+                return finish_terminal("stopped", k, n, "stopped", accept_exit,
+                                       current_last_event, tail_final)
+        if not step_done:
+            # Should be unreachable (gave_up returns), but guard anyway.
+            return finish_terminal("gave_up", k, MAX_ATTEMPTS, last_reason or "out of attempts",
+                                   accept_exit, current_last_event, "")
+
+    # ---- acceptance ----
+    if not accept_cmd:
+        # No acceptance: done. Keep last attempt info from final step.
+        last_k_hist = history.get(str(steps)) or []
+        last_att = len(last_k_hist) or 1
+        try:
+            last_att = int(last_k_hist[-1].get("attempt", last_att)) if last_k_hist else 1
+        except Exception:
+            pass
+        try:
+            tail_done = "\n".join(read_tail_filtered(
+                os.path.join(ldir, "step%d-attempt%d.err" % (steps, last_att))))
+            tail_done = redact_text(tail_done, secrets)
+        except Exception:
+            tail_done = ""
+        return finish_terminal("done", steps, last_att, last_reason, None,
+                               current_last_event, tail_done)
+    # Run acceptance command.
+    if stop_requested["flag"] or _stop_marker_present():
+        last_k_hist = history.get(str(steps)) or []
+        try:
+            last_att0 = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
+        except Exception:
+            last_att0 = 1
+        return finish_terminal("stopped", steps, last_att0, "stopped", None,
+                               current_last_event, "")
+    shell = "/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/sh"
+    accept_log = os.path.join(ldir, "accept.log")
+    secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
+    slog("accepting: %s -c %s" % (shell, accept_cmd))
+    head_cur, commits_cur = git_snapshot()
+    last_k_hist0 = history.get(str(steps)) or []
+    try:
+        last_att0 = int(last_k_hist0[-1].get("attempt", 1)) if last_k_hist0 else 1
+    except Exception:
+        last_att0 = 1
+    write_state("accepting", steps, last_att0,
+                None, now_iso(), current_last_event, head_cur, commits_cur, "",
+                None, None, last_reason)
+    try:
+        alog_f = open(accept_log, "w", encoding="utf-8", errors="replace")
+        try:
+            os.fchmod(alog_f.fileno(), 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        reason = redact_text("accept spawn failed: %s" % e, secrets)
+        try:
+            atomic_write_text(accept_log, reason + "\n")
+        except OSError:
+            pass
+        return finish_terminal("failed", steps, last_att0, reason, 127,
+                               current_last_event, "")
+    try:
+        aproc = subprocess.Popen([shell, "-c", accept_cmd], cwd=cwd, env=accept_env,
+                                 stdin=subprocess.DEVNULL, stdout=alog_f, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+    except Exception as e:
+        try:
+            alog_f.close()
+        except Exception:
+            pass
+        reason = redact_text("accept spawn failed: %s" % e, secrets)
+        try:
+            atomic_write_text(accept_log, reason + "\n")
+        except OSError:
+            pass
+        return finish_terminal("failed", steps, last_att0, reason, 127,
+                               current_last_event, "")
+    try:
+        accept_started = get_start_time(aproc.pid)
+    except Exception:
+        accept_started = None
+    accept_start_m = time.monotonic()
+    last_update_m = 0.0
+    accept_rc = None
+    timed_out = False
+    while True:
+        if stop_requested["flag"] or _stop_marker_present():
+            _kill_process_group(aproc, signal.SIGTERM)
+            try:
+                aproc.wait(timeout=5)
+            except Exception:
+                _kill_process_group(aproc, signal.SIGKILL)
+                try:
+                    aproc.wait(timeout=5)
+                except Exception:
+                    pass
+            try:
+                alog_f.close()
+            except Exception:
+                pass
+            try:
+                with open(accept_log, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()
+                atomic_write_text(accept_log, redact_text("\n".join(lines[-60:]) + ("\n" if lines else ""), secrets))
+            except OSError:
+                pass
+            last_k_hist = history.get(str(steps)) or []
+            try:
+                last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
+            except Exception:
+                last_att = 1
+            return finish_terminal("stopped", steps, last_att, "stopped", None,
+                                   current_last_event, "")
+        ret = aproc.poll()
+        now_m = time.monotonic()
+        if ret is None and now_m - accept_start_m >= ACCEPT_TIMEOUT_SEC:
+            timed_out = True
+            _kill_process_group(aproc, signal.SIGTERM)
+            try:
+                aproc.wait(timeout=10)
+            except Exception:
+                _kill_process_group(aproc, signal.SIGKILL)
+                try:
+                    aproc.wait(timeout=5)
+                except Exception:
+                    pass
+            ret = aproc.returncode
+        if now_m - last_update_m >= poll_sec or ret is not None:
+            head_cur, commits_cur = git_snapshot()
+            last_k_hist = history.get(str(steps)) or []
+            try:
+                last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
+            except Exception:
+                last_att = 1
+            write_state("accepting", steps, last_att, None, now_iso(), current_last_event,
+                        head_cur, commits_cur, "", None, None, last_reason,
+                        accept_pid=aproc.pid if ret is None else None,
+                        accept_started=accept_started if ret is None else None)
+            last_update_m = now_m
+        if ret is not None:
+            accept_rc = ret
+            break
+        time.sleep(min(0.2, poll_sec))
+    try:
+        alog_f.close()
+    except Exception:
+        pass
+    try:
+        with open(accept_log, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        atomic_write_text(accept_log, redact_text("\n".join(lines[-60:]) + ("\n" if lines else ""), secrets))
+    except OSError:
+        pass
+    _chmod_0600(accept_log)
+    last_k_hist = history.get(str(steps)) or []
+    try:
+        last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
+    except Exception:
+        last_att = 1
+    if timed_out:
+        return finish_terminal("failed", steps, last_att,
+                               "accept timeout after 2h", 124,
+                               current_last_event, "")
+    if accept_rc == 0:
+        return finish_terminal("done", steps, last_att, last_reason, 0, current_last_event, "")
+    return finish_terminal("failed", steps, last_att,
+                           "accept exit %s" % accept_rc, accept_rc,
+                           current_last_event, "")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="muse-lane", description="Supervisor for long headless Muse runs.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    ps = sub.add_parser("start", help="Start a new lane.")
+    ps.add_argument("--cwd", required=True, help="Working directory for muse and acceptance.")
+    ps.add_argument("--brief", dest="briefs", action="append", required=True, help="Brief markdown file (repeatable).")
+    ps.add_argument("--id", default=None, help="Lane id (default: timestamp-slug).")
+    ps.add_argument("--label", default="", help="Human label.")
+    ps.add_argument("--accept", default=None, help="Acceptance shell command.")
+    ps.add_argument("--effort", default="max", help="Reasoning effort (default: max).")
+    ps.add_argument("--env-file", default=None, help="KEY=VALUE file added to the environment.")
+    ps.add_argument("--accept-env", action="store_true", help="Pass env-file keys to the acceptance command.")
+    ps.add_argument("--stall-min", type=float, default=40.0, help="Stall minutes (default: 40).")
+    ps.add_argument("--owner-session", default=None, help="Owning session id for wake-ups.")
+    pr = sub.add_parser("_run", help="Run the supervisor (internal).")
+    pr.add_argument("id", help="Lane id.")
+    pt = sub.add_parser("status", help="Show lane status.")
+    pt.add_argument("id", nargs="?", default=None, help="Lane id (default: all).")
+    pt.add_argument("--json", action="store_true", help="Print JSON list.")
+    pk = sub.add_parser("stop", help="Stop a lane.")
+    pk.add_argument("id", help="Lane id.")
+    pm = sub.add_parser("resume", help="Resume an orphaned lane.")
+    pm.add_argument("id", help="Lane id.")
+    py = sub.add_parser("summary", help="Print a lane summary.")
+    py.add_argument("id", help="Lane id.")
+    prt = sub.add_parser("root", help="Print the lanes root directory.")
+    pa = sub.add_parser("ack", help="Claim a lane announcement (exactly-once).")
+    pa.add_argument("id", help="Lane id.")
+    pa.add_argument("--orphan", action="store_true",
+                    help="Claim the orphan announcement for the current incarnation.")
+    return p
+
+
+def cmd_root(_args):
+    print(lanes_root())
+    return 0
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.cmd == "start":
+        return cmd_start(args)
+    if args.cmd == "_run":
+        return cmd_run(args.id)
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "stop":
+        return cmd_stop(args)
+    if args.cmd == "resume":
+        return cmd_resume(args)
+    if args.cmd == "summary":
+        return cmd_summary(args)
+    if args.cmd == "root":
+        return cmd_root(args)
+    if args.cmd == "ack":
+        return cmd_ack(args)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
