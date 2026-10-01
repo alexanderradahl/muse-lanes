@@ -17,7 +17,10 @@ Claude stays the lead that plans and reviews, and Muse does the long, checkable 
   - `lane_resume` continues a lane whose supervisor died, from the step it recorded.
 - **Panel:** `/muse` opens a pane listing your lanes.
 - **Wake-up:** when one of this session's lanes ends, the plugin submits its summary as a prompt. Each lane
-  wakes the session that started it once, and no other session.
+  wakes the session that started it once, and no other session. A one-line toast names the lane and its end
+  state alongside the prompt.
+- **Status line:** while this session owns running or retry-waiting lanes, the plugin pins
+  `muse: N running` under the prompt. It clears when none remain.
 
 ## Requirements
 
@@ -83,6 +86,7 @@ bin/muse-lane status
 
 ```bash
 python3 bin/test_muse_lane.py      # runner tests, about 40 s, using a fake muse
+claude plugin test .
 claude plugin validate --strict .
 ```
 

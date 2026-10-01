@@ -1,6 +1,6 @@
 {
   "name": "muse",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run Muse lanes (headless muse exec, chained briefs, acceptance) under a supervisor that survives outages and stalls; one panel, one wake-up per finished lane.",
   "userConfig": {
     "envFile": {

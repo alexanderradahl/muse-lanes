@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.1 — 2026-10-01
+
+- Plugin tests: `tests/plugin.test.ts` runs under `claude plugin test`, faking the
+  runner beneath the plugin (status, summary and ack semantics) and pinning the
+  `$.state.set(ref, value)` shape.
+- Status line: `muse: N running` while this session owns running or retry-waiting
+  lanes, cleared when there are none, updated on each poll.
+- Toast: a one-line toast naming the lane and its end state when an owned lane
+  ends, alongside the wake-up prompt.
+
 ## 0.1.0 — 2026-10-01
 
 First release.
