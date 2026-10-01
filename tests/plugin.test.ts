@@ -281,6 +281,27 @@ test('orphaned lane is announced once, then its real end after resume', async ($
   expectStateShape(world)
 })
 
+test('owned lane end toasts alongside the wake-up', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  world.lanes.push({
+    id: 'lane-8', label: 'hotel', status: 'done',
+    owner: ME, announced: false, orphanAnnounced: false,
+    summary: 'hotel summary',
+  })
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(1)
+  expect(world.toasts).toHaveLength(1)
+  expect(world.toasts[0]).toContain('hotel')
+  expect(world.toasts[0]).toContain('done')
+  expect(world.toasts[0]).not.toContain('\n')
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(1)
+  expect(world.toasts).toHaveLength(1)
+  expectStateShape(world)
+})
+
 test('two overlapping polls submit a lane once', async ($, on) => {
   const { world, clock } = setup(on)
   await begin($, clock)

@@ -116,6 +116,7 @@ async function poll($: any) {
         }
         continue
       }
+      $.ui.toast(`Muse lane ${l.label ?? l.id} ended: ${l.status}`)
       await $.prompt.submit({ text: `Muse lane ${l.label ?? l.id} (${l.id}) ended: ${l.status}.\n\n${text}` })
       if (l.id in tries) {
         delete tries[l.id]
