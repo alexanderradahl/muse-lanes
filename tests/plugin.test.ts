@@ -526,3 +526,32 @@ test('lane_start passes review and consult_max to the runner', async ($, on) => 
   expect(world.startArgs[2]).toContain('0')
   expectStateShape(world)
 })
+
+test('stacked polls behind a slow status issue one fetch', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  world.lanes.push({
+    id: 'lane-slow', label: 'slow', status: 'done',
+    owner: ME, announced: false, orphanAnnounced: false,
+    summary: 'slow summary',
+  })
+
+  // One 38 s status fetch in flight while ticks keep firing: every later
+  // poll must skip instead of stacking a fetch of its own.
+  let release!: () => void
+  world.gate = new Promise<void>(resolve => { release = resolve })
+  const before = world.statusJsonCalls
+  const calls = Array.from({ length: 6 }, () => $.tool.call({ tool: 'mcp__muse__lane_status' }))
+  await Promise.all(calls)
+  release()
+  world.gate = null
+  await clock.settle()
+
+  expect(world.submits).toHaveLength(1)
+  expect(world.submits[0]).toContain('slow summary')
+  expect(world.statusJsonCalls - before).toBe(1)
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(1)
+  expectStateShape(world)
+})
