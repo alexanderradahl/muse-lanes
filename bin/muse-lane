@@ -1275,6 +1275,12 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
     rerr = state.get("review_error")
     if rcfg.get("enabled") or rrounds or rerr:
         lines.append("## %s" % REVIEW_HEADING)
+        try:
+            _fr = rcfg.get("rounds")
+            _fr = 1 if _fr is None else int(_fr)
+        except (TypeError, ValueError):
+            _fr = 1
+        lines.append("Fix re-runs allowed: %d" % _fr)
         if rrounds:
             for e in rrounds:
                 try:
@@ -1397,10 +1403,10 @@ def get_review_diff(cwd, head_start, head):
 
 def build_review_brief(lane_label, lane_id, brief_texts, head_start, head,
                        stat, full, files, accept_cmd, accept_exit, accept_tail,
-                       controls, rnd, rounds_max, extra):
-    """Review brief text for round rnd (1-based)."""
+                       controls, rnd, reviews_total, extra):
+    """Review brief text for round rnd (1-based) of reviews_total reviews."""
     L = []
-    L.append("# %s — round %d of %d" % (REVIEW_HEADING, rnd, rounds_max))
+    L.append("# %s — round %d of %d" % (REVIEW_HEADING, rnd, reviews_total))
     L.append("")
     L.append("You are a pre-filter, not the independent review. An Opus lead does the")
     L.append("final independent review after you; your job is to catch issues first so the")
@@ -1587,8 +1593,8 @@ def cmd_start(args):
     except (TypeError, ValueError):
         print("muse-lane: invalid --review-rounds", file=sys.stderr)
         return 1
-    if review_rounds < 1:
-        print("muse-lane: --review-rounds must be >= 1", file=sys.stderr)
+    if review_rounds < 0:
+        print("muse-lane: --review-rounds must be >= 0", file=sys.stderr)
         return 1
     review_extra = None
     if getattr(args, "review_brief", None):
@@ -2281,11 +2287,15 @@ def cmd_run(lane_id):
     rcfg = lane.get("review") if isinstance(lane.get("review"), dict) else {}
     review_enabled = bool(rcfg.get("enabled"))
     try:
-        review_rounds_max = int(rcfg.get("rounds") or 1)
+        _rr = rcfg.get("rounds")
+        review_rounds_max = int(1 if _rr is None else _rr)
     except (TypeError, ValueError):
         review_rounds_max = 1
-    if review_rounds_max < 1:
-        review_rounds_max = 1
+    if review_rounds_max < 0:
+        review_rounds_max = 0
+    # rounds counts fix re-runs, not reviews: 1 initial review plus one
+    # review per fix, so 0 means review once with no fix.
+    review_total = review_rounds_max + 1
     review_extra = rcfg.get("brief")
     try:
         lane_stall_sec = float(lane.get("stall_sec", 40 * 60))
@@ -3412,7 +3422,7 @@ def cmd_run(lane_id):
         brief_text = redact_text(build_review_brief(
             lane.get("label") or "", lane.get("id") or lane_id, brief_texts,
             head_start, head_now, stat, full, files, accept_cmd, accept_exit,
-            accept_tail, controls, rnd, review_rounds_max, review_extra), secrets)
+            accept_tail, controls, rnd, review_total, review_extra), secrets)
         brief_path = os.path.join(ldir, "review-brief%d.md" % rnd)
         try:
             atomic_write_text(brief_path, brief_text)
@@ -3675,8 +3685,8 @@ def cmd_run(lane_id):
     if not review_enabled:
         return finish_terminal("done", steps, alast, last_reason, arc, current_last_event, atail)
 
-    # ---- pre-review rounds ----
-    for rnd in range(len(review_rounds_done) + 1, review_rounds_max + 1):
+    # ---- pre-review: 1 initial review, then one fix + review per round ----
+    for rnd in range(len(review_rounds_done) + 1, review_total + 1):
         rres = run_review_round(rnd)
         if rres[0] == "finished":
             return rres[1]
@@ -3686,9 +3696,9 @@ def cmd_run(lane_id):
         if rres[0] == "error":
             return finish_terminal("done", steps, last_attempt_of_last_step(),
                                    last_reason, accept_exit, current_last_event, "")
-        if rnd >= review_rounds_max:
+        if rnd >= review_total:
             return finish_terminal("review_failed", steps, last_attempt_of_last_step(),
-                                   "pre-review round %d FAILed with no rounds left" % rnd,
+                                   "pre-review FAILed with no fix re-runs left",
                                    accept_exit, current_last_event, "")
         findings = rres[1]
         slog("review round %d FAILed; re-running step %d" % (rnd, steps))
@@ -3723,7 +3733,7 @@ def build_parser():
     ps.add_argument("--owner-session", default=None, help="Owning session id for wake-ups.")
     ps.add_argument("--review", action="store_true", help="Run a Muse pre-review after a passing accept.")
     ps.add_argument("--review-brief", default=None, help="Extra review instructions (text, or a file path to read).")
-    ps.add_argument("--review-rounds", type=int, default=1, help="Max pre-review rounds (default: 1).")
+    ps.add_argument("--review-rounds", type=int, default=1, help="Max fix re-runs after a FAIL review (default: 1; 0 reviews once with no fix).")
     ps.add_argument("--consult-max", type=int, default=3, help="Max consult answers per step, 0 disables (default: 3).")
     ps.add_argument("--consult-timeout-min", type=float, default=15.0, help="Consult helper timeout in minutes (default: 15).")
     pr = sub.add_parser("_run", help="Run the supervisor (internal).")
