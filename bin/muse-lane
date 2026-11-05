@@ -2912,10 +2912,10 @@ def cmd_run(lane_id):
         redact_file_inplace(err_path, secrets)
         if timed_out:
             return ("timeout", "")
-        ok, text = check_completion(jsonl_path)
-        if ok:
-            return ("ok", text or "")
-        return ("failed", text or "")
+        _v = get_terminal_verdict(jsonl_path)
+        if _v.get("has_event") and _v.get("terminal") == "completed":
+            return ("ok", _v.get("text") or "")
+        return ("failed", "")
 
     def maybe_handle_consult(k):
         """Answer one pending ASK.md for step k. True when one was handled."""
