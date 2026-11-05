@@ -44,6 +44,41 @@ if _base.startswith("consult-brief"):
     time.sleep(float(os.environ.get("FAKE_CONSULT_SLEEP", "0.1")))
     emit(os.environ.get("FAKE_CONSULT_ANSWER", "helper answer 42"))
     sys.exit(0)
+if _base.startswith("review-brief"):
+    _rmode = os.environ.get("FAKE_REVIEW_MODE", "")
+    if _rmode == "crash":
+        sys.stderr.write("review crashed boom\n")
+        sys.stderr.flush()
+        time.sleep(0.1)
+        sys.exit(1)
+    if _rmode == "sleep":
+        time.sleep(float(os.environ.get("FAKE_REVIEW_SLEEP", "30")))
+        sys.exit(1)
+    _verdict = os.environ.get("FAKE_REVIEW_VERDICT", "PASS")
+    _fails = int(os.environ.get("FAKE_REVIEW_FAILS", "0"))
+    _cf = os.environ.get("FAKE_REVIEW_COUNT_FILE", "")
+    if _fails > 0 and _cf:
+        _n = 0
+        if os.path.exists(_cf):
+            try:
+                with open(_cf) as _f:
+                    _n = int((_f.read() or "0").strip() or "0")
+            except Exception:
+                _n = 0
+        _n += 1
+        with open(_cf, "w") as _f:
+            _f.write(str(_n))
+        _verdict = "FAIL" if _n <= _fails else "PASS"
+    if os.environ.get("FAKE_REVIEW_DIRTY", "") == "1":
+        try:
+            with open(os.environ.get("FAKE_REVIEW_DIRTY_FILE", "tracked.txt"), "a") as _df:
+                _df.write("reviewer was here\n")
+        except Exception as _e:
+            sys.stderr.write("dirty write failed: %s\n" % _e)
+    _find = os.environ.get("FAKE_REVIEW_FINDINGS", "1. main.py:10 missing check")
+    time.sleep(float(os.environ.get("FAKE_SLEEP", "0.2")))
+    emit(_verdict + "\n" + _find)
+    sys.exit(0)
 if mode == "complete":
     txt = os.environ.get("FAKE_TEXT", "hello final")
     # include some stderr noise that must be filtered from the tail
@@ -52,45 +87,6 @@ if mode == "complete":
     sys.stderr.write("`skills_catalog` was trimmed to fit its size limit\n")
     sys.stderr.write("real error line\n")
     sys.stderr.flush()
-    base = os.path.basename(prompt_file)
-    if base.startswith("review-brief"):
-        import re as _re
-        _m = _re.search(r"(\d+)", base)
-        _rnd = _m.group(1) if _m else "1"
-        _rmode = os.environ.get("FAKE_REVIEW_MODE", "")
-        if _rmode == "crash":
-            sys.stderr.write("review crashed boom\n")
-            sys.stderr.flush()
-            time.sleep(0.1)
-            sys.exit(1)
-        if _rmode == "sleep":
-            time.sleep(float(os.environ.get("FAKE_REVIEW_SLEEP", "30")))
-            sys.exit(1)
-        _verdict = os.environ.get("FAKE_REVIEW_VERDICT", "PASS")
-        _fails = int(os.environ.get("FAKE_REVIEW_FAILS", "0"))
-        _cf = os.environ.get("FAKE_REVIEW_COUNT_FILE", "")
-        if _fails > 0 and _cf:
-            _n = 0
-            if os.path.exists(_cf):
-                try:
-                    with open(_cf) as _f:
-                        _n = int((_f.read() or "0").strip() or "0")
-                except Exception:
-                    _n = 0
-            _n += 1
-            with open(_cf, "w") as _f:
-                _f.write(str(_n))
-            _verdict = "FAIL" if _n <= _fails else "PASS"
-        try:
-            os.makedirs(".lane", exist_ok=True)
-        except Exception:
-            pass
-        _find = os.environ.get("FAKE_REVIEW_FINDINGS", "1. main.py:10 missing check")
-        try:
-            with open(".lane/REVIEW-%s.md" % _rnd, "w") as _f:
-                _f.write(_verdict + "\n" + _find + "\n")
-        except Exception as _e:
-            sys.stderr.write("verdict write failed: %s\n" % _e)
     time.sleep(float(os.environ.get("FAKE_SLEEP", "0.2")))
     emit(txt)
     sys.exit(0)
@@ -1552,6 +1548,7 @@ class TestReviewPass(LaneBase):
             rb = f.read()
         self.assertIn("review pass work", rb)
         self.assertIn("REVIEW-1.md", rb)
+        self.assertIn("round 1 of 2", rb)
 
 
 class TestReviewFailNoRoundsLeft(LaneBase):
@@ -1560,7 +1557,7 @@ class TestReviewFailNoRoundsLeft(LaneBase):
         lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
                                               "FAKE_REVIEW_VERDICT": "FAIL",
                                               "FAKE_REVIEW_FINDINGS": "1. app.py:42 missing test\n2. app.py:50 toothless control"},
-                              accept="exit 0", review=True, review_rounds=1)
+                              accept="exit 0", review=True, review_rounds=0)
         self.wait_status(lid, "review_failed", timeout=25)
         st = self.read_state(lid)
         self.assertEqual(st["status"], "review_failed")
@@ -1607,6 +1604,27 @@ class TestReviewFailThenPass(LaneBase):
             summ = f.read()
         self.assertIn("Round 1: FAIL", summ)
         self.assertIn("Round 2: PASS", summ)
+
+    def test_review_default_round_fixes_once(self):
+        count = os.path.join(self.state_dir, "review-count-default")
+        b = self.write_brief("b1.md", "default fix work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_FAILS": "1",
+                                              "FAKE_REVIEW_COUNT_FILE": count,
+                                              "FAKE_REVIEW_FINDINGS": "1. app.py:9 fix me"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=40)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "done")
+        rounds = st.get("review_rounds") or []
+        self.assertEqual([e.get("verdict") for e in rounds], ["FAIL", "PASS"])
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        self.assertIn("1-pre-r1", hist)
+        self.assertEqual(len(hist["1-pre-r1"]), 1)
+        self.assertEqual(len(hist["1"]), 1)
+        with open(self.lane_path(lid, "brief1.md")) as f:
+            self.assertIn("app.py:9", f.read())
 
 
 class TestReviewError(LaneBase):
@@ -1662,7 +1680,8 @@ class TestReviewBrief(LaneBase):
         self.assertIn("big.txt", files)
         self.assertIn("big.txt", stat)
         txt = mod.build_review_brief("lbl", "lid", ["brief one"], head_start, head,
-                                     stat, full, files, "exit 0", 0, "tail", [], 1, 1, None)
+                                     stat, full, files, "exit 0", 0, "tail", [], 1, 2, None)
+        self.assertIn("round 1 of 2", txt)
         self.assertIn("read them yourself", txt)
         self.assertIn("brief one", txt)
         self.assertIn("allowlist", txt)
@@ -1678,10 +1697,18 @@ class TestReviewBrief(LaneBase):
 
     def test_review_flags_validated(self):
         b = self.write_brief("b1.md", "x")
-        r = self.run_lane("start", "--cwd", self.cwd, "--brief", b, "--review", "--review-rounds", "0")
+        r = self.run_lane("start", "--cwd", self.cwd, "--brief", b, "--review", "--review-rounds", "-1")
         self.assertNotEqual(r.returncode, 0)
         r2 = self.run_lane("start", "--cwd", self.cwd, "--brief", b, "--review-brief", "extra")
         self.assertNotEqual(r2.returncode, 0)
+        # rounds 0 is valid: review once with no fix re-run.
+        b0 = self.write_brief("b0.md", "rounds zero work")
+        lid = self.start_lane([b0], env_extra={"FAKE_MODE": "complete",
+                                               "FAKE_REVIEW_VERDICT": "PASS"},
+                              accept="exit 0", review=True, review_rounds=0)
+        self.wait_status(lid, "done", timeout=25)
+        st = self.read_state(lid)
+        self.assertEqual(len(st.get("review_rounds") or []), 1)
 
 
 class TestConsultAnswers(LaneBase):
@@ -1742,6 +1769,75 @@ class TestConsultAnswers(LaneBase):
         self.assertFalse(consults[0].get("answered"))
 
 
+class TestReadOnlySessions(LaneBase):
+    def test_consult_and_review_run_without_write(self):
+        argv_file = os.path.join(self.state_dir, "argv-ro.log")
+        b = self.write_brief("b1.md", "readonly work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "1",
+                                              "FAKE_CONSULT_ANSWER": "CONSULT-RO-9",
+                                              "FAKE_REVIEW_VERDICT": "PASS",
+                                              "FAKE_REVIEW_FINDINGS": "1. ok.py:1 fine",
+                                              "FAKE_ARGV_FILE": argv_file},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=40)
+        with open(argv_file) as f:
+            argvs = [json.loads(line) for line in f.read().splitlines()
+                     if line.strip()]
+        by_prompt = {}
+        for argv in argvs:
+            if "--prompt-file" in argv:
+                pf = argv[argv.index("--prompt-file") + 1]
+                by_prompt[os.path.basename(pf)] = argv
+        step_argv = by_prompt.get("brief1.md")
+        consult_argv = by_prompt.get("consult-brief-1.md")
+        review_argv = by_prompt.get("review-brief1.md")
+        self.assertTrue(step_argv and consult_argv and review_argv,
+                        "missing sessions: %s" % sorted(by_prompt))
+        self.assertNotIn("--disable-write", step_argv)
+        self.assertIn("--disable-write", consult_argv)
+        self.assertIn("--disable-write", review_argv)
+        # The supervisor wrote both answer files from the helper's final text.
+        with open(os.path.join(self.cwd, ".lane", "ANSWER-1.md")) as f:
+            self.assertIn("CONSULT-RO-9", f.read())
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            self.assertIn("CONSULT-RO-9", f.read())
+        # The supervisor wrote both verdict files from the reviewer's final text.
+        for p in (os.path.join(self.cwd, ".lane", "REVIEW-1.md"),
+                  self.lane_path(lid, "REVIEW-1.md")):
+            with open(p) as f:
+                content = f.read()
+            self.assertTrue(content.startswith("PASS"),
+                            "verdict file %s: %r" % (p, content[:40]))
+            self.assertIn("ok.py:1", content)
+
+    def test_review_session_changing_tracked_files_fails_lane(self):
+        subprocess.run(["git", "init"], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=self.cwd, capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=self.cwd, capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=self.cwd, capture_output=True, timeout=15)
+        with open(os.path.join(self.cwd, "tracked.txt"), "w") as f:
+            f.write("v1\n")
+        subprocess.run(["git", "add", "."], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        b = self.write_brief("b1.md", "dirty review work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_VERDICT": "PASS",
+                                              "FAKE_REVIEW_DIRTY": "1",
+                                              "FAKE_REVIEW_DIRTY_FILE": "tracked.txt"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "failed", timeout=30)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "failed")
+        self.assertEqual(st.get("reason"), "review session changed tracked files")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("tracked.txt", summ)
+        # Nothing is reverted: the reviewer's edit is still there.
+        with open(os.path.join(self.cwd, "tracked.txt")) as f:
+            self.assertIn("reviewer was here", f.read())
+
+
 class TestAcceptPhases(LaneBase):
     def test_phase_from_accept_lines(self):
         b = self.write_brief("b1.md", "phase work")
@@ -1781,7 +1877,7 @@ class TestAcceptPhases(LaneBase):
         b2 = self.write_brief("b2.md", "review phase work")
         lid2 = self.start_lane([b2], env_extra={"FAKE_MODE": "complete",
                                                 "FAKE_REVIEW_VERDICT": "FAIL"},
-                               accept="exit 0", review=True, review_rounds=1)
+                               accept="exit 0", review=True, review_rounds=0)
         self.wait_status(lid2, "review_failed", timeout=25)
         st2 = self.read_state(lid2)
         self.assertEqual(st2.get("phase"), "review:1")
