@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.3 — 2026-11-05
+
+- Final-answer extraction is one shared helper: the last non-blank completed terminal text, falling back
+  to the joined `run.output.delta` stream when muse 1.3 emits an empty terminal event. Consult, review and
+  step finals all use it. Fixes consult answers lost when a stray empty run followed the real one (the
+  supervisor logged "ok" while `ANSWER.md` said the helper failed).
+- A consult that completes with no answer text anywhere is now logged `failed` with the reason, never `ok`.
+- Pre-review severity rule: the generated brief says any blocker or should-fix finding means FAIL and PASS
+  only when the findings are nits or none. A PASS whose numbered findings carry blocker/should-fix severity
+  is overridden to FAIL (`PASS overridden: should-fix findings` in the summary) and runs the fix round.
+
 ## 0.2.2 — 2026-11-05
 
 - `status --active` and `--limit` now filter from cheap state (status, ended time) before building

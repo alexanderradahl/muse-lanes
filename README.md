@@ -96,7 +96,9 @@ lists files and asks the reviewer to read them), the accept output tail, and any
 since `head_start`. The brief asks for: each brief requirement checked against the diff, writes outside the
 named allowlist, tests that would pass without the change, missing or toothless controls, and behaviour the
 accept didn't exercise. The reviewer returns the verdict as its final answer text (first line `PASS` or `FAIL`,
-then numbered findings with file:line); the supervisor records it as `.lane/REVIEW-<round>.md` itself.
+then numbered findings with severity and file:line); the supervisor records it as `.lane/REVIEW-<round>.md` itself.
+Each finding is a blocker, a should-fix, or a nit: any blocker or should-fix means `FAIL`, and a `PASS` that
+lists one is overridden to `FAIL` and runs the fix round like any other `FAIL`.
 
 On FAIL with fix re-runs left, the runner archives the last step's attempts, appends the findings to its brief,
 re-runs it and the accept, and reviews again (round N of `rounds + 1`). A FAIL on the last review ends the lane
