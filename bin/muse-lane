@@ -1762,6 +1762,101 @@ def cmd_start(args):
     return 0
 
 
+def _default_queued_state(lane):
+    return {
+        "status": "queued",
+        "step": 1,
+        "steps": len(lane.get("briefs") or []),
+        "attempt": 1,
+        "supervisor_pid": None,
+        "supervisor_started": None,
+        "muse_pid": None,
+        "muse_started": None,
+        "accept_pid": None,
+        "accept_started": None,
+        "started_at": lane.get("created_at"),
+        "updated_at": lane.get("created_at"),
+        "last_activity_at": lane.get("created_at"),
+        "last_event": None,
+        "head_start": None,
+        "head": None,
+        "commits": 0,
+        "stderr_tail": "",
+        "accept_exit": None,
+        "retry_at": None,
+        "reason": None,
+        "phase": None,
+        "phase_started": None,
+        "review_rounds": [],
+        "review_error": None,
+        "consults": [],
+    }
+
+
+def _cheap_status_view(lid):
+    """Lane + state + display status from JSON and a lock probe only.
+
+    No subprocesses, no log reads: cheap enough to run for every lane ever
+    so --active/--limit can shed lanes before any per-lane work.
+    Returns (lane, state, disp) or None when the lane has no lane.json.
+    """
+    lane = load_lane(lid)
+    if lane is None:
+        return None
+    state = load_state(lid)
+    if state is None:
+        state = _default_queued_state(lane)
+        disp = "queued"
+    else:
+        disp = display_status(state.get("status"), state.get("supervisor_pid"),
+                              lane_id=lid, state=state, lane=lane)
+    return (lane, state, disp)
+
+
+def _is_live_display_status(disp):
+    return disp in NON_TERMINAL or disp == "orphaned"
+
+
+def _build_status_obj(lid, lane, state, disp):
+    ldir = lane_dir(lid)
+    obj = dict(state)
+    # Old state files lack review/phase fields; read them unchanged.
+    obj.setdefault("phase", None)
+    obj.setdefault("phase_started", None)
+    obj.setdefault("review_rounds", [])
+    obj.setdefault("review_error", None)
+    obj.setdefault("consults", [])
+    obj["id"] = lid
+    obj["label"] = lane.get("label") or ""
+    obj["cwd"] = lane.get("cwd") or ""
+    obj["status"] = disp
+    obj["owner_session"] = lane.get("owner_session")
+    obj["announced"] = is_announced(ldir)
+    obj["orphan_announced"] = is_orphan_announced(ldir, state)
+    obj["stall_sec"] = lane.get("stall_sec")
+    # One git subprocess per lane; ended lanes keep a null subject so a
+    # full listing never shells out for lanes nobody is watching.
+    if _is_live_display_status(disp):
+        try:
+            obj["last_subject"] = get_last_subject(lane.get("cwd") or "")
+        except Exception:
+            obj["last_subject"] = None
+    else:
+        obj["last_subject"] = None
+    try:
+        with open(os.path.join(ldir, "accept.log"), "r", encoding="utf-8", errors="replace") as f:
+            obj["accept_tail"] = "\n".join(f.read().splitlines()[-5:])
+    except (FileNotFoundError, OSError):
+        obj["accept_tail"] = ""
+    # Redact anything printable using this lane's secrets.
+    secrets = secrets_from_env_file(lane.get("env_file"))
+    if secrets:
+        for k, v in list(obj.items()):
+            if isinstance(v, str):
+                obj[k] = redact_text(v, secrets)
+    return obj
+
+
 def cmd_status(args):
     want_id = getattr(args, "id", None)
     as_json = bool(getattr(args, "json", False))
@@ -1773,94 +1868,32 @@ def cmd_status(args):
             return 1
     else:
         ids = list_lane_ids_newest_first()
-    objs = []
+    views = []
     for lid in ids:
-        lane = load_lane(lid)
-        if lane is None:
+        v = _cheap_status_view(lid)
+        if v is None:
             continue
-        state = load_state(lid)
-        if state is None:
-            state = {
-                "status": "queued",
-                "step": 1,
-                "steps": len(lane.get("briefs") or []),
-                "attempt": 1,
-                "supervisor_pid": None,
-                "supervisor_started": None,
-                "muse_pid": None,
-                "muse_started": None,
-                "accept_pid": None,
-                "accept_started": None,
-                "started_at": lane.get("created_at"),
-                "updated_at": lane.get("created_at"),
-                "last_activity_at": lane.get("created_at"),
-                "last_event": None,
-                "head_start": None,
-                "head": None,
-                "commits": 0,
-                "stderr_tail": "",
-                "accept_exit": None,
-                "retry_at": None,
-                "reason": None,
-                "phase": None,
-                "phase_started": None,
-                "review_rounds": [],
-                "review_error": None,
-                "consults": [],
-            }
-            disp = "queued"
-        else:
-            disp = display_status(state.get("status"), state.get("supervisor_pid"),
-                                  lane_id=lid, state=state, lane=lane)
-        ldir = lane_dir(lid)
-        obj = dict(state)
-        # Old state files lack review/phase fields; read them unchanged.
-        obj.setdefault("phase", None)
-        obj.setdefault("phase_started", None)
-        obj.setdefault("review_rounds", [])
-        obj.setdefault("review_error", None)
-        obj.setdefault("consults", [])
-        obj["id"] = lid
-        obj["label"] = lane.get("label") or ""
-        obj["cwd"] = lane.get("cwd") or ""
-        obj["status"] = disp
-        obj["owner_session"] = lane.get("owner_session")
-        obj["announced"] = is_announced(ldir)
-        obj["orphan_announced"] = is_orphan_announced(ldir, state)
-        obj["stall_sec"] = lane.get("stall_sec")
-        try:
-            obj["last_subject"] = get_last_subject(lane.get("cwd") or "")
-        except Exception:
-            obj["last_subject"] = None
-        try:
-            with open(os.path.join(ldir, "accept.log"), "r", encoding="utf-8", errors="replace") as f:
-                obj["accept_tail"] = "\n".join(f.read().splitlines()[-5:])
-        except (FileNotFoundError, OSError):
-            obj["accept_tail"] = ""
-        # Redact anything printable using this lane's secrets.
-        secrets = secrets_from_env_file(lane.get("env_file"))
-        if secrets:
-            for k, v in list(obj.items()):
-                if isinstance(v, str):
-                    obj[k] = redact_text(v, secrets)
-        objs.append(obj)
-    total = len(objs)
+        lane, state, disp = v
+        views.append((lid, lane, state, disp))
+    total = len(views)
     if not want_id and bool(getattr(args, "active", False)):
         kept = []
-        for o in objs:
-            if o.get("status") in NON_TERMINAL or o.get("status") == "orphaned":
-                kept.append(o)
+        for (lid, lane, state, disp) in views:
+            if _is_live_display_status(disp):
+                kept.append((lid, lane, state, disp))
                 continue
-            age = _iso_age_sec(o.get("updated_at"))
+            age = _iso_age_sec(state.get("updated_at"))
             if age is None or age <= 24 * 3600:
-                kept.append(o)
-        objs = kept
+                kept.append((lid, lane, state, disp))
+        views = kept
     limit = getattr(args, "limit", None)
     if not want_id and limit is not None:
         try:
-            objs = objs[:max(0, int(limit))]
+            views = views[:max(0, int(limit))]
         except (TypeError, ValueError):
             pass
+    objs = [_build_status_obj(lid, lane, state, disp)
+            for (lid, lane, state, disp) in views]
     older = total - len(objs)
     if as_json:
         print(json.dumps(objs, indent=2))

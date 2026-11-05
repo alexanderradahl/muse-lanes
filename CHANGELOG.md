@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2 — 2026-11-05
+
+- `status --active` and `--limit` now filter from cheap state (status, ended time) before building
+  per-lane objects, and the `git log -1` behind `last_subject` runs only for live lanes (running,
+  retry_wait, accepting, queued, orphaned); ended lanes report a null subject. Listing output is
+  otherwise unchanged. Fixes 38 s+ polls with hundreds of lanes stacking across sessions.
+- Plugin test pins that stacked polls behind one slow status fetch issue a single fetch (the
+  single-flight guard stands).
+
 ## 0.2.1 — 2026-11-05
 
 - Pre-review `rounds` now counts fix re-runs, not reviews: the default `rounds: 1` reviews, and on FAIL re-runs
