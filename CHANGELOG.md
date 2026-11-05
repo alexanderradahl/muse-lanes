@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0 — 2026-11-05
+
+- Muse pre-review: `lane_start` takes `review` (`true` or `{brief, rounds}`); after a passing accept a fresh
+  Muse session reviews the diff and writes `.lane/REVIEW-<round>.md` (`PASS`/`FAIL` plus findings). FAIL
+  re-runs the last step with the findings appended, up to `rounds`; no rounds left ends the lane as
+  `review_failed`. Crashes and timeouts record `review_error` without blocking a passing accept. The summary
+  labels every round "Muse pre-review (not the independent review)".
+- Mid-step consults: a step may write `.lane/ASK.md`; the supervisor answers via a fresh read-only helper into
+  `.lane/ANSWER.md` (at most `consult_max` per step, default 3). Briefs carry a three-line protocol prefix.
+- Accept phases: `LANE-PHASE: <name>` lines during the accept set the lane's phase; steps set `step:<n>` and
+  review rounds `review:<n>`.
+- Active view: `status --json` takes `--active` and `--limit`; the hook polls the active view and a bare
+  `lane_status` shows it plus an older-lanes count (`all: true` lists everything).
+- Panel rows show phase and elapsed times, idle minutes marked past 75% of the stall budget, commits with the
+  last subject, and the last accept lines on failure, own lanes first. The status line names one owned lane's
+  label and phase.
+- Runner passes `--sandbox-network restricted` to every `muse exec` (no network inside Muse's sandbox).
+
 ## 0.1.1 — 2026-10-01
 
 - Plugin tests: `tests/plugin.test.ts` runs under `claude plugin test`, faking the
