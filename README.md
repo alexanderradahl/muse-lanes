@@ -69,7 +69,8 @@ logged in.
    whether the lane ends `done` or `failed`. While it runs, lines matching `^LANE-PHASE: (\S+)` set the lane's
    phase so long remote checks stay visible (see below).
 6. With `review` set and a passing accept, a fresh Muse session pre-reviews the diff (see below). A FAIL
-   re-runs the last step with the findings appended, then the accept and the review again, up to `rounds`.
+   re-runs the last step with the findings appended, then the accept and the review again, up to `rounds`
+   fix re-runs (default 1; 0 reviews once with no fix).
 7. The plugin checks the runner's active view every 20 seconds. When one of its lanes reaches a final state it
    records the announcement, then submits the summary.
 
@@ -87,27 +88,29 @@ One Muse review runs BEFORE the work reaches the Opus lead, so the lead spends f
 The Muse pass is a pre-filter, labelled "Muse pre-review (not the independent review)" everywhere it appears;
 Opus still does the final review.
 
-Pass `review: true` to `lane_start` (or `{brief, rounds}` with extra instructions and up to `rounds` rounds,
-default 1). After the last step and a passing accept, the runner starts a FRESH `muse exec` session — no shared
-context — with a generated brief holding the step briefs, `git diff <head_start>..HEAD --stat` plus the full
-diff (capped; past the cap it lists files and asks the reviewer to read them), the accept output tail, and any
-`control/*` branches created since `head_start`. The brief asks for: each brief requirement checked against the
-diff, writes outside the named allowlist, tests that would pass without the change, missing or toothless
-controls, and behaviour the accept didn't exercise. The reviewer writes `.lane/REVIEW-<round>.md` whose first
-line is `PASS` or `FAIL`, then numbered findings with file:line.
+Pass `review: true` to `lane_start` (or `{brief, rounds}` with extra instructions and up to `rounds` fix
+re-runs after a FAIL, default 1; 0 reviews once with no fix). After the last step and a passing accept, the
+runner starts a FRESH `muse exec` session — no shared context, `--disable-write` — with a generated brief
+holding the step briefs, `git diff <head_start>..HEAD --stat` plus the full diff (capped; past the cap it
+lists files and asks the reviewer to read them), the accept output tail, and any `control/*` branches created
+since `head_start`. The brief asks for: each brief requirement checked against the diff, writes outside the
+named allowlist, tests that would pass without the change, missing or toothless controls, and behaviour the
+accept didn't exercise. The reviewer returns the verdict as its final answer text (first line `PASS` or `FAIL`,
+then numbered findings with file:line); the supervisor records it as `.lane/REVIEW-<round>.md` itself.
 
-On FAIL with rounds left, the runner archives the last step's attempts, appends the findings to its brief,
-re-runs it and the accept, and reviews again. A FAIL with no rounds left ends the lane as `review_failed`,
-which the hook treats like `failed`. A review session that crashes or times out records `review_error` and does
-not block a passing accept. Every round's verdict and findings appear in `lane_summary` under the pre-review
-heading.
+On FAIL with fix re-runs left, the runner archives the last step's attempts, appends the findings to its brief,
+re-runs it and the accept, and reviews again (round N of `rounds + 1`). A FAIL on the last review ends the lane
+as `review_failed`, which the hook treats like `failed`. A review session that crashes or times out records
+`review_error` and does not block a passing accept — unless it changed HEAD or a tracked file, which ends the
+lane `failed` instead (the changed paths are listed in the summary; nothing is reverted). Every round's verdict
+and findings appear in `lane_summary` under the pre-review heading.
 
 ## Mid-step consults
 
 While a step runs, Muse may write `.lane/ASK.md` with a question (plus paths worth reading). The supervisor
 notices on its next poll, renames it to `.lane/ASK-<n>.md`, runs a short helper `muse exec` — fresh session,
-read-only intent, `--reasoning-effort high`, 15-minute timeout — that answers into `.lane/ANSWER-<n>.md`, then
-writes `.lane/ANSWER.md` for the step to read. Each step's brief starts with three lines describing the protocol
+`--disable-write`, `--reasoning-effort high`, 15-minute timeout — whose final answer the supervisor saves to
+`.lane/ANSWER-<n>.md`, then writes `.lane/ANSWER.md` for the step to read. Each step's brief starts with three lines describing the protocol
 (write `ASK.md`, wait for `ANSWER.md`, keep working meanwhile if it can). At most `consult_max` answers per step
 (default 3); past it, `ANSWER.md` says the limit was reached. Each exchange is logged in the summary.
 

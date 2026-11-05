@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1 — 2026-11-05
+
+- Pre-review `rounds` now counts fix re-runs, not reviews: the default `rounds: 1` reviews, and on FAIL re-runs
+  the last step with the findings, re-runs the accept, and reviews again. A FAIL after the last fix ends the
+  lane as `review_failed`. `rounds: 0` reviews once with no fix; negative values are rejected.
+- Review and consult sessions run with `--disable-write`. The reviewer returns the verdict as its final answer
+  text and the supervisor writes `.lane/REVIEW-<round>.md` itself; the consult helper's final answer is saved
+  to `.lane/ANSWER-<n>.md` and `.lane/ANSWER.md` by the supervisor.
+- A review session that changes HEAD or a tracked file ends the lane `failed` (`review session changed tracked
+  files`); the summary lists the changed paths and nothing is reverted.
+- `lane_start` passes `review.rounds: 0` through to the runner.
+
 ## 0.2.0 — 2026-11-05
 
 - Muse pre-review: `lane_start` takes `review` (`true` or `{brief, rounds}`); after a passing accept a fresh
