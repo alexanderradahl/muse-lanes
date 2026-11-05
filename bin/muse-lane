@@ -19,13 +19,17 @@ import subprocess
 import sys
 import time
 
-TERMINAL = {"done", "failed", "gave_up", "stopped"}
+TERMINAL = {"done", "failed", "gave_up", "stopped", "review_failed"}
 NON_TERMINAL = {"queued", "running", "retry_wait", "accepting"}
 
 DEFAULT_POLL_SEC = 15.0
 DEFAULT_BACKOFF = [120.0, 300.0, 600.0, 1200.0, 1800.0, 1800.0]
 MAX_ATTEMPTS = 6
 ACCEPT_TIMEOUT_SEC = 2 * 3600
+REVIEW_TIMEOUT_SEC = 30 * 60
+REVIEW_DIFF_CAP = 80000
+REVIEW_PREVIEW_CHARS = 2000
+REVIEW_HEADING = "Muse pre-review (not the independent review)"
 LOCK_NAME = "supervisor.lock"
 STOP_MARKER = "stop.requested"
 ANNOUNCE_MARKER = "announced"
@@ -1247,6 +1251,41 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
     else:
         lines.append("(none)")
     lines.append("")
+    rcfg = lane.get("review") or {}
+    rrounds = state.get("review_rounds") or []
+    rerr = state.get("review_error")
+    if rcfg.get("enabled") or rrounds or rerr:
+        lines.append("## %s" % REVIEW_HEADING)
+        if rrounds:
+            for e in rrounds:
+                try:
+                    rn = int(e.get("round", "?"))
+                except Exception:
+                    rn = "?"
+                verdict = e.get("verdict") or "?"
+                lines.append("Round %s: %s" % (rn, verdict))
+                body = ""
+                try:
+                    with open(os.path.join(ldir, "REVIEW-%s.md" % rn), "r",
+                              encoding="utf-8", errors="replace") as f:
+                        content = f.read().strip()
+                    _, findings = parse_review_verdict(content)
+                    body = findings or content
+                except (FileNotFoundError, OSError):
+                    body = e.get("findings_preview") or ""
+                if e.get("error"):
+                    lines.append("error: %s" % e.get("error"))
+                if body:
+                    lines.append("```")
+                    lines.extend(body.splitlines())
+                    lines.append("```")
+                else:
+                    lines.append("(no findings)")
+        else:
+            lines.append("(no rounds ran)")
+        if rerr:
+            lines.append("review_error: %s" % rerr)
+        lines.append("")
     for k in range(1, steps + 1):
         lines.append("## Step %d final" % k)
         try:
@@ -1261,6 +1300,143 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
     text = redact_text(text, secrets)
     atomic_write_text(os.path.join(ldir, "summary.md"), text if text.endswith("\n") else text + "\n")
     return text
+
+
+def get_control_branches_since(cwd, head_start, max_branches=20, max_commits=10):
+    """control/* branches with commits since head_start: [(branch, one-line log)]."""
+    if not cwd or not os.path.isdir(cwd):
+        return []
+    r = _git(["branch", "--list", "control/*", "--format=%(refname:short)"], cwd)
+    if r is None or r.returncode != 0:
+        return []
+    out = []
+    for b in (r.stdout or "").splitlines():
+        b = b.strip()
+        if not b:
+            continue
+        if head_start:
+            r2 = _git(["log", "--oneline", "%s..%s" % (head_start, b),
+                       "-n", str(max_commits)], cwd)
+        else:
+            r2 = _git(["log", "--oneline", "-n", str(max_commits), b], cwd)
+        if r2 is None or r2.returncode != 0:
+            continue
+        log = (r2.stdout or "").strip()
+        if log:
+            out.append((b, log))
+        if len(out) >= max_branches:
+            break
+    return out
+
+
+def get_review_diff(cwd, head_start, head):
+    """(stat, full_or_None, files) for the lane's diff.
+
+    full is None when the diff exceeds REVIEW_DIFF_CAP; then files holds
+    the --name-only list so the reviewer can read them itself.
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return ("(not a git repo)", None, [])
+    if head_start and head and head_start != head:
+        rng = "%s..%s" % (head_start, head)
+        rs = _git(["diff", rng, "--stat"], cwd)
+        stat = ((rs.stdout or "").strip() if rs and rs.returncode == 0
+                else "(stat unavailable)")
+        rf = _git(["diff", rng], cwd)
+        full = (rf.stdout or "") if rf and rf.returncode == 0 else ""
+        if len(full) > REVIEW_DIFF_CAP:
+            rn = _git(["diff", rng, "--name-only"], cwd)
+            files = [l.strip() for l in
+                     ((rn.stdout or "").splitlines() if rn and rn.returncode == 0 else [])
+                     if l.strip()]
+            return (stat or "(empty stat)", None, files)
+        return (stat or "(empty stat)", full, [])
+    if head:
+        rs = _git(["show", "--stat", "--oneline", "HEAD"], cwd)
+        stat = ((rs.stdout or "").strip() if rs and rs.returncode == 0
+                else "(stat unavailable)")
+        return (stat + "\n(no head_start baseline; HEAD shown)", None, [])
+    return ("(no commits)", None, [])
+
+
+def build_review_brief(lane_label, lane_id, brief_texts, head_start, head,
+                       stat, full, files, accept_cmd, accept_exit, accept_tail,
+                       controls, rnd, rounds_max, extra):
+    """Review brief text for round rnd (1-based)."""
+    L = []
+    L.append("# %s — round %d of %d" % (REVIEW_HEADING, rnd, rounds_max))
+    L.append("")
+    L.append("You are a pre-filter, not the independent review. An Opus lead does the")
+    L.append("final independent review after you; your job is to catch issues first so the")
+    L.append("lead spends fewer review rounds. Lane %s (%s), working directory is yours." % (
+        lane_label or "", lane_id))
+    L.append("")
+    L.append("## Checks")
+    L.append("1. Every requirement in each step brief below is met by the diff; cite the brief line and the diff hunk or file:line.")
+    L.append("2. Writes outside the named allowlist (the Reviewer notes below name it when there is one; otherwise outside the areas the briefs describe).")
+    L.append("3. Tests that would pass without the change (no failing-before / passing-after evidence).")
+    L.append("4. Missing or toothless controls (a control that cannot fail the lane is a finding).")
+    L.append("5. Behaviour the acceptance run did not exercise.")
+    L.append("")
+    if extra:
+        L.append("## Reviewer notes (from lead)")
+        L.append(extra.strip())
+        L.append("")
+    for k, txt in enumerate(brief_texts, start=1):
+        L.append("## Step %d brief" % k)
+        L.append((txt or "(empty)").strip() or "(empty)")
+        L.append("")
+    L.append("## Diff stat (head_start %s .. HEAD %s)" % (
+        (head_start or "(none)")[:12], (head or "(none)")[:12]))
+    L.append("```")
+    L.append((stat or "(none)").strip() or "(none)")
+    L.append("```")
+    L.append("")
+    if full is not None:
+        L.append("## Full diff")
+        L.append("```diff")
+        L.append(full.strip() or "(empty diff)")
+        L.append("```")
+        L.append("")
+    else:
+        L.append("## Diff too large for this brief (%d files); read them yourself" % len(files))
+        for f in files[:500]:
+            L.append("- %s" % f)
+        L.append("Use `git diff <head_start>..HEAD -- <file>` or read the worktree files.")
+        L.append("")
+    L.append("## Acceptance")
+    L.append("Command: %s" % (accept_cmd or "(none)"))
+    L.append("Exit: %s" % (accept_exit if accept_exit is not None else "(none)"))
+    L.append("Tail:")
+    L.append("```")
+    L.append((accept_tail or "(no output)").strip() or "(no output)")
+    L.append("```")
+    L.append("")
+    L.append("## Control branches created since head_start")
+    if controls:
+        for b, log in controls:
+            L.append("- %s" % b)
+            for ln in log.splitlines()[:10]:
+                L.append("  %s" % ln)
+    else:
+        L.append("(none)")
+    L.append("")
+    L.append("## Verdict")
+    L.append("Write `.lane/REVIEW-%d.md` in the working directory (`mkdir -p .lane` first)." % rnd)
+    L.append("Its first line must be exactly PASS or FAIL, then numbered findings (`1. path:line description`).")
+    L.append("PASS only when no material issue remains; when in doubt, FAIL with findings.")
+    return "\n".join(L) + "\n"
+
+
+def parse_review_verdict(text):
+    """(verdict, findings) with verdict in {"PASS", "FAIL", None}."""
+    if not text or not text.strip():
+        return (None, "")
+    lines = text.splitlines()
+    first = (lines[0] or "").strip().upper()
+    if first in ("PASS", "FAIL"):
+        return (first, "\n".join(lines[1:]).strip())
+    return (None, text.strip())
 
 
 def spawn_supervisor(lane_id):
@@ -1369,6 +1545,33 @@ def cmd_start(args):
         print("muse-lane: invalid --stall-min", file=sys.stderr)
         return 1
     stall_sec = stall_min * 60.0
+    try:
+        _rr = getattr(args, "review_rounds", 1)
+        review_rounds = int(1 if _rr is None else _rr)
+    except (TypeError, ValueError):
+        print("muse-lane: invalid --review-rounds", file=sys.stderr)
+        return 1
+    if review_rounds < 1:
+        print("muse-lane: --review-rounds must be >= 1", file=sys.stderr)
+        return 1
+    review_extra = None
+    if getattr(args, "review_brief", None):
+        rb = args.review_brief
+        if os.path.isfile(rb):
+            try:
+                with open(rb, "r", encoding="utf-8", errors="replace") as f:
+                    review_extra = f.read()
+            except OSError:
+                print("muse-lane: --review-brief not readable: %s" % rb, file=sys.stderr)
+                return 1
+        else:
+            review_extra = rb
+    review_cfg = None
+    if getattr(args, "review", False):
+        review_cfg = {"enabled": True, "brief": review_extra, "rounds": review_rounds}
+    elif review_extra is not None or getattr(args, "review_rounds", 1) != 1:
+        print("muse-lane: --review-brief/--review-rounds need --review", file=sys.stderr)
+        return 1
     exec_env = {}
     try:
         exec_env["MUSE_BIN"] = os.environ.get("MUSE_BIN", "") or ""
@@ -1397,6 +1600,7 @@ def cmd_start(args):
         "created_at": now_iso(),
         "exec_env": exec_env,
         "owner_session": getattr(args, "owner_session", None),
+        "review": review_cfg,
     }
     atomic_write_json(os.path.join(ldir, "lane.json"), lane)
     # Write queued state before spawning so stop/status never see a gap.
@@ -1427,6 +1631,10 @@ def cmd_start(args):
         "accept_exit": None,
         "retry_at": None,
         "reason": None,
+        "phase": None,
+        "phase_started": None,
+        "review_rounds": [],
+        "review_error": None,
     }
     atomic_write_json(os.path.join(ldir, "state.json"), queued_state)
     pid = spawn_supervisor(lane_id)
@@ -1476,6 +1684,10 @@ def cmd_status(args):
                 "accept_exit": None,
                 "retry_at": None,
                 "reason": None,
+                "phase": None,
+                "phase_started": None,
+                "review_rounds": [],
+                "review_error": None,
             }
             disp = "queued"
         else:
@@ -1483,6 +1695,11 @@ def cmd_status(args):
                                   lane_id=lid, state=state, lane=lane)
         ldir = lane_dir(lid)
         obj = dict(state)
+        # Old state files lack review/phase fields; read them unchanged.
+        obj.setdefault("phase", None)
+        obj.setdefault("phase_started", None)
+        obj.setdefault("review_rounds", [])
+        obj.setdefault("review_error", None)
         obj["id"] = lid
         obj["label"] = lane.get("label") or ""
         obj["cwd"] = lane.get("cwd") or ""
@@ -1613,6 +1830,10 @@ def _build_stopped_state(lane, state):
         "accept_exit": state.get("accept_exit"),
         "retry_at": None,
         "reason": "stopped",
+        "phase": state.get("phase"),
+        "phase_started": state.get("phase_started"),
+        "review_rounds": state.get("review_rounds") or [],
+        "review_error": state.get("review_error"),
     }
     for k, v in list(new_state.items()):
         if isinstance(v, str):
@@ -1947,6 +2168,15 @@ def cmd_run(lane_id):
     effort = lane.get("effort") or "max"
     accept_cmd = lane.get("accept")
     env_file = lane.get("env_file")
+    rcfg = lane.get("review") if isinstance(lane.get("review"), dict) else {}
+    review_enabled = bool(rcfg.get("enabled"))
+    try:
+        review_rounds_max = int(rcfg.get("rounds") or 1)
+    except (TypeError, ValueError):
+        review_rounds_max = 1
+    if review_rounds_max < 1:
+        review_rounds_max = 1
+    review_extra = rcfg.get("brief")
     try:
         lane_stall_sec = float(lane.get("stall_sec", 40 * 60))
     except (TypeError, ValueError):
@@ -1970,6 +2200,15 @@ def cmd_run(lane_id):
         stall_sec = lane_stall_sec
     if stall_sec <= 0:
         stall_sec = 1.0
+    review_timeout_sec = REVIEW_TIMEOUT_SEC
+    try:
+        rto = eff.get("MUSE_LANE_REVIEW_TIMEOUT_SEC")
+        if rto is not None and str(rto).strip() != "":
+            review_timeout_sec = float(rto)
+    except (TypeError, ValueError):
+        pass
+    if review_timeout_sec <= 0:
+        review_timeout_sec = 1.0
     muse_bin = (eff.get("MUSE_BIN", "") or "muse") or "muse"
 
     secrets = secrets_from_env_file(env_file)
@@ -2063,6 +2302,20 @@ def cmd_run(lane_id):
             head_start = None
     elif head_start is None and prev_state is not None:
         head_start = prev_state.get("head_start")
+    # Phase/review holders (old states lack these keys; .get defaults keep them readable).
+    phase_holder = {"phase": (prev_state or {}).get("phase"),
+                    "phase_started": (prev_state or {}).get("phase_started")}
+    review_rounds_done = list((prev_state or {}).get("review_rounds") or [])
+    review_error_holder = {"v": (prev_state or {}).get("review_error")}
+    current_last_event = (prev_state or {}).get("last_event")
+    # Resume past a passed accept goes straight to review: all step finals are
+    # present (start_step > steps) and the accept already passed (accept_exit 0).
+    skip_accept = bool(review_enabled and start_step > steps and accept_exit == 0)
+
+    def set_phase(v):
+        if v != phase_holder["phase"]:
+            phase_holder["phase"] = v
+            phase_holder["phase_started"] = now_iso()
 
     stop_requested = {"flag": False}
 
@@ -2112,6 +2365,10 @@ def cmd_run(lane_id):
             "accept_exit": accept_exit_v,
             "retry_at": retry_at,
             "reason": reason,
+            "phase": phase_holder["phase"],
+            "phase_started": phase_holder["phase_started"],
+            "review_rounds": review_rounds_done,
+            "review_error": review_error_holder["v"],
         }
         for k, v in list(st.items()):
             if isinstance(v, str):
@@ -2164,6 +2421,10 @@ def cmd_run(lane_id):
             "accept_exit": accept_exit_v,
             "retry_at": None,
             "reason": redact_text(reason, secrets) if reason else reason,
+            "phase": phase_holder["phase"],
+            "phase_started": phase_holder["phase_started"],
+            "review_rounds": review_rounds_done,
+            "review_error": review_error_holder["v"],
         }
         # Summary BEFORE terminal state on every exit path.
         try:
@@ -2204,13 +2465,14 @@ def cmd_run(lane_id):
             slog("step %d already exhausted %d attempts before resume; giving up" % (start_step, MAX_ATTEMPTS))
             return finish_terminal("gave_up", start_step, MAX_ATTEMPTS, last_reason or "out of attempts", accept_exit)
 
-    # ---- main step loop ----
-    current_last_event = (prev_state or {}).get("last_event")
-    for k in range(start_step if start_step <= steps else steps + 1, steps + 1):
+    # ---- step execution (also used for post-review re-runs of the last step) ----
+    # Returns ("ok",) when the step completes, else the finish_terminal code.
+    def run_step(k, brief_path, n_start):
+        nonlocal secrets, last_reason, current_last_event
+        set_phase("step:%d" % k)
         if stop_requested["flag"] or _stop_marker_present():
-            return finish_terminal("stopped", k, 1 if k != start_step else start_attempt,
+            return finish_terminal("stopped", k, n_start,
                                    "stopped", accept_exit, current_last_event, "")
-        n_start = start_attempt if k == start_step else 1
         step_done = False
         for n in range(n_start, MAX_ATTEMPTS + 1):
             if stop_requested["flag"] or _stop_marker_present():
@@ -2219,7 +2481,6 @@ def cmd_run(lane_id):
             secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
             jsonl_path = os.path.join(ldir, "step%d-attempt%d.jsonl" % (k, n))
             err_path = os.path.join(ldir, "step%d-attempt%d.err" % (k, n))
-            brief_path = os.path.join(ldir, "brief%d.md" % k)
             cmd = [muse_bin, "exec", "--prompt-file", brief_path,
                    "--trust-workspace", "--approval-mode", "never",
                    "--disable-approval", "--reasoning-effort", effort, "--json",
@@ -2562,167 +2823,501 @@ def cmd_run(lane_id):
             # Should be unreachable (gave_up returns), but guard anyway.
             return finish_terminal("gave_up", k, MAX_ATTEMPTS, last_reason or "out of attempts",
                                    accept_exit, current_last_event, "")
+        return ("ok",)
 
     # ---- acceptance ----
-    if not accept_cmd:
-        # No acceptance: done. Keep last attempt info from final step.
-        last_k_hist = history.get(str(steps)) or []
-        last_att = len(last_k_hist) or 1
+    # Returns ("accept_done", rc_or_None, last_att, tail) when the accept
+    # passed (or there is none), else ("finished", code) after writing a
+    # terminal state.
+    def run_accept():
+        nonlocal secrets
+        if not accept_cmd:
+            # No acceptance. Keep last attempt info from final step.
+            last_k_hist = history.get(str(steps)) or []
+            last_att = len(last_k_hist) or 1
+            try:
+                last_att = int(last_k_hist[-1].get("attempt", last_att)) if last_k_hist else 1
+            except Exception:
+                pass
+            try:
+                tail_done = "\n".join(read_tail_filtered(
+                    os.path.join(ldir, "step%d-attempt%d.err" % (steps, last_att))))
+                tail_done = redact_text(tail_done, secrets)
+            except Exception:
+                tail_done = ""
+            return ("accept_done", None, last_att, tail_done)
+        # Run acceptance command.
+        if stop_requested["flag"] or _stop_marker_present():
+            last_k_hist = history.get(str(steps)) or []
+            try:
+                last_att0 = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
+            except Exception:
+                last_att0 = 1
+            return ("finished", finish_terminal("stopped", steps, last_att0, "stopped", None,
+                                                current_last_event, ""))
+        shell = "/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/sh"
+        accept_log = os.path.join(ldir, "accept.log")
+        secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
+        slog("accepting: %s -c %s" % (shell, accept_cmd))
+        head_cur, commits_cur = git_snapshot()
+        last_k_hist0 = history.get(str(steps)) or []
         try:
-            last_att = int(last_k_hist[-1].get("attempt", last_att)) if last_k_hist else 1
-        except Exception:
-            pass
-        try:
-            tail_done = "\n".join(read_tail_filtered(
-                os.path.join(ldir, "step%d-attempt%d.err" % (steps, last_att))))
-            tail_done = redact_text(tail_done, secrets)
-        except Exception:
-            tail_done = ""
-        return finish_terminal("done", steps, last_att, last_reason, None,
-                               current_last_event, tail_done)
-    # Run acceptance command.
-    if stop_requested["flag"] or _stop_marker_present():
-        last_k_hist = history.get(str(steps)) or []
-        try:
-            last_att0 = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
+            last_att0 = int(last_k_hist0[-1].get("attempt", 1)) if last_k_hist0 else 1
         except Exception:
             last_att0 = 1
-        return finish_terminal("stopped", steps, last_att0, "stopped", None,
-                               current_last_event, "")
-    shell = "/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/sh"
-    accept_log = os.path.join(ldir, "accept.log")
-    secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
-    slog("accepting: %s -c %s" % (shell, accept_cmd))
-    head_cur, commits_cur = git_snapshot()
-    last_k_hist0 = history.get(str(steps)) or []
-    try:
-        last_att0 = int(last_k_hist0[-1].get("attempt", 1)) if last_k_hist0 else 1
-    except Exception:
-        last_att0 = 1
-    write_state("accepting", steps, last_att0,
-                None, now_iso(), current_last_event, head_cur, commits_cur, "",
-                None, None, last_reason)
-    try:
-        alog_f = open(accept_log, "w", encoding="utf-8", errors="replace")
+        write_state("accepting", steps, last_att0,
+                    None, now_iso(), current_last_event, head_cur, commits_cur, "",
+                    None, None, last_reason)
         try:
-            os.fchmod(alog_f.fileno(), 0o600)
-        except OSError:
-            pass
-    except OSError as e:
-        reason = redact_text("accept spawn failed: %s" % e, secrets)
-        try:
-            atomic_write_text(accept_log, reason + "\n")
-        except OSError:
-            pass
-        return finish_terminal("failed", steps, last_att0, reason, 127,
-                               current_last_event, "")
-    try:
-        aproc = subprocess.Popen([shell, "-c", accept_cmd], cwd=cwd, env=accept_env,
-                                 stdin=subprocess.DEVNULL, stdout=alog_f, stderr=subprocess.STDOUT,
-                                 start_new_session=True)
-    except Exception as e:
-        try:
-            alog_f.close()
-        except Exception:
-            pass
-        reason = redact_text("accept spawn failed: %s" % e, secrets)
-        try:
-            atomic_write_text(accept_log, reason + "\n")
-        except OSError:
-            pass
-        return finish_terminal("failed", steps, last_att0, reason, 127,
-                               current_last_event, "")
-    try:
-        accept_started = get_start_time(aproc.pid)
-    except Exception:
-        accept_started = None
-    accept_start_m = time.monotonic()
-    last_update_m = 0.0
-    accept_rc = None
-    timed_out = False
-    while True:
-        if stop_requested["flag"] or _stop_marker_present():
-            _kill_process_group(aproc, signal.SIGTERM)
+            alog_f = open(accept_log, "w", encoding="utf-8", errors="replace")
             try:
-                aproc.wait(timeout=5)
-            except Exception:
-                _kill_process_group(aproc, signal.SIGKILL)
-                try:
-                    aproc.wait(timeout=5)
-                except Exception:
-                    pass
+                os.fchmod(alog_f.fileno(), 0o600)
+            except OSError:
+                pass
+        except OSError as e:
+            reason = redact_text("accept spawn failed: %s" % e, secrets)
+            try:
+                atomic_write_text(accept_log, reason + "\n")
+            except OSError:
+                pass
+            return ("finished", finish_terminal("failed", steps, last_att0, reason, 127,
+                                                current_last_event, ""))
+        try:
+            aproc = subprocess.Popen([shell, "-c", accept_cmd], cwd=cwd, env=accept_env,
+                                     stdin=subprocess.DEVNULL, stdout=alog_f, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+        except Exception as e:
             try:
                 alog_f.close()
             except Exception:
                 pass
+            reason = redact_text("accept spawn failed: %s" % e, secrets)
             try:
-                with open(accept_log, "r", encoding="utf-8", errors="replace") as f:
-                    lines = f.read().splitlines()
-                atomic_write_text(accept_log, redact_text("\n".join(lines[-60:]) + ("\n" if lines else ""), secrets))
+                atomic_write_text(accept_log, reason + "\n")
             except OSError:
                 pass
-            last_k_hist = history.get(str(steps)) or []
-            try:
-                last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
-            except Exception:
-                last_att = 1
-            return finish_terminal("stopped", steps, last_att, "stopped", None,
-                                   current_last_event, "")
-        ret = aproc.poll()
-        now_m = time.monotonic()
-        if ret is None and now_m - accept_start_m >= ACCEPT_TIMEOUT_SEC:
-            timed_out = True
-            _kill_process_group(aproc, signal.SIGTERM)
-            try:
-                aproc.wait(timeout=10)
-            except Exception:
-                _kill_process_group(aproc, signal.SIGKILL)
+            return ("finished", finish_terminal("failed", steps, last_att0, reason, 127,
+                                                current_last_event, ""))
+        try:
+            accept_started = get_start_time(aproc.pid)
+        except Exception:
+            accept_started = None
+        accept_start_m = time.monotonic()
+        last_update_m = 0.0
+        accept_rc = None
+        timed_out = False
+        while True:
+            if stop_requested["flag"] or _stop_marker_present():
+                _kill_process_group(aproc, signal.SIGTERM)
                 try:
                     aproc.wait(timeout=5)
                 except Exception:
+                    _kill_process_group(aproc, signal.SIGKILL)
+                    try:
+                        aproc.wait(timeout=5)
+                    except Exception:
+                        pass
+                try:
+                    alog_f.close()
+                except Exception:
                     pass
-            ret = aproc.returncode
-        if now_m - last_update_m >= poll_sec or ret is not None:
-            head_cur, commits_cur = git_snapshot()
-            last_k_hist = history.get(str(steps)) or []
+                try:
+                    with open(accept_log, "r", encoding="utf-8", errors="replace") as f:
+                        lines = f.read().splitlines()
+                    atomic_write_text(accept_log, redact_text("\n".join(lines[-60:]) + ("\n" if lines else ""), secrets))
+                except OSError:
+                    pass
+                last_k_hist = history.get(str(steps)) or []
+                try:
+                    last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
+                except Exception:
+                    last_att = 1
+                return ("finished", finish_terminal("stopped", steps, last_att, "stopped", None,
+                                                    current_last_event, ""))
+            ret = aproc.poll()
+            now_m = time.monotonic()
+            if ret is None and now_m - accept_start_m >= ACCEPT_TIMEOUT_SEC:
+                timed_out = True
+                _kill_process_group(aproc, signal.SIGTERM)
+                try:
+                    aproc.wait(timeout=10)
+                except Exception:
+                    _kill_process_group(aproc, signal.SIGKILL)
+                    try:
+                        aproc.wait(timeout=5)
+                    except Exception:
+                        pass
+                ret = aproc.returncode
+            if now_m - last_update_m >= poll_sec or ret is not None:
+                head_cur, commits_cur = git_snapshot()
+                last_k_hist = history.get(str(steps)) or []
+                try:
+                    last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
+                except Exception:
+                    last_att = 1
+                write_state("accepting", steps, last_att, None, now_iso(), current_last_event,
+                            head_cur, commits_cur, "", None, None, last_reason,
+                            accept_pid=aproc.pid if ret is None else None,
+                            accept_started=accept_started if ret is None else None)
+                last_update_m = now_m
+            if ret is not None:
+                accept_rc = ret
+                break
+            time.sleep(min(0.2, poll_sec))
+        try:
+            alog_f.close()
+        except Exception:
+            pass
+        try:
+            with open(accept_log, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+            atomic_write_text(accept_log, redact_text("\n".join(lines[-60:]) + ("\n" if lines else ""), secrets))
+        except OSError:
+            pass
+        _chmod_0600(accept_log)
+        last_k_hist = history.get(str(steps)) or []
+        try:
+            last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
+        except Exception:
+            last_att = 1
+        if timed_out:
+            return ("finished", finish_terminal("failed", steps, last_att,
+                                                "accept timeout after 2h", 124,
+                                                current_last_event, ""))
+        return ("accept_done", accept_rc, last_att, "")
+
+    def last_attempt_of_last_step():
+        hist = history.get(str(steps)) or []
+        try:
+            return int(hist[-1].get("attempt", 1)) if hist else 1
+        except Exception:
+            return 1
+
+    def run_review_round(rnd):
+        """Run pre-review round rnd in a fresh muse session.
+
+        Returns ("pass", findings), ("fail", findings), ("error", msg),
+        or ("finished", code) after writing a terminal state.
+        """
+        nonlocal secrets, current_last_event
+        secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
+        set_phase("review:%d" % rnd)
+        try:
+            head_now = get_git_head(cwd) if os.path.isdir(cwd) else None
+        except Exception:
+            head_now = None
+        try:
+            with open(os.path.join(ldir, "accept.log"), "r", encoding="utf-8",
+                      errors="replace") as f:
+                accept_tail = "\n".join(f.read().splitlines()[-60:])
+        except (FileNotFoundError, OSError):
+            accept_tail = ""
+        brief_texts = []
+        for k in range(1, steps + 1):
             try:
-                last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
+                with open(os.path.join(ldir, "brief%d.md" % k), "r", encoding="utf-8",
+                          errors="replace") as f:
+                    brief_texts.append(f.read())
+            except (FileNotFoundError, OSError):
+                brief_texts.append("(missing)")
+        stat, full, files = get_review_diff(cwd, head_start, head_now)
+        controls = get_control_branches_since(cwd, head_start)
+        brief_text = redact_text(build_review_brief(
+            lane.get("label") or "", lane.get("id") or lane_id, brief_texts,
+            head_start, head_now, stat, full, files, accept_cmd, accept_exit,
+            accept_tail, controls, rnd, review_rounds_max, review_extra), secrets)
+        brief_path = os.path.join(ldir, "review-brief%d.md" % rnd)
+        try:
+            atomic_write_text(brief_path, brief_text)
+        except OSError as e:
+            err = redact_text("cannot write review brief: %s" % e, secrets)
+            review_error_holder["v"] = err
+            review_rounds_done.append({"round": rnd, "verdict": "ERROR", "error": err,
+                                       "findings_preview": ""})
+            return ("error", err)
+        verdict_path = os.path.join(cwd, ".lane", "REVIEW-%d.md" % rnd)
+        try:
+            if os.path.exists(verdict_path):
+                os.remove(verdict_path)
+        except OSError:
+            pass
+        jsonl_path = os.path.join(ldir, "review%d.jsonl" % rnd)
+        err_path = os.path.join(ldir, "review%d.err" % rnd)
+        cmd = [muse_bin, "exec", "--prompt-file", brief_path,
+               "--trust-workspace", "--approval-mode", "never",
+               "--disable-approval", "--reasoning-effort", effort, "--json",
+               # Owner 2026-10-16: no network from inside Muse's shell sandbox (two lanes built ssh stand-ins
+               # to reach the lab runner with ~/.ssh keys). Remote steps run in the unsandboxed accept.
+               "--sandbox-network", os.environ.get("MUSE_LANE_SANDBOX_NETWORK", "restricted")]
+        slog("review round %d: %s" % (rnd, " ".join(cmd)))
+        last_att = last_attempt_of_last_step()
+        head_cur, commits_cur = git_snapshot()
+        write_state("running", steps, last_att, None, now_iso(), current_last_event,
+                    head_cur, commits_cur, "", accept_exit, None, last_reason)
+        try:
+            jf = open(jsonl_path, "w", encoding="utf-8", errors="replace")
+            try:
+                os.fchmod(jf.fileno(), 0o600)
+            except OSError:
+                pass
+            ef = open(err_path, "w", encoding="utf-8", errors="replace")
+            try:
+                os.fchmod(ef.fileno(), 0o600)
+            except OSError:
+                pass
+        except OSError as e:
+            try:
+                jf.close()
             except Exception:
-                last_att = 1
-            write_state("accepting", steps, last_att, None, now_iso(), current_last_event,
-                        head_cur, commits_cur, "", None, None, last_reason,
-                        accept_pid=aproc.pid if ret is None else None,
-                        accept_started=accept_started if ret is None else None)
-            last_update_m = now_m
-        if ret is not None:
-            accept_rc = ret
-            break
-        time.sleep(min(0.2, poll_sec))
-    try:
-        alog_f.close()
-    except Exception:
-        pass
-    try:
-        with open(accept_log, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
-        atomic_write_text(accept_log, redact_text("\n".join(lines[-60:]) + ("\n" if lines else ""), secrets))
-    except OSError:
-        pass
-    _chmod_0600(accept_log)
-    last_k_hist = history.get(str(steps)) or []
-    try:
-        last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
-    except Exception:
-        last_att = 1
-    if timed_out:
-        return finish_terminal("failed", steps, last_att,
-                               "accept timeout after 2h", 124,
+                pass
+            try:
+                ef.close()
+            except Exception:
+                pass
+            err = redact_text("cannot open review output files: %s" % e, secrets)
+            review_error_holder["v"] = err
+            review_rounds_done.append({"round": rnd, "verdict": "ERROR", "error": err,
+                                       "findings_preview": ""})
+            return ("error", err)
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, env=muse_env,
+                                    stdin=subprocess.DEVNULL, stdout=jf, stderr=ef,
+                                    start_new_session=True)
+        except Exception as e:
+            try:
+                jf.close()
+            except Exception:
+                pass
+            try:
+                ef.close()
+            except Exception:
+                pass
+            err = redact_text("review spawn failed: %s" % e, secrets)
+            review_error_holder["v"] = err
+            review_rounds_done.append({"round": rnd, "verdict": "ERROR", "error": err,
+                                       "findings_preview": ""})
+            return ("error", err)
+        try:
+            muse_started_v = get_start_time(proc.pid)
+        except Exception:
+            muse_started_v = None
+        start_m = time.monotonic()
+        last_update_m = 0.0
+        timed_out = False
+        rc = None
+        while True:
+            if stop_requested["flag"] or _stop_marker_present():
+                _kill_process_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    _kill_process_group(proc, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                try:
+                    jf.close()
+                except Exception:
+                    pass
+                try:
+                    ef.close()
+                except Exception:
+                    pass
+                redact_file_inplace(jsonl_path, secrets)
+                redact_file_inplace(err_path, secrets)
+                tail = "\n".join(read_tail_filtered(err_path))
+                return ("finished", finish_terminal("stopped", steps, last_att, "stopped",
+                                                    accept_exit, current_last_event,
+                                                    redact_text(tail, secrets)))
+            ret = proc.poll()
+            now_m = time.monotonic()
+            if ret is None and now_m - start_m >= review_timeout_sec:
+                timed_out = True
+                slog("review round %d timed out after %.0fs; killing pgid %d" % (
+                    rnd, now_m - start_m, proc.pid))
+                _kill_process_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    _kill_process_group(proc, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                ret = proc.returncode
+            if now_m - last_update_m >= poll_sec or ret is not None:
+                head_cur, commits_cur = git_snapshot()
+                ev, _ = read_last_json_info(jsonl_path)
+                if ev is not None:
+                    current_last_event = redact_text(ev, secrets)
+                write_state("running", steps, last_att, proc.pid if ret is None else None,
+                            now_iso(), current_last_event, head_cur, commits_cur, "",
+                            accept_exit, None, last_reason,
+                            muse_started=muse_started_v if ret is None else None)
+                last_update_m = now_m
+            if ret is not None:
+                rc = ret
+                break
+            time.sleep(min(0.2, poll_sec))
+        try:
+            jf.close()
+        except Exception:
+            pass
+        try:
+            ef.close()
+        except Exception:
+            pass
+        _chmod_0600(jsonl_path)
+        _chmod_0600(err_path)
+        redact_file_inplace(jsonl_path, secrets)
+        redact_file_inplace(err_path, secrets)
+        try:
+            with open(verdict_path, "r", encoding="utf-8", errors="replace") as f:
+                verdict_text = f.read()
+        except (FileNotFoundError, OSError):
+            verdict_text = ""
+        if timed_out:
+            err = "review round %d timed out after %.0fs" % (rnd, review_timeout_sec)
+            slog(err)
+            review_error_holder["v"] = err
+            review_rounds_done.append({"round": rnd, "verdict": "ERROR", "error": err,
+                                       "findings_preview": ""})
+            return ("error", err)
+        verdict, findings = parse_review_verdict(verdict_text)
+        if verdict is None:
+            if rc != 0:
+                tail = "\n".join(read_tail_filtered(err_path))
+                last_line = tail.splitlines()[-1] if tail.splitlines() else ""
+                err = redact_text("review round %d crashed (exit %s): %s" % (
+                    rnd, rc, last_line), secrets)
+            else:
+                err = "review round %d produced no PASS/FAIL verdict" % rnd
+            slog(err)
+            review_error_holder["v"] = err
+            review_rounds_done.append({"round": rnd, "verdict": "ERROR", "error": err,
+                                       "findings_preview": redact_text(
+                                           (verdict_text or "")[:REVIEW_PREVIEW_CHARS], secrets)})
+            return ("error", err)
+        try:
+            atomic_write_text(os.path.join(ldir, "REVIEW-%d.md" % rnd),
+                              redact_text(verdict_text if verdict_text.endswith("\n")
+                                          else verdict_text + "\n", secrets))
+        except OSError as e:
+            slog("failed to preserve review verdict: %s" % e)
+        review_rounds_done.append({"round": rnd, "verdict": verdict, "error": None,
+                                   "findings_preview": redact_text(
+                                       (findings or "")[:REVIEW_PREVIEW_CHARS], secrets)})
+        head_cur, commits_cur = git_snapshot()
+        write_state("running", steps, last_att, None, now_iso(), current_last_event,
+                    head_cur, commits_cur, "", accept_exit, None, last_reason)
+        slog("review round %d: %s" % (rnd, verdict))
+        if verdict == "PASS":
+            return ("pass", findings or "")
+        return ("fail", findings or "")
+
+    def archive_last_step_for_rerun(rnd):
+        k = steps
+        hkey = str(k)
+        if history.get(hkey):
+            history["%s-pre-r%d" % (hkey, rnd)] = history.pop(hkey)
+            save_history()
+        try:
+            names = os.listdir(ldir)
+        except OSError:
+            names = []
+        prefix = "step%d-attempt" % k
+        for fn in names:
+            if fn.startswith(prefix):
+                try:
+                    os.rename(os.path.join(ldir, fn),
+                              os.path.join(ldir, "%s-pre-r%d" % (fn, rnd)))
+                except OSError:
+                    pass
+        final_p = os.path.join(ldir, "step%d-final.md" % k)
+        if os.path.exists(final_p):
+            try:
+                os.rename(final_p, os.path.join(ldir, "step%d-final-pre-r%d.md" % (k, rnd)))
+            except OSError:
+                pass
+        brief_p = os.path.join(ldir, "brief%d.md" % k)
+        orig_p = os.path.join(ldir, "brief%d-orig.md" % k)
+        if not os.path.exists(orig_p) and os.path.exists(brief_p):
+            try:
+                shutil.copyfile(brief_p, orig_p)
+                _chmod_0600(orig_p)
+            except OSError:
+                pass
+
+    def augment_last_brief(rnd, findings):
+        brief_p = os.path.join(ldir, "brief%d.md" % steps)
+        try:
+            with open(brief_p, "r", encoding="utf-8", errors="replace") as f:
+                cur = f.read()
+        except (FileNotFoundError, OSError):
+            cur = ""
+        add = ("\n\n# Muse pre-review findings (round %d, verdict FAIL)\n\n"
+               "Your previous attempt was reviewed and failed. "
+               "Address every numbered finding:\n\n%s\n") % (
+                   rnd, (findings or "(no findings text)").strip())
+        try:
+            atomic_write_text(brief_p, (cur.rstrip() + "\n" + add) if cur.strip() else add)
+        except OSError as e:
+            slog("failed to augment brief for re-run: %s" % e)
+
+    # ---- main step loop (first pass) ----
+    if start_step <= steps:
+        for k in range(start_step, steps + 1):
+            ns = start_attempt if k == start_step else 1
+            res = run_step(k, os.path.join(ldir, "brief%d.md" % k), ns)
+            if not (isinstance(res, tuple) and res and res[0] == "ok"):
+                return res
+
+    # ---- acceptance (first pass; skipped when resuming past a passed accept) ----
+    if skip_accept:
+        ares = ("accept_done", accept_exit, last_attempt_of_last_step(), "")
+    else:
+        ares = run_accept()
+    if ares[0] == "finished":
+        return ares[1]
+    _, arc, alast, atail = ares
+    accept_exit = arc
+    if arc is not None and arc != 0:
+        return finish_terminal("failed", steps, alast, "accept exit %s" % arc, arc,
                                current_last_event, "")
-    if accept_rc == 0:
-        return finish_terminal("done", steps, last_att, last_reason, 0, current_last_event, "")
-    return finish_terminal("failed", steps, last_att,
-                           "accept exit %s" % accept_rc, accept_rc,
-                           current_last_event, "")
+    if not review_enabled:
+        return finish_terminal("done", steps, alast, last_reason, arc, current_last_event, atail)
+
+    # ---- pre-review rounds ----
+    for rnd in range(len(review_rounds_done) + 1, review_rounds_max + 1):
+        rres = run_review_round(rnd)
+        if rres[0] == "finished":
+            return rres[1]
+        if rres[0] == "pass":
+            return finish_terminal("done", steps, last_attempt_of_last_step(),
+                                   last_reason, accept_exit, current_last_event, "")
+        if rres[0] == "error":
+            return finish_terminal("done", steps, last_attempt_of_last_step(),
+                                   last_reason, accept_exit, current_last_event, "")
+        if rnd >= review_rounds_max:
+            return finish_terminal("review_failed", steps, last_attempt_of_last_step(),
+                                   "pre-review round %d FAILed with no rounds left" % rnd,
+                                   accept_exit, current_last_event, "")
+        findings = rres[1]
+        slog("review round %d FAILed; re-running step %d" % (rnd, steps))
+        archive_last_step_for_rerun(rnd)
+        augment_last_brief(rnd, findings)
+        res = run_step(steps, os.path.join(ldir, "brief%d.md" % steps), 1)
+        if not (isinstance(res, tuple) and res and res[0] == "ok"):
+            return res
+        ares2 = run_accept()
+        if ares2[0] == "finished":
+            return ares2[1]
+        _, arc2, alast2, _ = ares2
+        accept_exit = arc2
+        if arc2 is not None and arc2 != 0:
+            return finish_terminal("failed", steps, alast2, "accept exit %s" % arc2, arc2,
+                                   current_last_event, "")
 
 
 def build_parser():
@@ -2739,6 +3334,9 @@ def build_parser():
     ps.add_argument("--accept-env", action="store_true", help="Pass env-file keys to the acceptance command.")
     ps.add_argument("--stall-min", type=float, default=40.0, help="Stall minutes (default: 40).")
     ps.add_argument("--owner-session", default=None, help="Owning session id for wake-ups.")
+    ps.add_argument("--review", action="store_true", help="Run a Muse pre-review after a passing accept.")
+    ps.add_argument("--review-brief", default=None, help="Extra review instructions (text, or a file path to read).")
+    ps.add_argument("--review-rounds", type=int, default=1, help="Max pre-review rounds (default: 1).")
     pr = sub.add_parser("_run", help="Run the supervisor (internal).")
     pr.add_argument("id", help="Lane id.")
     pt = sub.add_parser("status", help="Show lane status.")

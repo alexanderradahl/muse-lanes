@@ -47,6 +47,45 @@ if mode == "complete":
     sys.stderr.write("`skills_catalog` was trimmed to fit its size limit\n")
     sys.stderr.write("real error line\n")
     sys.stderr.flush()
+    base = os.path.basename(prompt_file)
+    if base.startswith("review-brief"):
+        import re as _re
+        _m = _re.search(r"(\d+)", base)
+        _rnd = _m.group(1) if _m else "1"
+        _rmode = os.environ.get("FAKE_REVIEW_MODE", "")
+        if _rmode == "crash":
+            sys.stderr.write("review crashed boom\n")
+            sys.stderr.flush()
+            time.sleep(0.1)
+            sys.exit(1)
+        if _rmode == "sleep":
+            time.sleep(float(os.environ.get("FAKE_REVIEW_SLEEP", "30")))
+            sys.exit(1)
+        _verdict = os.environ.get("FAKE_REVIEW_VERDICT", "PASS")
+        _fails = int(os.environ.get("FAKE_REVIEW_FAILS", "0"))
+        _cf = os.environ.get("FAKE_REVIEW_COUNT_FILE", "")
+        if _fails > 0 and _cf:
+            _n = 0
+            if os.path.exists(_cf):
+                try:
+                    with open(_cf) as _f:
+                        _n = int((_f.read() or "0").strip() or "0")
+                except Exception:
+                    _n = 0
+            _n += 1
+            with open(_cf, "w") as _f:
+                _f.write(str(_n))
+            _verdict = "FAIL" if _n <= _fails else "PASS"
+        try:
+            os.makedirs(".lane", exist_ok=True)
+        except Exception:
+            pass
+        _find = os.environ.get("FAKE_REVIEW_FINDINGS", "1. main.py:10 missing check")
+        try:
+            with open(".lane/REVIEW-%s.md" % _rnd, "w") as _f:
+                _f.write(_verdict + "\n" + _find + "\n")
+        except Exception as _e:
+            sys.stderr.write("verdict write failed: %s\n" % _e)
     time.sleep(float(os.environ.get("FAKE_SLEEP", "0.2")))
     emit(txt)
     sys.exit(0)
@@ -249,6 +288,12 @@ class LaneBase(unittest.TestCase):
             cmd += ["--stall-min", str(kwargs["stall_min"])]
         if kwargs.get("owner_session"):
             cmd += ["--owner-session", kwargs["owner_session"]]
+        if kwargs.get("review"):
+            cmd += ["--review"]
+        if kwargs.get("review_rounds") is not None:
+            cmd += ["--review-rounds", str(kwargs["review_rounds"])]
+        if kwargs.get("review_brief"):
+            cmd += ["--review-brief", kwargs["review_brief"]]
         r = self.run_lane(*cmd, env_extra=env_extra)
         self.assertEqual(r.returncode, 0, "start failed: %s %s" % (r.stdout, r.stderr))
         lid = r.stdout.strip().splitlines()[-1].strip()
@@ -1443,6 +1488,161 @@ class TestOrphanAckPerIncarnation(LaneBase):
         self.wait_status(lid, "done", timeout=25)
         a4 = self.run_lane("ack", lid, "--orphan")
         self.assertEqual(a4.returncode, 2)
+
+
+class TestReviewPass(LaneBase):
+    def test_review_pass_ends_done_with_section(self):
+        b = self.write_brief("b1.md", "review pass work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_TEXT": "work done",
+                                              "FAKE_REVIEW_VERDICT": "PASS"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=25)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "done")
+        rounds = st.get("review_rounds") or []
+        self.assertEqual(len(rounds), 1)
+        self.assertEqual(rounds[0].get("verdict"), "PASS")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("Muse pre-review (not the independent review)", summ)
+        self.assertIn("Round 1: PASS", summ)
+        self.assertTrue(os.path.exists(self.lane_path(lid, "REVIEW-1.md")))
+        self.assertTrue(os.path.exists(os.path.join(self.cwd, ".lane", "REVIEW-1.md")))
+        with open(self.lane_path(lid, "review-brief1.md")) as f:
+            rb = f.read()
+        self.assertIn("review pass work", rb)
+        self.assertIn("REVIEW-1.md", rb)
+
+
+class TestReviewFailNoRoundsLeft(LaneBase):
+    def test_review_fail_ends_review_failed(self):
+        b = self.write_brief("b1.md", "review fail work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_VERDICT": "FAIL",
+                                              "FAKE_REVIEW_FINDINGS": "1. app.py:42 missing test\n2. app.py:50 toothless control"},
+                              accept="exit 0", review=True, review_rounds=1)
+        self.wait_status(lid, "review_failed", timeout=25)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "review_failed")
+        rounds = st.get("review_rounds") or []
+        self.assertEqual(len(rounds), 1)
+        self.assertEqual(rounds[0].get("verdict"), "FAIL")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("Muse pre-review (not the independent review)", summ)
+        self.assertIn("Round 1: FAIL", summ)
+        self.assertIn("app.py:42", summ)
+        r = self.run_lane("ack", lid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class TestReviewFailThenPass(LaneBase):
+    def test_review_fail_reruns_last_step_then_done(self):
+        count = os.path.join(self.state_dir, "review-count")
+        b1 = self.write_brief("b1.md", "first work")
+        b2 = self.write_brief("b2.md", "last work RERUN-MARKER")
+        lid = self.start_lane([b1, b2], env_extra={"FAKE_MODE": "complete",
+                                                   "FAKE_REVIEW_FAILS": "1",
+                                                   "FAKE_REVIEW_COUNT_FILE": count,
+                                                   "FAKE_REVIEW_FINDINGS": "1. last.py:7 fix this"},
+                              accept="exit 0", review=True, review_rounds=2)
+        self.wait_status(lid, "done", timeout=40)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "done")
+        rounds = st.get("review_rounds") or []
+        self.assertEqual([e.get("verdict") for e in rounds], ["FAIL", "PASS"])
+        with open(self.lane_path(lid, "brief2.md")) as f:
+            aug = f.read()
+        self.assertIn("RERUN-MARKER", aug)
+        self.assertIn("last.py:7", aug)
+        with open(self.lane_path(lid, "brief2-orig.md")) as f:
+            orig = f.read()
+        self.assertIn("RERUN-MARKER", orig)
+        self.assertNotIn("last.py:7", orig)
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        self.assertIn("2-pre-r1", hist)
+        self.assertIn("2", hist)
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("Round 1: FAIL", summ)
+        self.assertIn("Round 2: PASS", summ)
+
+
+class TestReviewError(LaneBase):
+    def test_review_crash_does_not_block_done(self):
+        b = self.write_brief("b1.md", "review crash work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_MODE": "crash"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=25)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "done")
+        self.assertTrue(st.get("review_error"))
+        rounds = st.get("review_rounds") or []
+        self.assertEqual(rounds[0].get("verdict"), "ERROR")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("review_error", summ)
+
+    def test_review_timeout_records_error(self):
+        b = self.write_brief("b1.md", "review timeout work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_MODE": "sleep",
+                                              "FAKE_REVIEW_SLEEP": "30",
+                                              "MUSE_LANE_REVIEW_TIMEOUT_SEC": "1"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=30)
+        st = self.read_state(lid)
+        self.assertIn("timed out", st.get("review_error") or "")
+
+
+class TestReviewBrief(LaneBase):
+    def test_review_brief_caps_large_diff_and_parses_verdict(self):
+        mod = _load_lane_module()
+        subprocess.run(["git", "init"], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=self.cwd, capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=self.cwd, capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=self.cwd, capture_output=True, timeout=15)
+        with open(os.path.join(self.cwd, "init.txt"), "w") as f:
+            f.write("init\n")
+        subprocess.run(["git", "add", "."], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        head_start = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.cwd, capture_output=True,
+                                    text=True, timeout=15).stdout.strip()
+        big = "x" * (mod.REVIEW_DIFF_CAP + 1000)
+        with open(os.path.join(self.cwd, "big.txt"), "w") as f:
+            f.write(big + "\n")
+        subprocess.run(["git", "add", "."], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        subprocess.run(["git", "commit", "-m", "big"], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.cwd, capture_output=True,
+                              text=True, timeout=15).stdout.strip()
+        stat, full, files = mod.get_review_diff(self.cwd, head_start, head)
+        self.assertIsNone(full)
+        self.assertIn("big.txt", files)
+        self.assertIn("big.txt", stat)
+        txt = mod.build_review_brief("lbl", "lid", ["brief one"], head_start, head,
+                                     stat, full, files, "exit 0", 0, "tail", [], 1, 1, None)
+        self.assertIn("read them yourself", txt)
+        self.assertIn("brief one", txt)
+        self.assertIn("allowlist", txt)
+        self.assertIn("toothless", txt)
+        self.assertNotIn(big[:100], txt)
+        v, f = mod.parse_review_verdict("FAIL\n1. a.py:1 bad\n")
+        self.assertEqual(v, "FAIL")
+        self.assertIn("a.py:1", f)
+        v2, _ = mod.parse_review_verdict("pass\n")
+        self.assertEqual(v2, "PASS")
+        v3, _ = mod.parse_review_verdict("maybe\n")
+        self.assertIsNone(v3)
+
+    def test_review_flags_validated(self):
+        b = self.write_brief("b1.md", "x")
+        r = self.run_lane("start", "--cwd", self.cwd, "--brief", b, "--review", "--review-rounds", "0")
+        self.assertNotEqual(r.returncode, 0)
+        r2 = self.run_lane("start", "--cwd", self.cwd, "--brief", b, "--review-brief", "extra")
+        self.assertNotEqual(r2.returncode, 0)
 
 
 class TestSandboxNetworkArgv(LaneBase):
