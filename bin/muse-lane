@@ -889,10 +889,71 @@ def get_terminal_verdict(jsonl_path):
     return verdict
 
 
+def _is_output_delta_event(obj):
+    if not isinstance(obj, dict):
+        return False
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("kind") == "run_output_delta":
+        return True
+    return obj.get("payload_type") == "run.output.delta"
+
+
+def get_final_text(jsonl_path):
+    """Final answer text from a muse exec JSONL.
+
+    muse 1.3 can emit more than one run_terminal event per exec (a stray
+    empty run after the real one), so the last terminal text may be empty
+    while an earlier one holds the answer. Prefer the last non-blank
+    completed terminal text; when every terminal text is blank, fall back
+    to the joined run.output.delta stream, which carries the same final
+    assistant message. Returns "" when neither has text.
+    """
+    last_text = ""
+    deltas = []
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (FileNotFoundError, OSError):
+        return ""
+    for line in content.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except Exception:
+            continue
+        if _is_run_terminal_event(obj):
+            payload = obj.get("payload") or {}
+            term = payload.get("terminal")
+            if not isinstance(term, str) or not term:
+                pt = obj.get("payload_type")
+                if isinstance(pt, str) and pt.startswith("run.terminal."):
+                    term = pt.split(".")[-1]
+            if term == "completed":
+                text = payload.get("text") or ""
+                if not isinstance(text, str):
+                    try:
+                        text = str(text)
+                    except Exception:
+                        text = ""
+                if text.strip():
+                    last_text = text
+        elif _is_output_delta_event(obj):
+            text = (obj.get("payload") or {}).get("text") or ""
+            if isinstance(text, str) and text:
+                deltas.append(text)
+    if last_text:
+        return last_text
+    return "".join(deltas)
+
+
 def check_completion(jsonl_path):
     v = get_terminal_verdict(jsonl_path)
     if v.get("has_event") and v.get("terminal") == "completed":
-        return (True, v.get("text") or "")
+        return (True, get_final_text(jsonl_path) or "")
     return (False, None)
 
 
@@ -1288,7 +1349,10 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
                 except Exception:
                     rn = "?"
                 verdict = e.get("verdict") or "?"
-                lines.append("Round %s: %s" % (rn, verdict))
+                if e.get("overridden"):
+                    lines.append("Round %s: %s (%s)" % (rn, verdict, e["overridden"]))
+                else:
+                    lines.append("Round %s: %s" % (rn, verdict))
                 body = ""
                 try:
                     with open(os.path.join(ldir, "REVIEW-%s.md" % rn), "r",
@@ -1509,8 +1573,9 @@ def build_review_brief(lane_label, lane_id, brief_texts, head_start, head,
     L.append("## Verdict")
     L.append("This session is read-only: do not modify, create, or delete any files.")
     L.append("End your turn with the verdict as your final answer text: its first line must be")
-    L.append("exactly PASS or FAIL, then numbered findings (`1. path:line description`).")
-    L.append("PASS only when no material issue remains; when in doubt, FAIL with findings.")
+    L.append("exactly PASS or FAIL, then numbered findings (`1. [severity] path:line description`).")
+    L.append("Mark each finding blocker, should-fix, or nit. Any blocker or should-fix finding")
+    L.append("means FAIL; PASS only when the findings are nits or none. When in doubt, FAIL.")
     L.append("The supervisor records your final answer as `.lane/REVIEW-%d.md` itself." % rnd)
     return "\n".join(L) + "\n"
 
@@ -1524,6 +1589,19 @@ def parse_review_verdict(text):
     if first in ("PASS", "FAIL"):
         return (first, "\n".join(lines[1:]).strip())
     return (None, text.strip())
+
+
+_REVIEW_FINDING_LINE_RE = re.compile(r"^\s*\d+\s*[.)]\s+")
+_REVIEW_SEVERE_RE = re.compile(r"\b(blocker|should-fix)\b", re.IGNORECASE)
+
+
+def pass_has_severe_findings(findings):
+    """True when a numbered finding carries blocker/should-fix severity."""
+    for line in (findings or "").splitlines():
+        if (_REVIEW_FINDING_LINE_RE.match(line)
+                and _REVIEW_SEVERE_RE.search(line)):
+            return True
+    return False
 
 
 def spawn_supervisor(lane_id):
@@ -2879,6 +2957,14 @@ def cmd_run(lane_id):
         # the answer and the supervisor writes both files itself.
         answer = (final_text or "") if status == "ok" else ""
         answered = bool(answer.strip())
+        fail_reason = ""
+        if status == "ok" and not answered:
+            # Completed but produced no answer text: the answer below falls
+            # back to the failure text, so never report this as ok.
+            status = "failed"
+            fail_reason = "completed with no answer text"
+        elif status == "failed":
+            fail_reason = "helper did not complete"
         if answered:
             try:
                 atomic_write_text(ans_n, answer if answer.endswith("\n") else answer + "\n")
@@ -2906,7 +2992,10 @@ def cmd_run(lane_id):
                               "answered": answered, "helper": status,
                               "answer_preview": redact_text(
                                   answer[:CONSULT_ANSWER_PREVIEW], secrets)})
-        slog("consult step %d #%d %s" % (k, n, status))
+        if fail_reason:
+            slog("consult step %d #%d %s: %s" % (k, n, status, fail_reason))
+        else:
+            slog("consult step %d #%d %s" % (k, n, status))
         return True
 
     # ---- step execution (also used for post-review re-runs of the last step) ----
@@ -3689,6 +3778,13 @@ def cmd_run(lane_id):
                                        "findings_preview": redact_text(
                                            (verdict_text or "")[:REVIEW_PREVIEW_CHARS], secrets)})
             return ("error", err)
+        # A PASS that still lists a blocker or should-fix finding is a FAIL
+        # the reviewer mislabeled; the supervisor overrides it and runs the
+        # fix round. The verdict file keeps the reviewer's verbatim text.
+        overridden = ""
+        if verdict == "PASS" and pass_has_severe_findings(findings):
+            overridden = "PASS overridden: should-fix findings"
+            verdict = "FAIL"
         # The reviewer cannot write (--disable-write); the supervisor records
         # its final answer as the verdict file, in the worktree and the lane.
         verdict_body = redact_text(verdict_text if verdict_text.endswith("\n")
@@ -3700,12 +3796,16 @@ def cmd_run(lane_id):
             except OSError as e:
                 slog("failed to write review verdict %s: %s" % (_vp, e))
         review_rounds_done.append({"round": rnd, "verdict": verdict, "error": None,
+                                   "overridden": overridden,
                                    "findings_preview": redact_text(
                                        (findings or "")[:REVIEW_PREVIEW_CHARS], secrets)})
         head_cur, commits_cur = git_snapshot()
         write_state("running", steps, last_att, None, now_iso(), current_last_event,
                     head_cur, commits_cur, "", accept_exit, None, last_reason)
-        slog("review round %d: %s" % (rnd, verdict))
+        if overridden:
+            slog("review round %d: FAIL (%s)" % (rnd, overridden))
+        else:
+            slog("review round %d: %s" % (rnd, verdict))
         if verdict == "PASS":
             return ("pass", findings or "")
         return ("fail", findings or "")
