@@ -1401,6 +1401,49 @@ def get_review_diff(cwd, head_start, head):
     return ("(no commits)", None, [])
 
 
+def get_git_status_tracked(cwd):
+    """`git status --porcelain` over tracked files only, or None."""
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    r = _git(["status", "--porcelain", "--untracked-files=no"], cwd)
+    if r is None or r.returncode != 0:
+        return None
+    return r.stdout or ""
+
+
+def review_changed_paths(cwd, head_before, head_after,
+                         status_before, status_after):
+    """Sorted tracked paths that changed across a review session."""
+    paths = set()
+
+    def _add_porcelain_path(rest):
+        for part in rest.split(" -> "):
+            p = part.strip().strip('"')
+            if p:
+                paths.add(p)
+
+    before = set((status_before or "").splitlines())
+    after = set((status_after or "").splitlines())
+    for ln in (before ^ after):
+        if len(ln) < 4:
+            continue
+        _add_porcelain_path(ln[3:])
+    if (head_before or "") != (head_after or "") and cwd and os.path.isdir(cwd):
+        if head_before and head_after:
+            r = _git(["diff", "--name-only",
+                      "%s..%s" % (head_before, head_after)], cwd)
+        elif head_after:
+            r = _git(["show", "--name-only", "--format=", head_after], cwd)
+        else:
+            r = None
+        if r is not None and r.returncode == 0:
+            for ln in (r.stdout or "").splitlines():
+                ln = ln.strip()
+                if ln:
+                    paths.add(ln)
+    return sorted(paths)
+
+
 def build_review_brief(lane_label, lane_id, brief_texts, head_start, head,
                        stat, full, files, accept_cmd, accept_exit, accept_tail,
                        controls, rnd, reviews_total, extra):
@@ -1464,9 +1507,11 @@ def build_review_brief(lane_label, lane_id, brief_texts, head_start, head,
         L.append("(none)")
     L.append("")
     L.append("## Verdict")
-    L.append("Write `.lane/REVIEW-%d.md` in the working directory (`mkdir -p .lane` first)." % rnd)
-    L.append("Its first line must be exactly PASS or FAIL, then numbered findings (`1. path:line description`).")
+    L.append("This session is read-only: do not modify, create, or delete any files.")
+    L.append("End your turn with the verdict as your final answer text: its first line must be")
+    L.append("exactly PASS or FAIL, then numbered findings (`1. path:line description`).")
     L.append("PASS only when no material issue remains; when in doubt, FAIL with findings.")
+    L.append("The supervisor records your final answer as `.lane/REVIEW-%d.md` itself." % rnd)
     return "\n".join(L) + "\n"
 
 
@@ -2639,12 +2684,12 @@ def cmd_run(lane_id):
         """Fresh read-only helper for ASK-n. Returns (status, final_text) with
         status in {"ok", "timeout", "failed"}."""
         brief = ("You are answering one mid-step question from a Muse agent working in this directory.\n"
-                 "Read-only: do not modify, create, or delete any files except your answer file below. Do not run long commands.\n"
+                 "Read-only: this session cannot write files. Do not modify, create, or delete anything. Do not run long commands.\n"
                  "\n"
                  "Question from step %d (saved as .lane/ASK-%d.md):\n"
                  "\n%s\n"
                  "\n---\n"
-                 "Write your answer to .lane/ANSWER-%d.md in the working directory (`mkdir -p .lane` first), then finish.\n"
+                 "Your final answer IS the answer: the supervisor saves it to .lane/ANSWER-%d.md and .lane/ANSWER.md itself.\n"
                  "Keep the answer short and concrete; cite file:line paths you read.\n") % (
                      k, n, (question or "(empty)").strip(), n)
         bpath = os.path.join(ldir, "consult-brief-%d.md" % n)
@@ -2656,7 +2701,8 @@ def cmd_run(lane_id):
         err_path = os.path.join(ldir, "consult-%d.err" % n)
         cmd = [muse_bin, "exec", "--prompt-file", bpath,
                "--trust-workspace", "--approval-mode", "never",
-               "--disable-approval", "--reasoning-effort", "high", "--json",
+               "--disable-approval", "--disable-write",
+               "--reasoning-effort", "high", "--json",
                # Owner 2026-10-16: no network from inside Muse's shell sandbox (two lanes built ssh stand-ins
                # to reach the lab runner with ~/.ssh keys). Remote steps run in the unsandboxed accept.
                "--sandbox-network", os.environ.get("MUSE_LANE_SANDBOX_NETWORK", "restricted")]
@@ -2796,19 +2842,15 @@ def cmd_run(lane_id):
             return True
         status, final_text = run_consult_helper(k, n, question)
         ans_n = os.path.join(lane_dot, "ANSWER-%d.md" % n)
-        answer = ""
-        try:
-            with open(ans_n, "r", encoding="utf-8", errors="replace") as f:
-                answer = f.read()
-        except (FileNotFoundError, OSError):
-            answer = ""
-        if not answer.strip() and status == "ok" and (final_text or "").strip():
-            answer = final_text
+        # The helper cannot write (--disable-write); its final answer text is
+        # the answer and the supervisor writes both files itself.
+        answer = (final_text or "") if status == "ok" else ""
+        answered = bool(answer.strip())
+        if answered:
             try:
                 atomic_write_text(ans_n, answer if answer.endswith("\n") else answer + "\n")
             except OSError:
                 pass
-        answered = bool(answer.strip())
         if not answered:
             if status == "timeout":
                 answer = ("The consult helper timed out; no answer is coming. "
@@ -3432,17 +3474,12 @@ def cmd_run(lane_id):
             review_rounds_done.append({"round": rnd, "verdict": "ERROR", "error": err,
                                        "findings_preview": ""})
             return ("error", err)
-        verdict_path = os.path.join(cwd, ".lane", "REVIEW-%d.md" % rnd)
-        try:
-            if os.path.exists(verdict_path):
-                os.remove(verdict_path)
-        except OSError:
-            pass
         jsonl_path = os.path.join(ldir, "review%d.jsonl" % rnd)
         err_path = os.path.join(ldir, "review%d.err" % rnd)
         cmd = [muse_bin, "exec", "--prompt-file", brief_path,
                "--trust-workspace", "--approval-mode", "never",
-               "--disable-approval", "--reasoning-effort", effort, "--json",
+               "--disable-approval", "--disable-write",
+               "--reasoning-effort", effort, "--json",
                # Owner 2026-10-16: no network from inside Muse's shell sandbox (two lanes built ssh stand-ins
                # to reach the lab runner with ~/.ssh keys). Remote steps run in the unsandboxed accept.
                "--sandbox-network", os.environ.get("MUSE_LANE_SANDBOX_NETWORK", "restricted")]
@@ -3476,6 +3513,13 @@ def cmd_run(lane_id):
             review_rounds_done.append({"round": rnd, "verdict": "ERROR", "error": err,
                                        "findings_preview": ""})
             return ("error", err)
+        # Tracked-tree snapshot: the review session is read-only and must not
+        # change HEAD or any tracked file; compared again after it exits.
+        try:
+            head_before = get_git_head(cwd) if os.path.isdir(cwd) else None
+        except Exception:
+            head_before = None
+        status_before = get_git_status_tracked(cwd)
         try:
             proc = subprocess.Popen(cmd, cwd=cwd, env=muse_env,
                                     stdin=subprocess.DEVNULL, stdout=jf, stderr=ef,
@@ -3570,10 +3614,26 @@ def cmd_run(lane_id):
         redact_file_inplace(jsonl_path, secrets)
         redact_file_inplace(err_path, secrets)
         try:
-            with open(verdict_path, "r", encoding="utf-8", errors="replace") as f:
-                verdict_text = f.read()
-        except (FileNotFoundError, OSError):
-            verdict_text = ""
+            head_after = get_git_head(cwd) if os.path.isdir(cwd) else None
+        except Exception:
+            head_after = None
+        status_after = get_git_status_tracked(cwd)
+        if ((head_before or "") != (head_after or "")
+                or (status_before or "") != (status_after or "")):
+            changed = review_changed_paths(cwd, head_before, head_after,
+                                            status_before, status_after)
+            detail = "review session changed tracked files" + (
+                ": " + ", ".join(changed) if changed else "")
+            slog(detail)
+            review_error_holder["v"] = detail
+            review_rounds_done.append({"round": rnd, "verdict": "ERROR",
+                                       "error": detail, "findings_preview": ""})
+            return ("finished", finish_terminal(
+                "failed", steps, last_attempt_of_last_step(),
+                "review session changed tracked files", accept_exit,
+                current_last_event, ""))
+        _rok, _rtext = check_completion(jsonl_path)
+        verdict_text = _rtext or ""
         if timed_out:
             err = "review round %d timed out after %.0fs" % (rnd, review_timeout_sec)
             slog(err)
@@ -3596,12 +3656,16 @@ def cmd_run(lane_id):
                                        "findings_preview": redact_text(
                                            (verdict_text or "")[:REVIEW_PREVIEW_CHARS], secrets)})
             return ("error", err)
-        try:
-            atomic_write_text(os.path.join(ldir, "REVIEW-%d.md" % rnd),
-                              redact_text(verdict_text if verdict_text.endswith("\n")
-                                          else verdict_text + "\n", secrets))
-        except OSError as e:
-            slog("failed to preserve review verdict: %s" % e)
+        # The reviewer cannot write (--disable-write); the supervisor records
+        # its final answer as the verdict file, in the worktree and the lane.
+        verdict_body = redact_text(verdict_text if verdict_text.endswith("\n")
+                                   else verdict_text + "\n", secrets)
+        for _vp in (os.path.join(cwd, ".lane", "REVIEW-%d.md" % rnd),
+                    os.path.join(ldir, "REVIEW-%d.md" % rnd)):
+            try:
+                atomic_write_text(_vp, verdict_body)
+            except OSError as e:
+                slog("failed to write review verdict %s: %s" % (_vp, e))
         review_rounds_done.append({"round": rnd, "verdict": verdict, "error": None,
                                    "findings_preview": redact_text(
                                        (findings or "")[:REVIEW_PREVIEW_CHARS], secrets)})
