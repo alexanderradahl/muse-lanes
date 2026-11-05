@@ -1349,7 +1349,10 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
                 except Exception:
                     rn = "?"
                 verdict = e.get("verdict") or "?"
-                lines.append("Round %s: %s" % (rn, verdict))
+                if e.get("overridden"):
+                    lines.append("Round %s: %s (%s)" % (rn, verdict, e["overridden"]))
+                else:
+                    lines.append("Round %s: %s" % (rn, verdict))
                 body = ""
                 try:
                     with open(os.path.join(ldir, "REVIEW-%s.md" % rn), "r",
@@ -1570,8 +1573,9 @@ def build_review_brief(lane_label, lane_id, brief_texts, head_start, head,
     L.append("## Verdict")
     L.append("This session is read-only: do not modify, create, or delete any files.")
     L.append("End your turn with the verdict as your final answer text: its first line must be")
-    L.append("exactly PASS or FAIL, then numbered findings (`1. path:line description`).")
-    L.append("PASS only when no material issue remains; when in doubt, FAIL with findings.")
+    L.append("exactly PASS or FAIL, then numbered findings (`1. [severity] path:line description`).")
+    L.append("Mark each finding blocker, should-fix, or nit. Any blocker or should-fix finding")
+    L.append("means FAIL; PASS only when the findings are nits or none. When in doubt, FAIL.")
     L.append("The supervisor records your final answer as `.lane/REVIEW-%d.md` itself." % rnd)
     return "\n".join(L) + "\n"
 
@@ -1585,6 +1589,19 @@ def parse_review_verdict(text):
     if first in ("PASS", "FAIL"):
         return (first, "\n".join(lines[1:]).strip())
     return (None, text.strip())
+
+
+_REVIEW_FINDING_LINE_RE = re.compile(r"^\s*\d+\s*[.)]\s+")
+_REVIEW_SEVERE_RE = re.compile(r"\b(blocker|should-fix)\b", re.IGNORECASE)
+
+
+def pass_has_severe_findings(findings):
+    """True when a numbered finding carries blocker/should-fix severity."""
+    for line in (findings or "").splitlines():
+        if (_REVIEW_FINDING_LINE_RE.match(line)
+                and _REVIEW_SEVERE_RE.search(line)):
+            return True
+    return False
 
 
 def spawn_supervisor(lane_id):
@@ -3761,6 +3778,13 @@ def cmd_run(lane_id):
                                        "findings_preview": redact_text(
                                            (verdict_text or "")[:REVIEW_PREVIEW_CHARS], secrets)})
             return ("error", err)
+        # A PASS that still lists a blocker or should-fix finding is a FAIL
+        # the reviewer mislabeled; the supervisor overrides it and runs the
+        # fix round. The verdict file keeps the reviewer's verbatim text.
+        overridden = ""
+        if verdict == "PASS" and pass_has_severe_findings(findings):
+            overridden = "PASS overridden: should-fix findings"
+            verdict = "FAIL"
         # The reviewer cannot write (--disable-write); the supervisor records
         # its final answer as the verdict file, in the worktree and the lane.
         verdict_body = redact_text(verdict_text if verdict_text.endswith("\n")
@@ -3772,12 +3796,16 @@ def cmd_run(lane_id):
             except OSError as e:
                 slog("failed to write review verdict %s: %s" % (_vp, e))
         review_rounds_done.append({"round": rnd, "verdict": verdict, "error": None,
+                                   "overridden": overridden,
                                    "findings_preview": redact_text(
                                        (findings or "")[:REVIEW_PREVIEW_CHARS], secrets)})
         head_cur, commits_cur = git_snapshot()
         write_state("running", steps, last_att, None, now_iso(), current_last_event,
                     head_cur, commits_cur, "", accept_exit, None, last_reason)
-        slog("review round %d: %s" % (rnd, verdict))
+        if overridden:
+            slog("review round %d: FAIL (%s)" % (rnd, overridden))
+        else:
+            slog("review round %d: %s" % (rnd, verdict))
         if verdict == "PASS":
             return ("pass", findings or "")
         return ("fail", findings or "")
