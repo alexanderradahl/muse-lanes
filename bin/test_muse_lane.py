@@ -1936,6 +1936,101 @@ class TestStatusActive(LaneBase):
         self.assertEqual(r2.returncode, 0)
 
 
+class TestStatusActiveCost(LaneBase):
+    def test_status_active_never_runs_git_for_ended_lanes(self):
+        import datetime as _dt
+        import fcntl
+        # git shim that counts invocations instead of touching repos.
+        shimdir = os.path.join(self.root, "shimbin")
+        os.makedirs(shimdir, exist_ok=True)
+        count_file = os.path.join(self.root, "git-calls.log")
+        with open(os.path.join(shimdir, "git"), "w") as f:
+            f.write('#!/bin/sh\n'
+                    'echo "$PWD :: $*" >> "%s"\n'
+                    'echo "shim-subject-line"\n'
+                    'exit 0\n' % count_file)
+        os.chmod(os.path.join(shimdir, "git"), 0o755)
+        env_extra = {"PATH": shimdir + os.pathsep + self.base_env.get("PATH", "")}
+        now = _dt.datetime.now(_dt.timezone.utc)
+        recent = now.isoformat()
+        old = (now - _dt.timedelta(days=2)).isoformat()
+        live_cwd = os.path.join(self.root, "live-cwd")
+        ended_cwd = os.path.join(self.root, "ended-cwd")
+        os.makedirs(live_cwd, exist_ok=True)
+        os.makedirs(ended_cwd, exist_ok=True)
+
+        def mk(lid, status, updated, created, cwd):
+            ldir = os.path.join(self.lanes, lid)
+            os.makedirs(ldir, exist_ok=True)
+            lane = {"id": lid, "label": "L-" + lid, "cwd": cwd,
+                    "created_at": created, "owner_session": "sess-1",
+                    "stall_sec": 2400, "env_file": None, "briefs": ["b.md"]}
+            state = {"status": status, "step": 1, "steps": 1, "attempt": 1,
+                     "supervisor_pid": None, "supervisor_started": None,
+                     "muse_pid": None, "muse_started": None,
+                     "started_at": created, "updated_at": updated,
+                     "last_activity_at": updated, "commits": 0,
+                     "reason": None, "phase": "step:1",
+                     "phase_started": created, "review_rounds": [],
+                     "review_error": None, "consults": []}
+            with open(os.path.join(ldir, "lane.json"), "w") as f:
+                json.dump(lane, f)
+            with open(os.path.join(ldir, "state.json"), "w") as f:
+                json.dump(state, f)
+
+        base = now - _dt.timedelta(hours=3)
+        terms = ["done", "failed", "gave_up", "stopped", "review_failed"]
+        recent_ids = []
+        old_ids = []
+        for i in range(12):
+            rid = "lane-ended-recent-%02d" % i
+            oid = "lane-ended-old-%02d" % i
+            mk(rid, terms[i % len(terms)], recent,
+               (base + _dt.timedelta(seconds=i)).isoformat(), ended_cwd)
+            mk(oid, terms[(i + 1) % len(terms)], old,
+               (base + _dt.timedelta(seconds=100 + i)).isoformat(), ended_cwd)
+            recent_ids.append(rid)
+            old_ids.append(oid)
+        live_id = "lane-live-1"
+        mk(live_id, "running", recent,
+           (base + _dt.timedelta(seconds=1000)).isoformat(), live_cwd)
+        # Hold the live lane's supervisor lock so it displays running.
+        lock_fd = os.open(self.lane_path(live_id, "supervisor.lock"),
+                          os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            r = self.run_lane("status", "--json", "--active",
+                              env_extra=env_extra)
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        objs = json.loads(r.stdout)
+        by_id = {o["id"]: o for o in objs}
+        self.assertIn(live_id, by_id)
+        self.assertEqual(by_id[live_id]["status"], "running")
+        self.assertEqual(by_id[live_id]["last_subject"], "shim-subject-line")
+        for rid in recent_ids:
+            self.assertIn(rid, by_id)
+            self.assertIsNone(by_id[rid]["last_subject"], rid)
+        for oid in old_ids:
+            self.assertNotIn(oid, by_id)
+        try:
+            with open(count_file) as f:
+                calls = [l for l in f.read().splitlines() if l.strip()]
+        except FileNotFoundError:
+            calls = []
+        self.assertEqual(len(calls), 1,
+                         "status --active ran git %d times, want at most 1: %s"
+                         % (len(calls), calls[:5]))
+        self.assertIn(" log ", " " + calls[0] + " ")
+        got_pwd = calls[0].split(" :: ")[0]
+        self.assertEqual(os.path.realpath(got_pwd), os.path.realpath(live_cwd))
+
+
 class TestSandboxNetworkArgv(LaneBase):
     def test_step_argv_carries_sandbox_network_restricted(self):
         argv_file = os.path.join(self.state_dir, "argv.log")
