@@ -44,7 +44,7 @@ const TOOLS = [
         effort: { type: 'string', description: 'Reasoning effort, default max.' },
         stall_min: { type: 'number', description: 'Minutes of no log and no git change before a retry, default 40.' },
         review: {
-          description: 'Muse pre-review after a passing accept (a pre-filter; the Opus lead still does the final review): true, or {brief, rounds} with rounds default 1.',
+          description: 'Muse pre-review after a passing accept (a pre-filter; the Opus lead still does the final review): true, or {brief, rounds} with rounds = max fix re-runs after a FAIL (default 1, 0 reviews once with no fix).',
           anyOf: [{ type: 'boolean' }, { type: 'object', properties: { brief: { type: 'string' }, rounds: { type: 'number' } } }],
         },
         consult_max: { type: 'number', description: 'Max mid-step consult answers per step, default 3.' },
@@ -189,7 +189,8 @@ export const register: Register = (on, options) => {
     } else if (e.review && typeof e.review === 'object') {
       args.push('--review')
       if ((e.review as { brief?: unknown }).brief) args.push('--review-brief', String((e.review as { brief?: unknown }).brief))
-      if ((e.review as { rounds?: unknown }).rounds) args.push('--review-rounds', String((e.review as { rounds?: unknown }).rounds))
+      const rr = (e.review as { rounds?: unknown }).rounds
+      if (rr !== undefined && rr !== null) args.push('--review-rounds', String(rr))
     }
     if (e.consult_max !== undefined && e.consult_max !== null) args.push('--consult-max', String(e.consult_max))
     if (envFile && (await $.fs.exists(envFile))) args.push('--env-file', envFile)

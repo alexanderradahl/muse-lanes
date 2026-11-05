@@ -503,8 +503,16 @@ test('lane_start passes review and consult_max to the runner', async ($, on) => 
   })
   expect(r2.isError).toBeFalsy()
   await clock.settle()
+  const r3 = await callMcp($, {
+    tool: 'mcp__muse__lane_start',
+    cwd: '/tmp/work',
+    steps: [{ prompt: 'do it' }],
+    review: { rounds: 0 },
+  })
+  expect(r3.isError).toBeFalsy()
+  await clock.settle()
 
-  expect(world.startArgs).toHaveLength(2)
+  expect(world.startArgs).toHaveLength(3)
   expect(world.startArgs[0]).toContain('--review')
   expect(world.startArgs[0]).toContain('--review-brief')
   expect(world.startArgs[0]).toContain('allowlist: src/')
@@ -514,5 +522,7 @@ test('lane_start passes review and consult_max to the runner', async ($, on) => 
   expect(world.startArgs[0]).toContain('5')
   expect(world.startArgs[1]).toContain('--review')
   expect(world.startArgs[1]).not.toContain('--review-brief')
+  expect(world.startArgs[2]).toContain('--review-rounds')
+  expect(world.startArgs[2]).toContain('0')
   expectStateShape(world)
 })
