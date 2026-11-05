@@ -42,6 +42,21 @@ def emit_log():
 _base = os.path.basename(prompt_file)
 if _base.startswith("consult-brief"):
     time.sleep(float(os.environ.get("FAKE_CONSULT_SLEEP", "0.1")))
+    if os.environ.get("FAKE_CONSULT_NO_ANSWER", "") == "1":
+        # muse 1.3 shape with no answer anywhere: one empty terminal event.
+        sys.stdout.write(json.dumps({"payload_type": "run.terminal.completed", "payload": {"kind": "run_terminal", "command_id": "cmd-1", "terminal": "completed", "text": ""}}) + "\n")
+        sys.stdout.flush()
+        sys.exit(0)
+    if os.environ.get("FAKE_CONSULT_EMPTY_TERMINAL", "") == "1":
+        # muse 1.3 shape: the answer streams as output deltas but the
+        # terminal event text is empty.
+        _ans = os.environ.get("FAKE_CONSULT_ANSWER", "helper answer 42")
+        _mid = max(1, len(_ans) // 2)
+        for _chunk in (_ans[:_mid], _ans[_mid:]):
+            sys.stdout.write(json.dumps({"payload_type": "run.output.delta", "payload": {"kind": "run_output_delta", "command_id": "cmd-1", "text": _chunk}}) + "\n")
+        sys.stdout.write(json.dumps({"payload_type": "run.terminal.completed", "payload": {"kind": "run_terminal", "command_id": "cmd-1", "terminal": "completed", "text": ""}}) + "\n")
+        sys.stdout.flush()
+        sys.exit(0)
     emit(os.environ.get("FAKE_CONSULT_ANSWER", "helper answer 42"))
     sys.exit(0)
 if _base.startswith("review-brief"):
@@ -707,6 +722,52 @@ class TestTrailingCompletion(LaneBase):
         with open(self.lane_path(lid, "history.json")) as f:
             hist = json.load(f)
         self.assertEqual(hist["1"][0].get("terminal"), "completed")
+
+
+class TestFinalTextExtraction(LaneBase):
+    def _write(self, name, objs):
+        fx = os.path.join(self.state_dir, name)
+        with open(fx, "w") as f:
+            for o in objs:
+                f.write(json.dumps(o) + "\n")
+        return fx
+
+    def _term(self, text, cmd="c1"):
+        return {"payload_type": "run.terminal.completed",
+                "payload": {"kind": "run_terminal", "command_id": cmd,
+                            "terminal": "completed", "text": text}}
+
+    def _delta(self, text, cmd="c1"):
+        return {"payload_type": "run.output.delta",
+                "payload": {"kind": "run_output_delta", "command_id": cmd,
+                            "text": text}}
+
+    def test_stray_empty_terminal_does_not_hide_answer(self):
+        mod = _load_lane_module()
+        fx = self._write("stray.jsonl", [self._term("REAL-ANSWER", "main"),
+                                         self._term("", "stray")])
+        self.assertEqual(mod.get_final_text(fx), "REAL-ANSWER")
+        ok, text = mod.check_completion(fx)
+        self.assertTrue(ok)
+        self.assertEqual(text, "REAL-ANSWER")
+
+    def test_empty_terminal_falls_back_to_deltas(self):
+        mod = _load_lane_module()
+        fx = self._write("deltas.jsonl", [self._delta("DELTA-"),
+                                          self._delta("ANSWER-53"),
+                                          self._term("")])
+        self.assertEqual(mod.get_final_text(fx), "DELTA-ANSWER-53")
+        ok, text = mod.check_completion(fx)
+        self.assertTrue(ok)
+        self.assertEqual(text, "DELTA-ANSWER-53")
+
+    def test_no_text_anywhere_is_empty(self):
+        mod = _load_lane_module()
+        fx = self._write("empty.jsonl", [self._term("")])
+        self.assertEqual(mod.get_final_text(fx), "")
+        ok, text = mod.check_completion(fx)
+        self.assertTrue(ok)
+        self.assertEqual(text, "")
 
 
 class TestSupervisorLock(LaneBase):
@@ -1767,6 +1828,42 @@ class TestConsultAnswers(LaneBase):
         consults = st.get("consults") or []
         self.assertEqual(consults[0].get("helper"), "timeout")
         self.assertFalse(consults[0].get("answered"))
+
+    def test_consult_empty_terminal_text_uses_delta_answer(self):
+        b = self.write_brief("b1.md", "consult delta work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "1",
+                                              "FAKE_CONSULT_EMPTY_TERMINAL": "1",
+                                              "FAKE_CONSULT_ANSWER": "DELTA-ANSWER-53"})
+        self.wait_status(lid, "done", timeout=30)
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            self.assertIn("DELTA-ANSWER-53", f.read())
+        with open(self.lane_path(lid, "supervisor.log")) as f:
+            log = f.read()
+        self.assertIn("consult step 1 #1 ok", log)
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(len(consults), 1)
+        self.assertTrue(consults[0].get("answered"))
+        self.assertEqual(consults[0].get("helper"), "ok")
+
+    def test_consult_no_answer_logs_failed_not_ok(self):
+        b = self.write_brief("b1.md", "consult no-answer work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "1",
+                                              "FAKE_CONSULT_NO_ANSWER": "1"})
+        self.wait_status(lid, "done", timeout=30)
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            self.assertIn("helper failed", f.read())
+        with open(self.lane_path(lid, "supervisor.log")) as f:
+            log = f.read()
+        self.assertIn("consult step 1 #1 failed", log)
+        self.assertNotIn("consult step 1 #1 ok", log)
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(len(consults), 1)
+        self.assertFalse(consults[0].get("answered"))
+        self.assertEqual(consults[0].get("helper"), "failed")
 
 
 class TestReadOnlySessions(LaneBase):
