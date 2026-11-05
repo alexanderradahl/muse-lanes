@@ -90,7 +90,8 @@ if _base.startswith("review-brief"):
                 _df.write("reviewer was here\n")
         except Exception as _e:
             sys.stderr.write("dirty write failed: %s\n" % _e)
-    _find = os.environ.get("FAKE_REVIEW_FINDINGS", "1. main.py:10 missing check")
+    _rnd = "".join(ch for ch in _base if ch.isdigit()) or "1"
+    _find = os.environ.get("FAKE_REVIEW_FINDINGS_" + _rnd, "") or os.environ.get("FAKE_REVIEW_FINDINGS", "1. main.py:10 missing check")
     time.sleep(float(os.environ.get("FAKE_SLEEP", "0.2")))
     emit(_verdict + "\n" + _find)
     sys.exit(0)
@@ -1688,6 +1689,50 @@ class TestReviewFailThenPass(LaneBase):
             self.assertIn("app.py:9", f.read())
 
 
+class TestReviewPassOverride(LaneBase):
+    def test_pass_with_should_fix_triggers_fix_round(self):
+        b = self.write_brief("b1.md", "override work OVERRIDE-MARKER")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_VERDICT": "PASS",
+                                              "FAKE_REVIEW_FINDINGS_1": "1. [should-fix] app.py:9 fix me",
+                                              "FAKE_REVIEW_FINDINGS_2": "1. [nit] app.py:3 typo"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=40)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "done")
+        rounds = st.get("review_rounds") or []
+        self.assertEqual([e.get("verdict") for e in rounds], ["FAIL", "PASS"])
+        self.assertEqual(rounds[0].get("overridden"), "PASS overridden: should-fix findings")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("Round 1: FAIL (PASS overridden: should-fix findings)", summ)
+        self.assertIn("Round 2: PASS", summ)
+        # The fix round ran as for FAIL: brief augmented, history archived.
+        with open(self.lane_path(lid, "brief1.md")) as f:
+            self.assertIn("app.py:9", f.read())
+        with open(self.lane_path(lid, "history.json")) as f:
+            self.assertIn("1-pre-r1", json.load(f))
+        # The verdict file keeps the reviewer's verbatim PASS text.
+        with open(self.lane_path(lid, "REVIEW-1.md")) as f:
+            self.assertTrue(f.read().startswith("PASS"))
+
+    def test_pass_with_only_nits_skips_fix_round(self):
+        b = self.write_brief("b1.md", "nits work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_VERDICT": "PASS",
+                                              "FAKE_REVIEW_FINDINGS": "1. [nit] app.py:3 typo\n2. [nit] app.py:4 spacing"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=25)
+        st = self.read_state(lid)
+        rounds = st.get("review_rounds") or []
+        self.assertEqual(len(rounds), 1)
+        self.assertEqual(rounds[0].get("verdict"), "PASS")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            self.assertNotIn("overridden", f.read())
+        with open(self.lane_path(lid, "history.json")) as f:
+            self.assertNotIn("1-pre-r1", json.load(f))
+
+
 class TestReviewError(LaneBase):
     def test_review_crash_does_not_block_done(self):
         b = self.write_brief("b1.md", "review crash work")
@@ -1755,6 +1800,23 @@ class TestReviewBrief(LaneBase):
         self.assertEqual(v2, "PASS")
         v3, _ = mod.parse_review_verdict("maybe\n")
         self.assertIsNone(v3)
+
+    def test_pass_override_predicate_and_brief_rule(self):
+        mod = _load_lane_module()
+        self.assertTrue(mod.pass_has_severe_findings("1. [should-fix] a.py:1 x"))
+        self.assertTrue(mod.pass_has_severe_findings("2. BLOCKER: b.py:2 y"))
+        self.assertTrue(mod.pass_has_severe_findings("1) Should-Fix c.py:3 z"))
+        self.assertFalse(mod.pass_has_severe_findings("1. [nit] a.py:1 typo"))
+        self.assertFalse(mod.pass_has_severe_findings("1. a.py:1 fix this"))
+        self.assertFalse(mod.pass_has_severe_findings(
+            "overall should-fix sentiment but no numbered finding"))
+        self.assertFalse(mod.pass_has_severe_findings(""))
+        txt = mod.build_review_brief("lbl", "lid", ["b"], None, None, "stat",
+                                     "diff", [], "exit 0", 0, "tail", [], 1, 2,
+                                     None)
+        self.assertIn("Any blocker or should-fix finding", txt)
+        self.assertIn("means FAIL", txt)
+        self.assertIn("PASS only when the findings are nits or none", txt)
 
     def test_review_flags_validated(self):
         b = self.write_brief("b1.md", "x")
