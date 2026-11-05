@@ -9,7 +9,8 @@ import type { MuseLane as Lane } from '../types'
 const PANE = 'muse-lanes'
 const lanes = atom({ plugin: 'muse', key: 'lanes' } as const, [] as Lane[])
 const triesRef = atom({ plugin: 'muse', key: 'summaryTries' } as const, {} as Record<string, number>)
-const TERMINAL = new Set(['done', 'failed', 'gave_up', 'stopped'])
+const TERMINAL = new Set(['done', 'failed', 'gave_up', 'stopped', 'review_failed'])
+const WORK = new Set(['running', 'retry_wait', 'accepting'])
 const POLL_MS = 20_000
 const SUMMARY_TRIES = 3
 let pollInFlight = false
@@ -42,10 +43,15 @@ const TOOLS = [
         label: { type: 'string' },
         effort: { type: 'string', description: 'Reasoning effort, default max.' },
         stall_min: { type: 'number', description: 'Minutes of no log and no git change before a retry, default 40.' },
+        review: {
+          description: 'Muse pre-review after a passing accept (a pre-filter; the Opus lead still does the final review): true, or {brief, rounds} with rounds = max fix re-runs after a FAIL (default 1, 0 reviews once with no fix).',
+          anyOf: [{ type: 'boolean' }, { type: 'object', properties: { brief: { type: 'string' }, rounds: { type: 'number' } } }],
+        },
+        consult_max: { type: 'number', description: 'Max mid-step consult answers per step, default 3.' },
       },
     },
   },
-  { name: 'lane_status', description: 'Muse lanes and their state (all, or one by id).', inputSchema: { type: 'object', properties: { id: { type: 'string' } } } },
+  { name: 'lane_status', description: 'Muse lanes and their state (active view, or one by id).', inputSchema: { type: 'object', properties: { id: { type: 'string' }, all: { type: 'boolean', description: 'List every lane, not just the active view.' } } } },
   { name: 'lane_summary', description: "A finished lane's summary: attempts, commits, acceptance, each step's final answer.", inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
   { name: 'lane_stop', description: 'Stop a running Muse lane.', inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
   { name: 'lane_resume', description: 'Resume an orphaned lane (its supervisor died) from its recorded step.', inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
@@ -66,7 +72,7 @@ async function poll($: any) {
   if (pollInFlight) return
   pollInFlight = true
   try {
-    const r = await lane($, ['status', '--json'])
+    const r = await lane($, ['status', '--json', '--active'])
     if (!r.ok) return
     let list: Lane[] = []
     try { list = JSON.parse(r.out) } catch { return }
@@ -80,8 +86,13 @@ async function poll($: any) {
     }
     if (!me) return
     const tries = { ...((((await read($, triesRef)) as Record<string, number> | undefined) ?? {})) }
-    const active = list.filter(l => l.owner_session === me && (l.status === 'running' || l.status === 'retry_wait')).length
-    $.ui.status(active > 0 ? `muse: ${active} running` : undefined)
+    const mine = list.filter(l => l.owner_session === me && WORK.has(l.status))
+    if (mine.length === 1) {
+      const l = mine[0]!
+      $.ui.status(`muse: ${l.label || l.id} ${l.phase || l.status}`)
+    } else {
+      $.ui.status(mine.length > 0 ? `muse: ${mine.length} running` : undefined)
+    }
 
     for (const l of list) {
       if (l.owner_session !== me) continue
@@ -173,6 +184,15 @@ export const register: Register = (on, options) => {
     if (e.label) args.push('--label', e.label)
     if (e.accept) args.push('--accept', e.accept)
     if (e.stall_min) args.push('--stall-min', String(e.stall_min))
+    if (e.review === true) {
+      args.push('--review')
+    } else if (e.review && typeof e.review === 'object') {
+      args.push('--review')
+      if ((e.review as { brief?: unknown }).brief) args.push('--review-brief', String((e.review as { brief?: unknown }).brief))
+      const rr = (e.review as { rounds?: unknown }).rounds
+      if (rr !== undefined && rr !== null) args.push('--review-rounds', String(rr))
+    }
+    if (e.consult_max !== undefined && e.consult_max !== null) args.push('--consult-max', String(e.consult_max))
     if (envFile && (await $.fs.exists(envFile))) args.push('--env-file', envFile)
     const r = await lane($, args)
     if (!r.ok) return { result: r.out, isError: true }
@@ -181,7 +201,7 @@ export const register: Register = (on, options) => {
     return { result: `Started lane ${id}. You will get one prompt with its summary when it ends; no need to poll.` }
   })
 
-  on('tool.call', { tool: 'mcp__muse__lane_status' }, async ($, e: any) => answer($, e.id ? ['status', e.id] : ['status']))
+  on('tool.call', { tool: 'mcp__muse__lane_status' }, async ($, e: any) => answer($, e.id ? ['status', e.id] : (e.all ? ['status'] : ['status', '--active'])))
   on('tool.call', { tool: 'mcp__muse__lane_summary' }, async ($, e: any) => answer($, ['summary', e.id]))
   on('tool.call', { tool: 'mcp__muse__lane_stop' }, async ($, e: any) => answer($, ['stop', e.id]))
   on('tool.call', { tool: 'mcp__muse__lane_resume' }, async ($, e: any) => answer($, ['resume', e.id]))
@@ -189,27 +209,88 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const list = ((await read($, lanes)) as Lane[] | undefined) ?? []
+    let me = ''
+    try {
+      me = await $.session.id()
+    } catch {
+      me = ''
+    }
     const now = Date.now() / 1000
-    const idle = (t?: number | string) => {
-      const s = typeof t === 'number' ? t : t ? Date.parse(t) / 1000 : NaN
-      return Number.isFinite(s) ? `${Math.round((now - s) / 60)}m idle` : ''
+    const ts = (t?: number | string | null) => {
+      if (t === undefined || t === null) return NaN
+      const s = typeof t === 'number' ? t : Date.parse(t) / 1000
+      return Number.isFinite(s) ? s : NaN
+    }
+    const dur = (sec: number) => {
+      if (!Number.isFinite(sec) || sec < 0) return ''
+      if (sec < 120) return `${Math.round(sec)}s`
+      if (sec < 3600) return `${Math.round(sec / 60)}m`
+      return `${Math.floor(sec / 3600)}h ${Math.round((sec % 3600) / 60)}m`
+    }
+    const ordered = [...list].sort((a, b) => {
+      const am = me && a.owner_session === me ? 0 : 1
+      const bm = me && b.owner_session === me ? 0 : 1
+      return am - bm
+    })
+    const row1 = (l: Lane) => {
+      const done = TERMINAL.has(l.status)
+      const bits = [
+        l.status.padEnd(10),
+        `${l.label || l.id}`,
+        `step ${l.step ?? '-'}/${l.steps ?? '-'} try ${l.attempt ?? '-'}`,
+      ]
+      if (l.phase) {
+        const end = done ? ts(l.updated_at) : now
+        const el = dur(end - ts(l.phase_started))
+        bits.push(`phase ${l.phase}${el ? ` (${el})` : ''}`)
+      }
+      const totalEnd = done ? ts(l.updated_at) : now
+      const total = dur(totalEnd - ts(l.started_at))
+      if (total) bits.push(`total ${total}`)
+      if (!done) {
+        const idleSec = now - ts(l.last_activity_at)
+        if (Number.isFinite(idleSec) && idleSec >= 0) {
+          const hot = l.stall_sec ? idleSec > 0.75 * l.stall_sec : false
+          bits.push(`idle ${Math.round(idleSec / 60)}m${hot ? '!' : ''}`)
+        }
+      } else if (l.reason) {
+        bits.push(l.reason)
+      }
+      let commits = `${l.commits ?? 0} commits`
+      if ((l.commits ?? 0) > 0 && l.last_subject) commits += `: ${l.last_subject}`
+      bits.push(commits)
+      return bits.join('  ')
+    }
+    const row2 = (l: Lane): string | null => {
+      if ((l.status === 'failed' || l.status === 'review_failed') && l.accept_tail) {
+        const lines = l.accept_tail.split('\n').filter(s => s.trim()).slice(-5)
+          .map(s => (s.length > 120 ? s.slice(0, 117) + '...' : s))
+        return lines.length > 0 ? `accept: ${lines.join(' | ')}` : null
+      }
+      return null
     }
     return (
       <Box flexDirection="column">
-        {list.length === 0 && <Text dimColor>No Muse lanes.</Text>}
-        {list.slice(0, 30).map(l => (
-          <Box key={l.id} flexDirection="row" gap={1}>
-            <Text bold={!TERMINAL.has(l.status)} dimColor={TERMINAL.has(l.status)}>
-              {l.status.padEnd(10)} {l.label ?? l.id}  step {l.step ?? '-'}/{l.steps ?? '-'}  try {l.attempt ?? '-'}  {l.commits ?? 0} commits  {TERMINAL.has(l.status) ? (l.reason ?? '') : idle(l.last_activity_at)}
-            </Text>
-            {!TERMINAL.has(l.status) && l.status !== 'orphaned' && (
-              <Button key={`stop-${l.id}`} plain onPress={() => void lane($, ['stop', l.id]).then(() => poll($))}>stop</Button>
-            )}
-            {l.status === 'orphaned' && (
-              <Button key={`resume-${l.id}`} plain onPress={() => void lane($, ['resume', l.id]).then(() => poll($))}>resume</Button>
-            )}
-          </Box>
-        ))}
+        {ordered.length === 0 && <Text dimColor>No Muse lanes.</Text>}
+        {ordered.slice(0, 30).map(l => {
+          const second = row2(l)
+          return (
+            <Box key={l.id} flexDirection="column">
+              <Box flexDirection="row" gap={1}>
+                <Text bold={!TERMINAL.has(l.status)} dimColor={TERMINAL.has(l.status)}>
+                  {row1(l)}
+                </Text>
+                {!TERMINAL.has(l.status) && l.status !== 'orphaned' && (
+                  <Button key={`stop-${l.id}`} plain onPress={() => void lane($, ['stop', l.id]).then(() => poll($))}>stop</Button>
+                )}
+                {l.status === 'orphaned' && (
+                  <Button key={`resume-${l.id}`} plain onPress={() => void lane($, ['resume', l.id]).then(() => poll($))}>resume</Button>
+                )}
+              </Box>
+              {second && <Text dimColor>{second}</Text>}
+            </Box>
+          )
+        })}
       </Box>
     )
   })

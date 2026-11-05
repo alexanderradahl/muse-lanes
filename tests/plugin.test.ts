@@ -14,7 +14,8 @@ import type { On } from 'claude-code'
 
 const ME = 'sess-test-me'
 const OTHER = 'sess-other'
-const TERMINAL = new Set(['done', 'failed', 'gave_up', 'stopped'])
+const TERMINAL = new Set(['done', 'failed', 'gave_up', 'stopped', 'review_failed'])
+const NON_TERMINAL = new Set(['queued', 'running', 'retry_wait', 'accepting'])
 
 type FakeLane = {
   id: string
@@ -24,6 +25,8 @@ type FakeLane = {
   announced: boolean
   orphanAnnounced: boolean
   summary?: string
+  phase?: string
+  updatedAt?: string
 }
 
 type World = {
@@ -42,8 +45,11 @@ type World = {
   gate: Promise<void> | null
 }
 
-// One row the way `muse-lane status --json` serves it.
+// One row the way `muse-lane status --json` serves it. Stamps a fresh
+// updated_at on first serve so the active filter treats test lanes as recent
+// while staying deterministic across calls.
 function rowJson(l: FakeLane) {
+  if (!l.updatedAt) l.updatedAt = new Date().toISOString()
   return {
     id: l.id,
     label: l.label ?? '',
@@ -58,7 +64,25 @@ function rowJson(l: FakeLane) {
     owner_session: l.owner,
     announced: l.announced,
     orphan_announced: l.orphanAnnounced,
+    phase: l.phase ?? 'step:1',
+    phase_started: l.updatedAt,
+    started_at: l.updatedAt,
+    updated_at: l.updatedAt,
+    stall_sec: 2400,
+    last_subject: null,
+    accept_tail: '',
+    review_rounds: [],
+    review_error: null,
   }
+}
+
+function isActive(l: FakeLane): boolean {
+  if (l.status === 'orphaned' || NON_TERMINAL.has(l.status)) return true
+  if (!TERMINAL.has(l.status)) return true
+  if (!l.updatedAt) l.updatedAt = new Date().toISOString()
+  const u = Date.parse(l.updatedAt)
+  if (!Number.isFinite(u)) return true
+  return Date.now() - u <= 24 * 3600 * 1000
 }
 
 function setup(on: On): { world: World; clock: MockClock } {
@@ -93,10 +117,23 @@ function setup(on: On): { world: World; clock: MockClock } {
     const cmd = rest[0] ?? ''
     const a = rest[1]
     const b = rest[2]
-    if (cmd === 'status' && a === '--json') {
+    if (cmd === 'status' && rest.includes('--json')) {
       world.statusJsonCalls += 1
       if (world.gate) await world.gate
-      return runOk(JSON.stringify(world.lanes.map(rowJson)))
+      let lanes = [...world.lanes]
+      if (rest.includes('--active')) lanes = lanes.filter(isActive)
+      const li = rest.indexOf('--limit')
+      if (li >= 0) lanes = lanes.slice(0, Math.max(0, Number(rest[li + 1] ?? 0)))
+      return runOk(JSON.stringify(lanes.map(rowJson)))
+    }
+    if (cmd === 'status' && a === '--active') {
+      const active = world.lanes.filter(isActive)
+      const lines = active.map(l => `${l.id}  ${l.status}  step 1/1 att 1  updated now`)
+      if (world.lanes.length > active.length) {
+        lines.push(`(+${world.lanes.length - active.length} older lanes not shown)`)
+      }
+      if (lines.length === 0) return runOk('(no lanes)')
+      return runOk(lines.join('\n'))
     }
     if (cmd === 'status' && a === undefined) {
       if (world.lanes.length === 0) return runOk('(no lanes)')
@@ -350,7 +387,7 @@ test('status line shows owned running lanes and clears', async ($, on) => {
   world.lanes[0]!.status = 'done'
   world.lanes[0]!.summary = 'delta summary'
   await pollOnce($, clock)
-  expect(world.statuses.at(-1)).toBe('muse: 1 running')
+  expect(world.statuses.at(-1)).toBe('muse: echo step:1')
 
   world.lanes[1]!.status = 'done'
   world.lanes[1]!.summary = 'echo summary'
@@ -387,5 +424,105 @@ test('lane_start writes a unique brief path per inline prompt', async ($, on) =>
     expect(world.startArgs[i]).toContain('--owner-session')
     expect(world.startArgs[i]).toContain(ME)
   }
+  expectStateShape(world)
+})
+
+test('poll uses the active view and lane_status pages older lanes', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  world.lanes.push(
+    {
+      id: 'lane-live', label: 'live', status: 'running',
+      owner: ME, announced: false, orphanAnnounced: false, phase: 'gate1',
+    },
+    {
+      id: 'lane-old', label: 'old', status: 'done',
+      owner: ME, announced: true, orphanAnnounced: false,
+      summary: 'old summary',
+      updatedAt: new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString(),
+    },
+  )
+  await pollOnce($, clock)
+  expect(world.runs.some(r => r === 'status --json --active')).toBe(true)
+  expect(world.store.get('muse/lanes')).toEqual([rowJson(world.lanes[0]!)])
+  expect(world.submits).toHaveLength(0)
+  expect(world.statuses.at(-1)).toBe('muse: live gate1')
+
+  const active = await callMcp($, { tool: 'mcp__muse__lane_status' })
+  expect(active.isError).toBeFalsy()
+  expect(active.result).toContain('lane-live')
+  expect(active.result).toContain('older lanes')
+  expect(active.result).not.toContain('lane-old')
+  await clock.settle()
+
+  const all = await callMcp($, { tool: 'mcp__muse__lane_status', all: true })
+  expect(all.isError).toBeFalsy()
+  expect(all.result).toContain('lane-live')
+  expect(all.result).toContain('lane-old')
+  expect(all.result).not.toContain('older lanes')
+})
+
+test('review_failed wakes the owner like failed', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  world.lanes.push({
+    id: 'lane-r', label: 'rev', status: 'review_failed',
+    owner: ME, announced: false, orphanAnnounced: false,
+    summary: 'Muse pre-review (not the independent review)\nRound 1: FAIL',
+  })
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(1)
+  expect(world.submits[0]).toContain('review_failed')
+  expect(world.submits[0]).toContain('Muse pre-review (not the independent review)')
+  expect(world.toasts).toHaveLength(1)
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(1)
+  expectStateShape(world)
+})
+
+test('lane_start passes review and consult_max to the runner', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  const r1 = await callMcp($, {
+    tool: 'mcp__muse__lane_start',
+    cwd: '/tmp/work',
+    steps: [{ prompt: 'do it' }],
+    review: { brief: 'allowlist: src/', rounds: 2 },
+    consult_max: 5,
+  })
+  expect(r1.isError).toBeFalsy()
+  await clock.settle()
+  const r2 = await callMcp($, {
+    tool: 'mcp__muse__lane_start',
+    cwd: '/tmp/work',
+    steps: [{ prompt: 'do it' }],
+    review: true,
+  })
+  expect(r2.isError).toBeFalsy()
+  await clock.settle()
+  const r3 = await callMcp($, {
+    tool: 'mcp__muse__lane_start',
+    cwd: '/tmp/work',
+    steps: [{ prompt: 'do it' }],
+    review: { rounds: 0 },
+  })
+  expect(r3.isError).toBeFalsy()
+  await clock.settle()
+
+  expect(world.startArgs).toHaveLength(3)
+  expect(world.startArgs[0]).toContain('--review')
+  expect(world.startArgs[0]).toContain('--review-brief')
+  expect(world.startArgs[0]).toContain('allowlist: src/')
+  expect(world.startArgs[0]).toContain('--review-rounds')
+  expect(world.startArgs[0]).toContain('2')
+  expect(world.startArgs[0]).toContain('--consult-max')
+  expect(world.startArgs[0]).toContain('5')
+  expect(world.startArgs[1]).toContain('--review')
+  expect(world.startArgs[1]).not.toContain('--review-brief')
+  expect(world.startArgs[2]).toContain('--review-rounds')
+  expect(world.startArgs[2]).toContain('0')
   expectStateShape(world)
 })

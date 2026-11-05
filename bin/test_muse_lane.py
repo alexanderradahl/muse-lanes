@@ -16,6 +16,13 @@ LANE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "muse-lane")
 
 FAKE_MUSE = r"""#!/usr/bin/env python3
 import json, os, sys, time, subprocess
+_argv_file = os.environ.get("FAKE_ARGV_FILE", "")
+if _argv_file:
+    try:
+        with open(_argv_file, "a") as _af:
+            _af.write(json.dumps(sys.argv) + "\n")
+    except Exception:
+        pass
 def get_arg(name):
     a = sys.argv
     if name in a:
@@ -32,6 +39,46 @@ def emit(text):
 def emit_log():
     sys.stdout.write(json.dumps({"payload_type": "run.log", "payload": {}}) + "\n")
     sys.stdout.flush()
+_base = os.path.basename(prompt_file)
+if _base.startswith("consult-brief"):
+    time.sleep(float(os.environ.get("FAKE_CONSULT_SLEEP", "0.1")))
+    emit(os.environ.get("FAKE_CONSULT_ANSWER", "helper answer 42"))
+    sys.exit(0)
+if _base.startswith("review-brief"):
+    _rmode = os.environ.get("FAKE_REVIEW_MODE", "")
+    if _rmode == "crash":
+        sys.stderr.write("review crashed boom\n")
+        sys.stderr.flush()
+        time.sleep(0.1)
+        sys.exit(1)
+    if _rmode == "sleep":
+        time.sleep(float(os.environ.get("FAKE_REVIEW_SLEEP", "30")))
+        sys.exit(1)
+    _verdict = os.environ.get("FAKE_REVIEW_VERDICT", "PASS")
+    _fails = int(os.environ.get("FAKE_REVIEW_FAILS", "0"))
+    _cf = os.environ.get("FAKE_REVIEW_COUNT_FILE", "")
+    if _fails > 0 and _cf:
+        _n = 0
+        if os.path.exists(_cf):
+            try:
+                with open(_cf) as _f:
+                    _n = int((_f.read() or "0").strip() or "0")
+            except Exception:
+                _n = 0
+        _n += 1
+        with open(_cf, "w") as _f:
+            _f.write(str(_n))
+        _verdict = "FAIL" if _n <= _fails else "PASS"
+    if os.environ.get("FAKE_REVIEW_DIRTY", "") == "1":
+        try:
+            with open(os.environ.get("FAKE_REVIEW_DIRTY_FILE", "tracked.txt"), "a") as _df:
+                _df.write("reviewer was here\n")
+        except Exception as _e:
+            sys.stderr.write("dirty write failed: %s\n" % _e)
+    _find = os.environ.get("FAKE_REVIEW_FINDINGS", "1. main.py:10 missing check")
+    time.sleep(float(os.environ.get("FAKE_SLEEP", "0.2")))
+    emit(_verdict + "\n" + _find)
+    sys.exit(0)
 if mode == "complete":
     txt = os.environ.get("FAKE_TEXT", "hello final")
     # include some stderr noise that must be filtered from the tail
@@ -84,7 +131,7 @@ elif mode == "order":
         with open(order_file, "a") as f:
             f.write(base + "\n")
     time.sleep(0.2)
-    emit("final for %s: %s" % (base, content.strip()[:80]))
+    emit("final for %s: %s" % (base, content.strip()[:2000]))
     sys.exit(0)
 elif mode == "envcheck":
     key = os.environ.get("FAKE_ENV_KEY", "MY_SECRET")
@@ -144,6 +191,36 @@ elif mode == "complete_then_hang":
     time.sleep(0.2)
     emit(os.environ.get("FAKE_TEXT", "hung final"))
     time.sleep(float(os.environ.get("FAKE_SLEEP", "30")))
+    sys.exit(0)
+elif mode == "ask":
+    _count = int(os.environ.get("FAKE_ASK_COUNT", "1"))
+    _wait = float(os.environ.get("FAKE_ASK_WAIT", "25"))
+    try:
+        os.makedirs(".lane", exist_ok=True)
+    except Exception:
+        pass
+    _got = []
+    for _i in range(1, _count + 1):
+        try:
+            os.remove(".lane/ANSWER.md")
+        except Exception:
+            pass
+        with open(".lane/ASK.md", "w") as _f:
+            _f.write("Question %d: how to test?\nPaths: foo.py\n" % _i)
+        _ans = ""
+        _dead = time.time() + _wait
+        while time.time() < _dead:
+            if os.path.exists(".lane/ANSWER.md"):
+                try:
+                    with open(".lane/ANSWER.md") as _f:
+                        _ans = _f.read()
+                except Exception:
+                    pass
+                if _ans.strip():
+                    break
+            time.sleep(0.1)
+        _got.append((_ans.strip()[:80] or "NO-ANSWER"))
+    emit("ask final; answers=%s" % ("|".join(_got)))
     sys.exit(0)
 else:
     emit("default final")
@@ -242,6 +319,16 @@ class LaneBase(unittest.TestCase):
             cmd += ["--stall-min", str(kwargs["stall_min"])]
         if kwargs.get("owner_session"):
             cmd += ["--owner-session", kwargs["owner_session"]]
+        if kwargs.get("review"):
+            cmd += ["--review"]
+        if kwargs.get("review_rounds") is not None:
+            cmd += ["--review-rounds", str(kwargs["review_rounds"])]
+        if kwargs.get("review_brief"):
+            cmd += ["--review-brief", kwargs["review_brief"]]
+        if kwargs.get("consult_max") is not None:
+            cmd += ["--consult-max", str(kwargs["consult_max"])]
+        if kwargs.get("consult_timeout_min") is not None:
+            cmd += ["--consult-timeout-min", str(kwargs["consult_timeout_min"])]
         r = self.run_lane(*cmd, env_extra=env_extra)
         self.assertEqual(r.returncode, 0, "start failed: %s %s" % (r.stdout, r.stderr))
         lid = r.stdout.strip().splitlines()[-1].strip()
@@ -1436,6 +1523,436 @@ class TestOrphanAckPerIncarnation(LaneBase):
         self.wait_status(lid, "done", timeout=25)
         a4 = self.run_lane("ack", lid, "--orphan")
         self.assertEqual(a4.returncode, 2)
+
+
+class TestReviewPass(LaneBase):
+    def test_review_pass_ends_done_with_section(self):
+        b = self.write_brief("b1.md", "review pass work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_TEXT": "work done",
+                                              "FAKE_REVIEW_VERDICT": "PASS"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=25)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "done")
+        rounds = st.get("review_rounds") or []
+        self.assertEqual(len(rounds), 1)
+        self.assertEqual(rounds[0].get("verdict"), "PASS")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("Muse pre-review (not the independent review)", summ)
+        self.assertIn("Round 1: PASS", summ)
+        self.assertTrue(os.path.exists(self.lane_path(lid, "REVIEW-1.md")))
+        self.assertTrue(os.path.exists(os.path.join(self.cwd, ".lane", "REVIEW-1.md")))
+        with open(self.lane_path(lid, "review-brief1.md")) as f:
+            rb = f.read()
+        self.assertIn("review pass work", rb)
+        self.assertIn("REVIEW-1.md", rb)
+        self.assertIn("round 1 of 2", rb)
+
+
+class TestReviewFailNoRoundsLeft(LaneBase):
+    def test_review_fail_ends_review_failed(self):
+        b = self.write_brief("b1.md", "review fail work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_VERDICT": "FAIL",
+                                              "FAKE_REVIEW_FINDINGS": "1. app.py:42 missing test\n2. app.py:50 toothless control"},
+                              accept="exit 0", review=True, review_rounds=0)
+        self.wait_status(lid, "review_failed", timeout=25)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "review_failed")
+        rounds = st.get("review_rounds") or []
+        self.assertEqual(len(rounds), 1)
+        self.assertEqual(rounds[0].get("verdict"), "FAIL")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("Muse pre-review (not the independent review)", summ)
+        self.assertIn("Round 1: FAIL", summ)
+        self.assertIn("app.py:42", summ)
+        r = self.run_lane("ack", lid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class TestReviewFailThenPass(LaneBase):
+    def test_review_fail_reruns_last_step_then_done(self):
+        count = os.path.join(self.state_dir, "review-count")
+        b1 = self.write_brief("b1.md", "first work")
+        b2 = self.write_brief("b2.md", "last work RERUN-MARKER")
+        lid = self.start_lane([b1, b2], env_extra={"FAKE_MODE": "complete",
+                                                   "FAKE_REVIEW_FAILS": "1",
+                                                   "FAKE_REVIEW_COUNT_FILE": count,
+                                                   "FAKE_REVIEW_FINDINGS": "1. last.py:7 fix this"},
+                              accept="exit 0", review=True, review_rounds=2)
+        self.wait_status(lid, "done", timeout=40)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "done")
+        rounds = st.get("review_rounds") or []
+        self.assertEqual([e.get("verdict") for e in rounds], ["FAIL", "PASS"])
+        with open(self.lane_path(lid, "brief2.md")) as f:
+            aug = f.read()
+        self.assertIn("RERUN-MARKER", aug)
+        self.assertIn("last.py:7", aug)
+        with open(self.lane_path(lid, "brief2-orig.md")) as f:
+            orig = f.read()
+        self.assertIn("RERUN-MARKER", orig)
+        self.assertNotIn("last.py:7", orig)
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        self.assertIn("2-pre-r1", hist)
+        self.assertIn("2", hist)
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("Round 1: FAIL", summ)
+        self.assertIn("Round 2: PASS", summ)
+
+    def test_review_default_round_fixes_once(self):
+        count = os.path.join(self.state_dir, "review-count-default")
+        b = self.write_brief("b1.md", "default fix work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_FAILS": "1",
+                                              "FAKE_REVIEW_COUNT_FILE": count,
+                                              "FAKE_REVIEW_FINDINGS": "1. app.py:9 fix me"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=40)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "done")
+        rounds = st.get("review_rounds") or []
+        self.assertEqual([e.get("verdict") for e in rounds], ["FAIL", "PASS"])
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        self.assertIn("1-pre-r1", hist)
+        self.assertEqual(len(hist["1-pre-r1"]), 1)
+        self.assertEqual(len(hist["1"]), 1)
+        with open(self.lane_path(lid, "brief1.md")) as f:
+            self.assertIn("app.py:9", f.read())
+
+
+class TestReviewError(LaneBase):
+    def test_review_crash_does_not_block_done(self):
+        b = self.write_brief("b1.md", "review crash work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_MODE": "crash"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=25)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "done")
+        self.assertTrue(st.get("review_error"))
+        rounds = st.get("review_rounds") or []
+        self.assertEqual(rounds[0].get("verdict"), "ERROR")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("review_error", summ)
+
+    def test_review_timeout_records_error(self):
+        b = self.write_brief("b1.md", "review timeout work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_MODE": "sleep",
+                                              "FAKE_REVIEW_SLEEP": "30",
+                                              "MUSE_LANE_REVIEW_TIMEOUT_SEC": "1"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=30)
+        st = self.read_state(lid)
+        self.assertIn("timed out", st.get("review_error") or "")
+
+
+class TestReviewBrief(LaneBase):
+    def test_review_brief_caps_large_diff_and_parses_verdict(self):
+        mod = _load_lane_module()
+        subprocess.run(["git", "init"], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=self.cwd, capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=self.cwd, capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=self.cwd, capture_output=True, timeout=15)
+        with open(os.path.join(self.cwd, "init.txt"), "w") as f:
+            f.write("init\n")
+        subprocess.run(["git", "add", "."], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        head_start = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.cwd, capture_output=True,
+                                    text=True, timeout=15).stdout.strip()
+        big = "x" * (mod.REVIEW_DIFF_CAP + 1000)
+        with open(os.path.join(self.cwd, "big.txt"), "w") as f:
+            f.write(big + "\n")
+        subprocess.run(["git", "add", "."], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        subprocess.run(["git", "commit", "-m", "big"], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.cwd, capture_output=True,
+                              text=True, timeout=15).stdout.strip()
+        stat, full, files = mod.get_review_diff(self.cwd, head_start, head)
+        self.assertIsNone(full)
+        self.assertIn("big.txt", files)
+        self.assertIn("big.txt", stat)
+        txt = mod.build_review_brief("lbl", "lid", ["brief one"], head_start, head,
+                                     stat, full, files, "exit 0", 0, "tail", [], 1, 2, None)
+        self.assertIn("round 1 of 2", txt)
+        self.assertIn("read them yourself", txt)
+        self.assertIn("brief one", txt)
+        self.assertIn("allowlist", txt)
+        self.assertIn("toothless", txt)
+        self.assertNotIn(big[:100], txt)
+        v, f = mod.parse_review_verdict("FAIL\n1. a.py:1 bad\n")
+        self.assertEqual(v, "FAIL")
+        self.assertIn("a.py:1", f)
+        v2, _ = mod.parse_review_verdict("pass\n")
+        self.assertEqual(v2, "PASS")
+        v3, _ = mod.parse_review_verdict("maybe\n")
+        self.assertIsNone(v3)
+
+    def test_review_flags_validated(self):
+        b = self.write_brief("b1.md", "x")
+        r = self.run_lane("start", "--cwd", self.cwd, "--brief", b, "--review", "--review-rounds", "-1")
+        self.assertNotEqual(r.returncode, 0)
+        r2 = self.run_lane("start", "--cwd", self.cwd, "--brief", b, "--review-brief", "extra")
+        self.assertNotEqual(r2.returncode, 0)
+        # rounds 0 is valid: review once with no fix re-run.
+        b0 = self.write_brief("b0.md", "rounds zero work")
+        lid = self.start_lane([b0], env_extra={"FAKE_MODE": "complete",
+                                               "FAKE_REVIEW_VERDICT": "PASS"},
+                              accept="exit 0", review=True, review_rounds=0)
+        self.wait_status(lid, "done", timeout=25)
+        st = self.read_state(lid)
+        self.assertEqual(len(st.get("review_rounds") or []), 1)
+
+
+class TestConsultAnswers(LaneBase):
+    def test_consult_helper_answers_and_step_reads_it(self):
+        b = self.write_brief("b1.md", "consult work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "1",
+                                              "FAKE_CONSULT_ANSWER": "CONSULT-ANSWER-77"})
+        self.wait_status(lid, "done", timeout=30)
+        with open(self.lane_path(lid, "step1-final.md")) as f:
+            final = f.read()
+        self.assertIn("CONSULT-ANSWER-77", final)
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(len(consults), 1)
+        self.assertTrue(consults[0].get("answered"))
+        self.assertEqual(consults[0].get("helper"), "ok")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("## Consult", summ)
+        self.assertIn("Question 1", summ)
+        with open(self.lane_path(lid, "brief1.md")) as f:
+            brief = f.read()
+        self.assertIn("ASK.md", "\n".join(brief.splitlines()[:3]))
+        self.assertIn("ANSWER.md", "\n".join(brief.splitlines()[:3]))
+        self.assertTrue(os.path.exists(os.path.join(self.cwd, ".lane", "ASK-1.md")))
+        self.assertTrue(os.path.exists(os.path.join(self.cwd, ".lane", "ANSWER-1.md")))
+
+    def test_consult_limit_reached_past_max(self):
+        b = self.write_brief("b1.md", "consult limit work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "4",
+                                              "FAKE_CONSULT_ANSWER": "A"},
+                              consult_max=3)
+        self.wait_status(lid, "done", timeout=40)
+        with open(self.lane_path(lid, "step1-final.md")) as f:
+            final = f.read()
+        self.assertIn("limit", final.lower())
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(len(consults), 4)
+        self.assertEqual(consults[-1].get("helper"), "limited")
+        self.assertFalse(consults[-1].get("answered"))
+
+    def test_consult_helper_timeout_still_completes(self):
+        b = self.write_brief("b1.md", "consult timeout work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "1",
+                                              "FAKE_CONSULT_SLEEP": "30",
+                                              "MUSE_LANE_CONSULT_TIMEOUT_SEC": "1"})
+        self.wait_status(lid, "done", timeout=30)
+        with open(self.lane_path(lid, "step1-final.md")) as f:
+            final = f.read()
+        self.assertIn("timed out", final.lower())
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(consults[0].get("helper"), "timeout")
+        self.assertFalse(consults[0].get("answered"))
+
+
+class TestReadOnlySessions(LaneBase):
+    def test_consult_and_review_run_without_write(self):
+        argv_file = os.path.join(self.state_dir, "argv-ro.log")
+        b = self.write_brief("b1.md", "readonly work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "1",
+                                              "FAKE_CONSULT_ANSWER": "CONSULT-RO-9",
+                                              "FAKE_REVIEW_VERDICT": "PASS",
+                                              "FAKE_REVIEW_FINDINGS": "1. ok.py:1 fine",
+                                              "FAKE_ARGV_FILE": argv_file},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "done", timeout=40)
+        with open(argv_file) as f:
+            argvs = [json.loads(line) for line in f.read().splitlines()
+                     if line.strip()]
+        by_prompt = {}
+        for argv in argvs:
+            if "--prompt-file" in argv:
+                pf = argv[argv.index("--prompt-file") + 1]
+                by_prompt[os.path.basename(pf)] = argv
+        step_argv = by_prompt.get("brief1.md")
+        consult_argv = by_prompt.get("consult-brief-1.md")
+        review_argv = by_prompt.get("review-brief1.md")
+        self.assertTrue(step_argv and consult_argv and review_argv,
+                        "missing sessions: %s" % sorted(by_prompt))
+        self.assertNotIn("--disable-write", step_argv)
+        self.assertIn("--disable-write", consult_argv)
+        self.assertIn("--disable-write", review_argv)
+        # The supervisor wrote both answer files from the helper's final text.
+        with open(os.path.join(self.cwd, ".lane", "ANSWER-1.md")) as f:
+            self.assertIn("CONSULT-RO-9", f.read())
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            self.assertIn("CONSULT-RO-9", f.read())
+        # The supervisor wrote both verdict files from the reviewer's final text.
+        for p in (os.path.join(self.cwd, ".lane", "REVIEW-1.md"),
+                  self.lane_path(lid, "REVIEW-1.md")):
+            with open(p) as f:
+                content = f.read()
+            self.assertTrue(content.startswith("PASS"),
+                            "verdict file %s: %r" % (p, content[:40]))
+            self.assertIn("ok.py:1", content)
+
+    def test_review_session_changing_tracked_files_fails_lane(self):
+        subprocess.run(["git", "init"], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=self.cwd, capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=self.cwd, capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=self.cwd, capture_output=True, timeout=15)
+        with open(os.path.join(self.cwd, "tracked.txt"), "w") as f:
+            f.write("v1\n")
+        subprocess.run(["git", "add", "."], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.cwd, capture_output=True, timeout=15, check=True)
+        b = self.write_brief("b1.md", "dirty review work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_VERDICT": "PASS",
+                                              "FAKE_REVIEW_DIRTY": "1",
+                                              "FAKE_REVIEW_DIRTY_FILE": "tracked.txt"},
+                              accept="exit 0", review=True)
+        self.wait_status(lid, "failed", timeout=30)
+        st = self.read_state(lid)
+        self.assertEqual(st["status"], "failed")
+        self.assertEqual(st.get("reason"), "review session changed tracked files")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("tracked.txt", summ)
+        # Nothing is reverted: the reviewer's edit is still there.
+        with open(os.path.join(self.cwd, "tracked.txt")) as f:
+            self.assertIn("reviewer was here", f.read())
+
+
+class TestAcceptPhases(LaneBase):
+    def test_phase_from_accept_lines(self):
+        b = self.write_brief("b1.md", "phase work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              accept="echo LANE-PHASE: gate1; sleep 2; echo LANE-PHASE: gate2; exit 0")
+        deadline = time.time() + 20
+        st = None
+        seen_gate1 = False
+        while time.time() < deadline:
+            try:
+                st = self.read_state(lid)
+            except (FileNotFoundError, OSError, ValueError):
+                time.sleep(0.15)
+                continue
+            if st.get("phase") == "gate1":
+                seen_gate1 = True
+                break
+            if st.get("status") in ("done", "failed"):
+                break
+            time.sleep(0.15)
+        self.assertTrue(seen_gate1, "never saw gate1 phase: %s" % (st,))
+        self.wait_status(lid, "done", timeout=20)
+        st = self.read_state(lid)
+        self.assertEqual(st.get("phase"), "gate2")
+        self.assertTrue(st.get("phase_started"))
+
+    def test_phase_step_and_review(self):
+        b = self.write_brief("b1.md", "step phase work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "sleeper", "FAKE_SLEEP": "60"})
+        self.wait_status(lid, {"running", "retry_wait"}, timeout=15)
+        st = self.read_state(lid)
+        self.assertEqual(st.get("phase"), "step:1")
+        self.assertTrue(st.get("phase_started"))
+        r = self.run_lane("stop", lid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_status(lid, "stopped", timeout=20)
+        b2 = self.write_brief("b2.md", "review phase work")
+        lid2 = self.start_lane([b2], env_extra={"FAKE_MODE": "complete",
+                                                "FAKE_REVIEW_VERDICT": "FAIL"},
+                               accept="exit 0", review=True, review_rounds=0)
+        self.wait_status(lid2, "review_failed", timeout=25)
+        st2 = self.read_state(lid2)
+        self.assertEqual(st2.get("phase"), "review:1")
+
+
+class TestStatusActive(LaneBase):
+    def test_phase_status_active_and_limit(self):
+        b1 = self.write_brief("b1.md", "active work")
+        lid1 = self.start_lane([b1], env_extra={"FAKE_MODE": "sleeper", "FAKE_SLEEP": "60"})
+        self.wait_status(lid1, {"running", "retry_wait"}, timeout=15)
+        b2 = self.write_brief("b2.md", "old work")
+        lid2 = self.start_lane([b2], env_extra={"FAKE_MODE": "complete"})
+        self.wait_status(lid2, "done", timeout=20)
+        import datetime as _dt
+        old = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=2)).isoformat()
+        sp = self.lane_path(lid2, "state.json")
+        with open(sp) as f:
+            cur = json.load(f)
+        cur["updated_at"] = old
+        with open(sp, "w") as f:
+            json.dump(cur, f)
+        r = self.run_lane("status", "--json")
+        objs = json.loads(r.stdout)
+        self.assertEqual(len(objs), 2)
+        ra = self.run_lane("status", "--json", "--active")
+        obja = json.loads(ra.stdout)
+        self.assertEqual([o["id"] for o in obja], [lid1])
+        rl = self.run_lane("status", "--json", "--limit", "1")
+        objl = json.loads(rl.stdout)
+        self.assertEqual(len(objl), 1)
+        rh = self.run_lane("status", "--active")
+        self.assertIn("older lanes", rh.stdout)
+        self.assertIn(lid1, rh.stdout)
+        self.assertIn("phase", obja[0])
+        self.assertIn("stall_sec", obja[0])
+        self.assertIn("accept_tail", obja[0])
+        self.assertIn("last_subject", obja[0])
+
+    def test_phase_old_state_without_new_keys_reads(self):
+        b = self.write_brief("b1.md", "old state work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"})
+        self.wait_status(lid, "done", timeout=20)
+        sp = self.lane_path(lid, "state.json")
+        with open(sp) as f:
+            cur = json.load(f)
+        for k in ("phase", "phase_started", "review_rounds", "review_error", "consults"):
+            cur.pop(k, None)
+        with open(sp, "w") as f:
+            json.dump(cur, f)
+        r = self.run_lane("status", lid, "--json")
+        o = json.loads(r.stdout)[0]
+        self.assertEqual(o["status"], "done")
+        self.assertIsNone(o["phase"])
+        self.assertEqual(o["review_rounds"], [])
+        r2 = self.run_lane("summary", lid)
+        self.assertEqual(r2.returncode, 0)
+
+
+class TestSandboxNetworkArgv(LaneBase):
+    def test_step_argv_carries_sandbox_network_restricted(self):
+        argv_file = os.path.join(self.state_dir, "argv.log")
+        b = self.write_brief("b1.md", "argv work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_ARGV_FILE": argv_file})
+        self.wait_status(lid, "done", timeout=20)
+        self.wait_file(argv_file, timeout=10)
+        with open(argv_file) as f:
+            lines = [l.strip() for l in f.read().splitlines() if l.strip()]
+        self.assertTrue(lines, "fake muse never recorded argv")
+        argv = json.loads(lines[-1])
+        self.assertIn("--sandbox-network", argv)
+        self.assertIn("restricted", argv)
+        self.assertLess(argv.index("--json"), argv.index("--sandbox-network"))
+        i = argv.index("--sandbox-network")
+        self.assertEqual(argv[i + 1], "restricted")
 
 
 if __name__ == "__main__":
