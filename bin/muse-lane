@@ -1834,14 +1834,10 @@ def _build_status_obj(lid, lane, state, disp):
     obj["announced"] = is_announced(ldir)
     obj["orphan_announced"] = is_orphan_announced(ldir, state)
     obj["stall_sec"] = lane.get("stall_sec")
-    # One git subprocess per lane; ended lanes keep a null subject so a
-    # full listing never shells out for lanes nobody is watching.
-    if _is_live_display_status(disp):
-        try:
-            obj["last_subject"] = get_last_subject(lane.get("cwd") or "")
-        except Exception:
-            obj["last_subject"] = None
-    else:
+    # CONTROL: git subject for every lane again (reintroduces the cost).
+    try:
+        obj["last_subject"] = get_last_subject(lane.get("cwd") or "")
+    except Exception:
         obj["last_subject"] = None
     try:
         with open(os.path.join(ldir, "accept.log"), "r", encoding="utf-8", errors="replace") as f:
