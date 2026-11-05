@@ -615,6 +615,16 @@ def get_commits_count(cwd, head_start, head):
         return 0
 
 
+def get_last_subject(cwd):
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    r = _git(["log", "-1", "--format=%s"], cwd)
+    if r is None or r.returncode != 0:
+        return None
+    s = (r.stdout or "").strip()
+    return s or None
+
+
 def get_commit_log(cwd, head_start, head, max_lines=40):
     if head_start and head and head_start != head:
         r = _git(["log", "--oneline", "%s..%s" % (head_start, head)], cwd)
@@ -1766,6 +1776,16 @@ def cmd_status(args):
         obj["owner_session"] = lane.get("owner_session")
         obj["announced"] = is_announced(ldir)
         obj["orphan_announced"] = is_orphan_announced(ldir, state)
+        obj["stall_sec"] = lane.get("stall_sec")
+        try:
+            obj["last_subject"] = get_last_subject(lane.get("cwd") or "")
+        except Exception:
+            obj["last_subject"] = None
+        try:
+            with open(os.path.join(ldir, "accept.log"), "r", encoding="utf-8", errors="replace") as f:
+                obj["accept_tail"] = "\n".join(f.read().splitlines()[-5:])
+        except (FileNotFoundError, OSError):
+            obj["accept_tail"] = ""
         # Redact anything printable using this lane's secrets.
         secrets = secrets_from_env_file(lane.get("env_file"))
         if secrets:
@@ -1773,6 +1793,24 @@ def cmd_status(args):
                 if isinstance(v, str):
                     obj[k] = redact_text(v, secrets)
         objs.append(obj)
+    total = len(objs)
+    if not want_id and bool(getattr(args, "active", False)):
+        kept = []
+        for o in objs:
+            if o.get("status") in NON_TERMINAL or o.get("status") == "orphaned":
+                kept.append(o)
+                continue
+            age = _iso_age_sec(o.get("updated_at"))
+            if age is None or age <= 24 * 3600:
+                kept.append(o)
+        objs = kept
+    limit = getattr(args, "limit", None)
+    if not want_id and limit is not None:
+        try:
+            objs = objs[:max(0, int(limit))]
+        except (TypeError, ValueError):
+            pass
+    older = total - len(objs)
     if as_json:
         print(json.dumps(objs, indent=2))
         return 0
@@ -1790,6 +1828,13 @@ def cmd_status(args):
         print("last_activity: %s last_event: %s" % (o.get("last_activity_at"), o.get("last_event")))
         print("head_start: %s head: %s commits: %s" % (o.get("head_start"), o.get("head"), o.get("commits")))
         print("accept_exit: %s retry_at: %s reason: %s" % (o.get("accept_exit"), o.get("retry_at"), o.get("reason")))
+        print("phase: %s since %s" % (o.get("phase"), o.get("phase_started")))
+        rr = o.get("review_rounds") or []
+        if rr:
+            print("review: %s" % ", ".join(
+                "r%s=%s" % (e.get("round"), e.get("verdict")) for e in rr if isinstance(e, dict)))
+        if o.get("review_error"):
+            print("review_error: %s" % o.get("review_error"))
         tail = o.get("stderr_tail") or ""
         if tail:
             print("stderr_tail:")
@@ -1797,13 +1842,18 @@ def cmd_status(args):
                 print("  %s" % ln)
         return 0
     if not objs:
-        print("(no lanes)")
+        if older > 0:
+            print("(no lanes match; +%d older not shown)" % older)
+        else:
+            print("(no lanes)")
         return 0
     for o in objs:
         print("%s  %s  step %s/%s att %s  updated %s  %s" % (
             o.get("id"), o.get("status"), o.get("step"), o.get("steps"),
             o.get("attempt"), o.get("updated_at"), o.get("reason") or "",
         ))
+    if older > 0:
+        print("(+%d older lanes not shown)" % older)
     return 0
 
 
@@ -3189,9 +3239,11 @@ def cmd_run(lane_id):
             last_att0 = int(last_k_hist0[-1].get("attempt", 1)) if last_k_hist0 else 1
         except Exception:
             last_att0 = 1
+        set_phase("accept")
         write_state("accepting", steps, last_att0,
                     None, now_iso(), current_last_event, head_cur, commits_cur, "",
                     None, None, last_reason)
+        phase_log_offset = 0
         try:
             alog_f = open(accept_log, "w", encoding="utf-8", errors="replace")
             try:
@@ -3274,6 +3326,17 @@ def cmd_run(lane_id):
                 ret = aproc.returncode
             if now_m - last_update_m >= poll_sec or ret is not None:
                 head_cur, commits_cur = git_snapshot()
+                try:
+                    with open(accept_log, "r", encoding="utf-8", errors="replace") as _pf:
+                        _pf.seek(phase_log_offset)
+                        _new = _pf.read()
+                        phase_log_offset = _pf.tell()
+                    for _ln in _new.splitlines():
+                        _m = re.match(r"^LANE-PHASE: (\S+)", _ln)
+                        if _m:
+                            set_phase(_m.group(1))
+                except (FileNotFoundError, OSError):
+                    pass
                 last_k_hist = history.get(str(steps)) or []
                 try:
                     last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
@@ -3668,6 +3731,10 @@ def build_parser():
     pt = sub.add_parser("status", help="Show lane status.")
     pt.add_argument("id", nargs="?", default=None, help="Lane id (default: all).")
     pt.add_argument("--json", action="store_true", help="Print JSON list.")
+    pt.add_argument("--active", action="store_true",
+                    help="Only live lanes plus those ended in the last 24h.")
+    pt.add_argument("--limit", type=int, default=None,
+                    help="Max lanes listed, newest first.")
     pk = sub.add_parser("stop", help="Stop a lane.")
     pk.add_argument("id", help="Lane id.")
     pm = sub.add_parser("resume", help="Resume an orphaned lane.")

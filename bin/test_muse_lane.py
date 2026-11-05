@@ -1742,6 +1742,104 @@ class TestConsultAnswers(LaneBase):
         self.assertFalse(consults[0].get("answered"))
 
 
+class TestAcceptPhases(LaneBase):
+    def test_phase_from_accept_lines(self):
+        b = self.write_brief("b1.md", "phase work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              accept="echo LANE-PHASE: gate1; sleep 2; echo LANE-PHASE: gate2; exit 0")
+        deadline = time.time() + 20
+        st = None
+        seen_gate1 = False
+        while time.time() < deadline:
+            try:
+                st = self.read_state(lid)
+            except (FileNotFoundError, OSError, ValueError):
+                time.sleep(0.15)
+                continue
+            if st.get("phase") == "gate1":
+                seen_gate1 = True
+                break
+            if st.get("status") in ("done", "failed"):
+                break
+            time.sleep(0.15)
+        self.assertTrue(seen_gate1, "never saw gate1 phase: %s" % (st,))
+        self.wait_status(lid, "done", timeout=20)
+        st = self.read_state(lid)
+        self.assertEqual(st.get("phase"), "gate2")
+        self.assertTrue(st.get("phase_started"))
+
+    def test_phase_step_and_review(self):
+        b = self.write_brief("b1.md", "step phase work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "sleeper", "FAKE_SLEEP": "60"})
+        self.wait_status(lid, {"running", "retry_wait"}, timeout=15)
+        st = self.read_state(lid)
+        self.assertEqual(st.get("phase"), "step:1")
+        self.assertTrue(st.get("phase_started"))
+        r = self.run_lane("stop", lid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_status(lid, "stopped", timeout=20)
+        b2 = self.write_brief("b2.md", "review phase work")
+        lid2 = self.start_lane([b2], env_extra={"FAKE_MODE": "complete",
+                                                "FAKE_REVIEW_VERDICT": "FAIL"},
+                               accept="exit 0", review=True, review_rounds=1)
+        self.wait_status(lid2, "review_failed", timeout=25)
+        st2 = self.read_state(lid2)
+        self.assertEqual(st2.get("phase"), "review:1")
+
+
+class TestStatusActive(LaneBase):
+    def test_phase_status_active_and_limit(self):
+        b1 = self.write_brief("b1.md", "active work")
+        lid1 = self.start_lane([b1], env_extra={"FAKE_MODE": "sleeper", "FAKE_SLEEP": "60"})
+        self.wait_status(lid1, {"running", "retry_wait"}, timeout=15)
+        b2 = self.write_brief("b2.md", "old work")
+        lid2 = self.start_lane([b2], env_extra={"FAKE_MODE": "complete"})
+        self.wait_status(lid2, "done", timeout=20)
+        import datetime as _dt
+        old = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=2)).isoformat()
+        sp = self.lane_path(lid2, "state.json")
+        with open(sp) as f:
+            cur = json.load(f)
+        cur["updated_at"] = old
+        with open(sp, "w") as f:
+            json.dump(cur, f)
+        r = self.run_lane("status", "--json")
+        objs = json.loads(r.stdout)
+        self.assertEqual(len(objs), 2)
+        ra = self.run_lane("status", "--json", "--active")
+        obja = json.loads(ra.stdout)
+        self.assertEqual([o["id"] for o in obja], [lid1])
+        rl = self.run_lane("status", "--json", "--limit", "1")
+        objl = json.loads(rl.stdout)
+        self.assertEqual(len(objl), 1)
+        rh = self.run_lane("status", "--active")
+        self.assertIn("older lanes", rh.stdout)
+        self.assertIn(lid1, rh.stdout)
+        self.assertIn("phase", obja[0])
+        self.assertIn("stall_sec", obja[0])
+        self.assertIn("accept_tail", obja[0])
+        self.assertIn("last_subject", obja[0])
+
+    def test_phase_old_state_without_new_keys_reads(self):
+        b = self.write_brief("b1.md", "old state work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"})
+        self.wait_status(lid, "done", timeout=20)
+        sp = self.lane_path(lid, "state.json")
+        with open(sp) as f:
+            cur = json.load(f)
+        for k in ("phase", "phase_started", "review_rounds", "review_error", "consults"):
+            cur.pop(k, None)
+        with open(sp, "w") as f:
+            json.dump(cur, f)
+        r = self.run_lane("status", lid, "--json")
+        o = json.loads(r.stdout)[0]
+        self.assertEqual(o["status"], "done")
+        self.assertIsNone(o["phase"])
+        self.assertEqual(o["review_rounds"], [])
+        r2 = self.run_lane("summary", lid)
+        self.assertEqual(r2.returncode, 0)
+
+
 class TestSandboxNetworkArgv(LaneBase):
     def test_step_argv_carries_sandbox_network_restricted(self):
         argv_file = os.path.join(self.state_dir, "argv.log")
