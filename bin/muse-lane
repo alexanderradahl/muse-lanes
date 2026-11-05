@@ -2222,7 +2222,10 @@ def cmd_run(lane_id):
             brief_path = os.path.join(ldir, "brief%d.md" % k)
             cmd = [muse_bin, "exec", "--prompt-file", brief_path,
                    "--trust-workspace", "--approval-mode", "never",
-                   "--disable-approval", "--reasoning-effort", effort, "--json"]
+                   "--disable-approval", "--reasoning-effort", effort, "--json",
+                   # Owner 2026-10-16: no network from inside Muse's shell sandbox (two lanes built ssh stand-ins
+                   # to reach the lab runner with ~/.ssh keys). Remote steps run in the unsandboxed accept.
+                   "--sandbox-network", os.environ.get("MUSE_LANE_SANDBOX_NETWORK", "restricted")]
             slog("step %d attempt %d: %s" % (k, n, " ".join(cmd)))
             head0, commits0 = git_snapshot()
             last_activity_iso = now_iso()

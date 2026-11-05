@@ -16,6 +16,13 @@ LANE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "muse-lane")
 
 FAKE_MUSE = r"""#!/usr/bin/env python3
 import json, os, sys, time, subprocess
+_argv_file = os.environ.get("FAKE_ARGV_FILE", "")
+if _argv_file:
+    try:
+        with open(_argv_file, "a") as _af:
+            _af.write(json.dumps(sys.argv) + "\n")
+    except Exception:
+        pass
 def get_arg(name):
     a = sys.argv
     if name in a:
@@ -1436,6 +1443,25 @@ class TestOrphanAckPerIncarnation(LaneBase):
         self.wait_status(lid, "done", timeout=25)
         a4 = self.run_lane("ack", lid, "--orphan")
         self.assertEqual(a4.returncode, 2)
+
+
+class TestSandboxNetworkArgv(LaneBase):
+    def test_step_argv_carries_sandbox_network_restricted(self):
+        argv_file = os.path.join(self.state_dir, "argv.log")
+        b = self.write_brief("b1.md", "argv work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_ARGV_FILE": argv_file})
+        self.wait_status(lid, "done", timeout=20)
+        self.wait_file(argv_file, timeout=10)
+        with open(argv_file) as f:
+            lines = [l.strip() for l in f.read().splitlines() if l.strip()]
+        self.assertTrue(lines, "fake muse never recorded argv")
+        argv = json.loads(lines[-1])
+        self.assertIn("--sandbox-network", argv)
+        self.assertIn("restricted", argv)
+        self.assertLess(argv.index("--json"), argv.index("--sandbox-network"))
+        i = argv.index("--sandbox-network")
+        self.assertEqual(argv[i + 1], "restricted")
 
 
 if __name__ == "__main__":
