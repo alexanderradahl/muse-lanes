@@ -39,6 +39,11 @@ def emit(text):
 def emit_log():
     sys.stdout.write(json.dumps({"payload_type": "run.log", "payload": {}}) + "\n")
     sys.stdout.flush()
+_base = os.path.basename(prompt_file)
+if _base.startswith("consult-brief"):
+    time.sleep(float(os.environ.get("FAKE_CONSULT_SLEEP", "0.1")))
+    emit(os.environ.get("FAKE_CONSULT_ANSWER", "helper answer 42"))
+    sys.exit(0)
 if mode == "complete":
     txt = os.environ.get("FAKE_TEXT", "hello final")
     # include some stderr noise that must be filtered from the tail
@@ -130,7 +135,7 @@ elif mode == "order":
         with open(order_file, "a") as f:
             f.write(base + "\n")
     time.sleep(0.2)
-    emit("final for %s: %s" % (base, content.strip()[:80]))
+    emit("final for %s: %s" % (base, content.strip()[:2000]))
     sys.exit(0)
 elif mode == "envcheck":
     key = os.environ.get("FAKE_ENV_KEY", "MY_SECRET")
@@ -190,6 +195,36 @@ elif mode == "complete_then_hang":
     time.sleep(0.2)
     emit(os.environ.get("FAKE_TEXT", "hung final"))
     time.sleep(float(os.environ.get("FAKE_SLEEP", "30")))
+    sys.exit(0)
+elif mode == "ask":
+    _count = int(os.environ.get("FAKE_ASK_COUNT", "1"))
+    _wait = float(os.environ.get("FAKE_ASK_WAIT", "25"))
+    try:
+        os.makedirs(".lane", exist_ok=True)
+    except Exception:
+        pass
+    _got = []
+    for _i in range(1, _count + 1):
+        try:
+            os.remove(".lane/ANSWER.md")
+        except Exception:
+            pass
+        with open(".lane/ASK.md", "w") as _f:
+            _f.write("Question %d: how to test?\nPaths: foo.py\n" % _i)
+        _ans = ""
+        _dead = time.time() + _wait
+        while time.time() < _dead:
+            if os.path.exists(".lane/ANSWER.md"):
+                try:
+                    with open(".lane/ANSWER.md") as _f:
+                        _ans = _f.read()
+                except Exception:
+                    pass
+                if _ans.strip():
+                    break
+            time.sleep(0.1)
+        _got.append((_ans.strip()[:80] or "NO-ANSWER"))
+    emit("ask final; answers=%s" % ("|".join(_got)))
     sys.exit(0)
 else:
     emit("default final")
@@ -294,6 +329,10 @@ class LaneBase(unittest.TestCase):
             cmd += ["--review-rounds", str(kwargs["review_rounds"])]
         if kwargs.get("review_brief"):
             cmd += ["--review-brief", kwargs["review_brief"]]
+        if kwargs.get("consult_max") is not None:
+            cmd += ["--consult-max", str(kwargs["consult_max"])]
+        if kwargs.get("consult_timeout_min") is not None:
+            cmd += ["--consult-timeout-min", str(kwargs["consult_timeout_min"])]
         r = self.run_lane(*cmd, env_extra=env_extra)
         self.assertEqual(r.returncode, 0, "start failed: %s %s" % (r.stdout, r.stderr))
         lid = r.stdout.strip().splitlines()[-1].strip()
@@ -1643,6 +1682,64 @@ class TestReviewBrief(LaneBase):
         self.assertNotEqual(r.returncode, 0)
         r2 = self.run_lane("start", "--cwd", self.cwd, "--brief", b, "--review-brief", "extra")
         self.assertNotEqual(r2.returncode, 0)
+
+
+class TestConsultAnswers(LaneBase):
+    def test_consult_helper_answers_and_step_reads_it(self):
+        b = self.write_brief("b1.md", "consult work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "1",
+                                              "FAKE_CONSULT_ANSWER": "CONSULT-ANSWER-77"})
+        self.wait_status(lid, "done", timeout=30)
+        with open(self.lane_path(lid, "step1-final.md")) as f:
+            final = f.read()
+        self.assertIn("CONSULT-ANSWER-77", final)
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(len(consults), 1)
+        self.assertTrue(consults[0].get("answered"))
+        self.assertEqual(consults[0].get("helper"), "ok")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("## Consult", summ)
+        self.assertIn("Question 1", summ)
+        with open(self.lane_path(lid, "brief1.md")) as f:
+            brief = f.read()
+        self.assertIn("ASK.md", "\n".join(brief.splitlines()[:3]))
+        self.assertIn("ANSWER.md", "\n".join(brief.splitlines()[:3]))
+        self.assertTrue(os.path.exists(os.path.join(self.cwd, ".lane", "ASK-1.md")))
+        self.assertTrue(os.path.exists(os.path.join(self.cwd, ".lane", "ANSWER-1.md")))
+
+    def test_consult_limit_reached_past_max(self):
+        b = self.write_brief("b1.md", "consult limit work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "4",
+                                              "FAKE_CONSULT_ANSWER": "A"},
+                              consult_max=3)
+        self.wait_status(lid, "done", timeout=40)
+        with open(self.lane_path(lid, "step1-final.md")) as f:
+            final = f.read()
+        self.assertIn("limit", final.lower())
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(len(consults), 4)
+        self.assertEqual(consults[-1].get("helper"), "limited")
+        self.assertFalse(consults[-1].get("answered"))
+
+    def test_consult_helper_timeout_still_completes(self):
+        b = self.write_brief("b1.md", "consult timeout work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "1",
+                                              "FAKE_CONSULT_SLEEP": "30",
+                                              "MUSE_LANE_CONSULT_TIMEOUT_SEC": "1"})
+        self.wait_status(lid, "done", timeout=30)
+        with open(self.lane_path(lid, "step1-final.md")) as f:
+            final = f.read()
+        self.assertIn("timed out", final.lower())
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(consults[0].get("helper"), "timeout")
+        self.assertFalse(consults[0].get("answered"))
 
 
 class TestSandboxNetworkArgv(LaneBase):

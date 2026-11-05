@@ -30,6 +30,15 @@ REVIEW_TIMEOUT_SEC = 30 * 60
 REVIEW_DIFF_CAP = 80000
 REVIEW_PREVIEW_CHARS = 2000
 REVIEW_HEADING = "Muse pre-review (not the independent review)"
+CONSULT_TIMEOUT_SEC = 15 * 60
+CONSULT_MAX_DEFAULT = 3
+CONSULT_QUESTION_PREVIEW = 500
+CONSULT_ANSWER_PREVIEW = 300
+CONSULT_PREFIX_LINES = [
+    "You can ask the supervisor a question at any time by writing .lane/ASK.md (state your question and paths worth reading).",
+    "The supervisor will rename it to .lane/ASK-<n>.md and answer in .lane/ANSWER.md (also saved as .lane/ANSWER-<n>.md).",
+    "Keep working meanwhile if you can; check .lane/ANSWER.md for the reply instead of stalling.",
+]
 LOCK_NAME = "supervisor.lock"
 STOP_MARKER = "stop.requested"
 ANNOUNCE_MARKER = "announced"
@@ -1286,6 +1295,23 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
         if rerr:
             lines.append("review_error: %s" % rerr)
         lines.append("")
+    consults = state.get("consults") or []
+    if consults:
+        lines.append("## Consult")
+        for e in consults:
+            try:
+                ek = int(e.get("step", "?"))
+            except Exception:
+                ek = "?"
+            try:
+                en = int(e.get("n", "?"))
+            except Exception:
+                en = "?"
+            helper = e.get("helper") or ("answered" if e.get("answered") else "?")
+            q = (e.get("question_preview") or "").strip().splitlines()
+            q1 = q[0][:160] if q and q[0] else "(empty)"
+            lines.append("- Step %s #%s [%s]: %s" % (ek, en, helper, q1))
+        lines.append("")
     for k in range(1, steps + 1):
         lines.append("## Step %d final" % k)
         try:
@@ -1572,6 +1598,23 @@ def cmd_start(args):
     elif review_extra is not None or getattr(args, "review_rounds", 1) != 1:
         print("muse-lane: --review-brief/--review-rounds need --review", file=sys.stderr)
         return 1
+    try:
+        _cm = getattr(args, "consult_max", CONSULT_MAX_DEFAULT)
+        consult_max = int(CONSULT_MAX_DEFAULT if _cm is None else _cm)
+    except (TypeError, ValueError):
+        print("muse-lane: invalid --consult-max", file=sys.stderr)
+        return 1
+    if consult_max < 0:
+        print("muse-lane: --consult-max must be >= 0", file=sys.stderr)
+        return 1
+    try:
+        consult_timeout_min = float(getattr(args, "consult_timeout_min", 15.0))
+    except (TypeError, ValueError):
+        print("muse-lane: invalid --consult-timeout-min", file=sys.stderr)
+        return 1
+    if consult_timeout_min <= 0:
+        print("muse-lane: --consult-timeout-min must be > 0", file=sys.stderr)
+        return 1
     exec_env = {}
     try:
         exec_env["MUSE_BIN"] = os.environ.get("MUSE_BIN", "") or ""
@@ -1587,6 +1630,17 @@ def cmd_start(args):
                 exec_env[k] = v
             except Exception:
                 pass
+    if consult_max > 0:
+        prefix = "\n".join(CONSULT_PREFIX_LINES) + "\n\n"
+        for idx in range(1, len(briefs) + 1):
+            dst = os.path.join(ldir, "brief%d.md" % idx)
+            try:
+                with open(dst, "r", encoding="utf-8", errors="replace") as f:
+                    cur = f.read()
+                atomic_write_text(dst, prefix + cur)
+            except OSError as e:
+                print("muse-lane: cannot prefix brief %s: %s" % (dst, e), file=sys.stderr)
+                return 1
     lane = {
         "id": lane_id,
         "label": label,
@@ -1601,6 +1655,8 @@ def cmd_start(args):
         "exec_env": exec_env,
         "owner_session": getattr(args, "owner_session", None),
         "review": review_cfg,
+        "consult_max": consult_max,
+        "consult_timeout_sec": consult_timeout_min * 60.0,
     }
     atomic_write_json(os.path.join(ldir, "lane.json"), lane)
     # Write queued state before spawning so stop/status never see a gap.
@@ -1635,6 +1691,7 @@ def cmd_start(args):
         "phase_started": None,
         "review_rounds": [],
         "review_error": None,
+        "consults": [],
     }
     atomic_write_json(os.path.join(ldir, "state.json"), queued_state)
     pid = spawn_supervisor(lane_id)
@@ -1688,6 +1745,7 @@ def cmd_status(args):
                 "phase_started": None,
                 "review_rounds": [],
                 "review_error": None,
+                "consults": [],
             }
             disp = "queued"
         else:
@@ -1700,6 +1758,7 @@ def cmd_status(args):
         obj.setdefault("phase_started", None)
         obj.setdefault("review_rounds", [])
         obj.setdefault("review_error", None)
+        obj.setdefault("consults", [])
         obj["id"] = lid
         obj["label"] = lane.get("label") or ""
         obj["cwd"] = lane.get("cwd") or ""
@@ -1834,6 +1893,7 @@ def _build_stopped_state(lane, state):
         "phase_started": state.get("phase_started"),
         "review_rounds": state.get("review_rounds") or [],
         "review_error": state.get("review_error"),
+        "consults": state.get("consults") or [],
     }
     for k, v in list(new_state.items()):
         if isinstance(v, str):
@@ -2209,6 +2269,31 @@ def cmd_run(lane_id):
         pass
     if review_timeout_sec <= 0:
         review_timeout_sec = 1.0
+    try:
+        _cm = lane.get("consult_max", CONSULT_MAX_DEFAULT)
+        consult_max = int(CONSULT_MAX_DEFAULT if _cm is None else _cm)
+    except (TypeError, ValueError):
+        consult_max = CONSULT_MAX_DEFAULT
+    try:
+        consult_timeout_sec = float(lane.get("consult_timeout_sec", CONSULT_TIMEOUT_SEC))
+    except (TypeError, ValueError):
+        consult_timeout_sec = float(CONSULT_TIMEOUT_SEC)
+    try:
+        cmo = eff.get("MUSE_LANE_CONSULT_MAX")
+        if cmo is not None and str(cmo).strip() != "":
+            consult_max = int(cmo)
+    except (TypeError, ValueError):
+        pass
+    try:
+        cto = eff.get("MUSE_LANE_CONSULT_TIMEOUT_SEC")
+        if cto is not None and str(cto).strip() != "":
+            consult_timeout_sec = float(cto)
+    except (TypeError, ValueError):
+        pass
+    if consult_max < 0:
+        consult_max = 0
+    if consult_timeout_sec <= 0:
+        consult_timeout_sec = 1.0
     muse_bin = (eff.get("MUSE_BIN", "") or "muse") or "muse"
 
     secrets = secrets_from_env_file(env_file)
@@ -2307,6 +2392,7 @@ def cmd_run(lane_id):
                     "phase_started": (prev_state or {}).get("phase_started")}
     review_rounds_done = list((prev_state or {}).get("review_rounds") or [])
     review_error_holder = {"v": (prev_state or {}).get("review_error")}
+    consults_done = list((prev_state or {}).get("consults") or [])
     current_last_event = (prev_state or {}).get("last_event")
     # Resume past a passed accept goes straight to review: all step finals are
     # present (start_step > steps) and the accept already passed (accept_exit 0).
@@ -2369,6 +2455,7 @@ def cmd_run(lane_id):
             "phase_started": phase_holder["phase_started"],
             "review_rounds": review_rounds_done,
             "review_error": review_error_holder["v"],
+            "consults": consults_done,
         }
         for k, v in list(st.items()):
             if isinstance(v, str):
@@ -2425,6 +2512,7 @@ def cmd_run(lane_id):
             "phase_started": phase_holder["phase_started"],
             "review_rounds": review_rounds_done,
             "review_error": review_error_holder["v"],
+            "consults": consults_done,
         }
         # Summary BEFORE terminal state on every exit path.
         try:
@@ -2465,6 +2553,227 @@ def cmd_run(lane_id):
             slog("step %d already exhausted %d attempts before resume; giving up" % (start_step, MAX_ATTEMPTS))
             return finish_terminal("gave_up", start_step, MAX_ATTEMPTS, last_reason or "out of attempts", accept_exit)
 
+    # ---- mid-step consults (ASK.md / ANSWER.md) ----
+    def consult_step_count(k):
+        return sum(1 for e in consults_done if e.get("step") == k)
+
+    def consult_next_n():
+        m = 0
+        for e in consults_done:
+            try:
+                m = max(m, int(e.get("n") or 0))
+            except (TypeError, ValueError):
+                pass
+        try:
+            for fn in os.listdir(os.path.join(cwd, ".lane")):
+                if fn.startswith("ASK-") and fn.endswith(".md"):
+                    try:
+                        m = max(m, int(fn[4:-3]))
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+        return m + 1
+
+    def run_consult_helper(k, n, question):
+        """Fresh read-only helper for ASK-n. Returns (status, final_text) with
+        status in {"ok", "timeout", "failed"}."""
+        brief = ("You are answering one mid-step question from a Muse agent working in this directory.\n"
+                 "Read-only: do not modify, create, or delete any files except your answer file below. Do not run long commands.\n"
+                 "\n"
+                 "Question from step %d (saved as .lane/ASK-%d.md):\n"
+                 "\n%s\n"
+                 "\n---\n"
+                 "Write your answer to .lane/ANSWER-%d.md in the working directory (`mkdir -p .lane` first), then finish.\n"
+                 "Keep the answer short and concrete; cite file:line paths you read.\n") % (
+                     k, n, (question or "(empty)").strip(), n)
+        bpath = os.path.join(ldir, "consult-brief-%d.md" % n)
+        try:
+            atomic_write_text(bpath, redact_text(brief, secrets))
+        except OSError:
+            return ("failed", "")
+        jsonl_path = os.path.join(ldir, "consult-%d.jsonl" % n)
+        err_path = os.path.join(ldir, "consult-%d.err" % n)
+        cmd = [muse_bin, "exec", "--prompt-file", bpath,
+               "--trust-workspace", "--approval-mode", "never",
+               "--disable-approval", "--reasoning-effort", "high", "--json",
+               # Owner 2026-10-16: no network from inside Muse's shell sandbox (two lanes built ssh stand-ins
+               # to reach the lab runner with ~/.ssh keys). Remote steps run in the unsandboxed accept.
+               "--sandbox-network", os.environ.get("MUSE_LANE_SANDBOX_NETWORK", "restricted")]
+        slog("consult step %d #%d: %s" % (k, n, " ".join(cmd)))
+        try:
+            jf = open(jsonl_path, "w", encoding="utf-8", errors="replace")
+            try:
+                os.fchmod(jf.fileno(), 0o600)
+            except OSError:
+                pass
+            ef = open(err_path, "w", encoding="utf-8", errors="replace")
+            try:
+                os.fchmod(ef.fileno(), 0o600)
+            except OSError:
+                pass
+        except OSError:
+            try:
+                jf.close()
+            except Exception:
+                pass
+            try:
+                ef.close()
+            except Exception:
+                pass
+            return ("failed", "")
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, env=muse_env,
+                                    stdin=subprocess.DEVNULL, stdout=jf, stderr=ef,
+                                    start_new_session=True)
+        except Exception as e:
+            try:
+                jf.close()
+            except Exception:
+                pass
+            try:
+                ef.close()
+            except Exception:
+                pass
+            slog("consult helper spawn failed: %s" % e)
+            return ("failed", "")
+        start_m = time.monotonic()
+        rc = None
+        timed_out = False
+        while True:
+            if stop_requested["flag"] or _stop_marker_present():
+                _kill_process_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    _kill_process_group(proc, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                try:
+                    jf.close()
+                except Exception:
+                    pass
+                try:
+                    ef.close()
+                except Exception:
+                    pass
+                redact_file_inplace(jsonl_path, secrets)
+                redact_file_inplace(err_path, secrets)
+                return ("failed", "")
+            ret = proc.poll()
+            now_m = time.monotonic()
+            if ret is None and now_m - start_m >= consult_timeout_sec:
+                timed_out = True
+                slog("consult step %d #%d timed out after %.0fs" % (k, n, now_m - start_m))
+                _kill_process_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    _kill_process_group(proc, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                ret = proc.returncode
+            if ret is not None:
+                rc = ret
+                break
+            time.sleep(min(0.2, poll_sec))
+        try:
+            jf.close()
+        except Exception:
+            pass
+        try:
+            ef.close()
+        except Exception:
+            pass
+        _chmod_0600(jsonl_path)
+        _chmod_0600(err_path)
+        redact_file_inplace(jsonl_path, secrets)
+        redact_file_inplace(err_path, secrets)
+        if timed_out:
+            return ("timeout", "")
+        ok, text = check_completion(jsonl_path)
+        if ok:
+            return ("ok", text or "")
+        return ("failed", text or "")
+
+    def maybe_handle_consult(k):
+        """Answer one pending ASK.md for step k. True when one was handled."""
+        lane_dot = os.path.join(cwd, ".lane")
+        ask_path = os.path.join(lane_dot, "ASK.md")
+        try:
+            if not os.path.isfile(ask_path):
+                return False
+        except OSError:
+            return False
+        try:
+            with open(ask_path, "r", encoding="utf-8", errors="replace") as f:
+                question = f.read()
+        except OSError:
+            return False
+        n = consult_next_n()
+        try:
+            os.rename(ask_path, os.path.join(lane_dot, "ASK-%d.md" % n))
+        except OSError:
+            return False
+        if consult_step_count(k) >= consult_max:
+            msg = ("Consult limit reached (%d per step); no helper was run. "
+                   "Keep working without an answer." % consult_max)
+            try:
+                atomic_write_text(os.path.join(lane_dot, "ANSWER-%d.md" % n), msg + "\n")
+                atomic_write_text(os.path.join(lane_dot, "ANSWER.md"), msg + "\n")
+            except OSError:
+                pass
+            consults_done.append({"step": k, "n": n,
+                                  "question_preview": redact_text(
+                                      question[:CONSULT_QUESTION_PREVIEW], secrets),
+                                  "answered": False, "helper": "limited",
+                                  "answer_preview": ""})
+            slog("consult step %d #%d limited (max %d)" % (k, n, consult_max))
+            return True
+        status, final_text = run_consult_helper(k, n, question)
+        ans_n = os.path.join(lane_dot, "ANSWER-%d.md" % n)
+        answer = ""
+        try:
+            with open(ans_n, "r", encoding="utf-8", errors="replace") as f:
+                answer = f.read()
+        except (FileNotFoundError, OSError):
+            answer = ""
+        if not answer.strip() and status == "ok" and (final_text or "").strip():
+            answer = final_text
+            try:
+                atomic_write_text(ans_n, answer if answer.endswith("\n") else answer + "\n")
+            except OSError:
+                pass
+        answered = bool(answer.strip())
+        if not answered:
+            if status == "timeout":
+                answer = ("The consult helper timed out; no answer is coming. "
+                          "Keep working without it.")
+            else:
+                answer = ("The consult helper failed; no answer is coming. "
+                          "Keep working without it.")
+            try:
+                atomic_write_text(ans_n, answer + "\n")
+            except OSError:
+                pass
+        try:
+            atomic_write_text(os.path.join(lane_dot, "ANSWER.md"),
+                              answer if answer.endswith("\n") else answer + "\n")
+        except OSError:
+            pass
+        consults_done.append({"step": k, "n": n,
+                              "question_preview": redact_text(
+                                  question[:CONSULT_QUESTION_PREVIEW], secrets),
+                              "answered": answered, "helper": status,
+                              "answer_preview": redact_text(
+                                  answer[:CONSULT_ANSWER_PREVIEW], secrets)})
+        slog("consult step %d #%d %s" % (k, n, status))
+        return True
+
     # ---- step execution (also used for post-review re-runs of the last step) ----
     # Returns ("ok",) when the step completes, else the finish_terminal code.
     def run_step(k, brief_path, n_start):
@@ -2479,6 +2788,15 @@ def cmd_run(lane_id):
                 return finish_terminal("stopped", k, n, "stopped", accept_exit,
                                        current_last_event, "")
             secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
+            if consult_max > 0:
+                # Stale unnumbered Q&A from a dead attempt must not confuse this one.
+                for _f in ("ASK.md", "ANSWER.md"):
+                    try:
+                        _p = os.path.join(cwd, ".lane", _f)
+                        if os.path.isfile(_p):
+                            os.remove(_p)
+                    except OSError:
+                        pass
             jsonl_path = os.path.join(ldir, "step%d-attempt%d.jsonl" % (k, n))
             err_path = os.path.join(ldir, "step%d-attempt%d.err" % (k, n))
             cmd = [muse_bin, "exec", "--prompt-file", brief_path,
@@ -2642,6 +2960,12 @@ def cmd_run(lane_id):
                             if isinstance(cur_cpu, (int, float)):
                                 last_cpu = cur_cpu
                         last_snap_m = now_m
+                    if consult_max > 0:
+                        try:
+                            if maybe_handle_consult(k):
+                                activity = True
+                        except Exception as e:
+                            slog("consult handling failed: %s" % e)
                     if activity:
                         last_activity_m = now_m
                         last_activity_iso = now_iso()
@@ -3337,6 +3661,8 @@ def build_parser():
     ps.add_argument("--review", action="store_true", help="Run a Muse pre-review after a passing accept.")
     ps.add_argument("--review-brief", default=None, help="Extra review instructions (text, or a file path to read).")
     ps.add_argument("--review-rounds", type=int, default=1, help="Max pre-review rounds (default: 1).")
+    ps.add_argument("--consult-max", type=int, default=3, help="Max consult answers per step, 0 disables (default: 3).")
+    ps.add_argument("--consult-timeout-min", type=float, default=15.0, help="Consult helper timeout in minutes (default: 15).")
     pr = sub.add_parser("_run", help="Run the supervisor (internal).")
     pr.add_argument("id", help="Lane id.")
     pt = sub.add_parser("status", help="Show lane status.")
