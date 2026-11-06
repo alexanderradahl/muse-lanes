@@ -212,10 +212,8 @@ def accept_needs_lead_for_exit(exit_code, log_text, config):
             return kind_raw, (detail_raw or "").strip()[:NEEDS_LEAD_DETAIL_CAP]
         return "accept_failed_code", raw_line[:NEEDS_LEAD_DETAIL_CAP]
     mapping = {}
-    try:
-        mapping = (config or {}).get("accept_exit_kinds") or {}
-    except Exception:
-        mapping = {}
+    # CONTROL: ignore accept_exit_kinds; every nonzero exit is code.
+    mapping = {}
     mapped = None
     if isinstance(mapping, dict):
         mapped = mapping.get(str(exit_code))
