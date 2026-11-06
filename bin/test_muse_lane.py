@@ -4038,8 +4038,8 @@ class TestBoxMoveResetsTimer(LaneBase):
                 pass
             time.sleep(0.1)
         self.assertEqual(self.read_lane(lidB).get("box"), "box-s7c")
-        # The merged clear lands while the lane is still queued behind
-        # the box-s7c holder.
+        # The supervisor clears the timeout inline when it applies the
+        # move, while the lane is still queued behind the box-s7c holder.
         deadline = time.time() + 10
         while time.time() < deadline:
             try:
@@ -4325,6 +4325,207 @@ class TestBoxSidecarNoTouch(LaneBase):
         r = self.run_lane("stop", lid1)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_status(lid1, "stopped", timeout=20)
+
+
+class TestBoxSidecarNotWaitingReject(LaneBase):
+    def test_not_waiting_rejected_via_combined_answer(self):
+        b = self.write_brief("b1.md", "box not-waiting work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "sleeper", "FAKE_SLEEP": "60",
+                            "FAKE_CONSULT_ANSWER": "ESCALATE: pick left"},
+            box="box-nw1")
+        self.wait_status(lid, {"running", "retry_wait"}, timeout=15)
+        self.assertIsNone(self.read_state(lid).get("box_state"))
+        lane_dot = os.path.join(self.cwd, ".lane")
+        os.makedirs(lane_dot, exist_ok=True)
+        with open(os.path.join(lane_dot, "ASK.md"), "w") as f:
+            f.write("Which way?\nPaths: foo.py\n")
+        deadline = time.time() + 25
+        nl = None
+        while time.time() < deadline:
+            try:
+                nl = self.read_state(lid).get("needs_lead")
+            except (FileNotFoundError, OSError, ValueError):
+                nl = None
+            if isinstance(nl, dict) and nl.get("kind") == "question":
+                break
+            time.sleep(0.2)
+        self.assertIsNotNone(nl, "escalated question never raised")
+        self.assertIsNone(self.read_state(lid).get("box_state"))
+        r = self.run_lane("answer", lid, "--text", "go left", "--box", "box-nw2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("box move requested", r.stdout)
+        with open(os.path.join(lane_dot, "ANSWER.md")) as f:
+            self.assertIn("go left", f.read())
+        # Live combined path: consult + clear + box sidecars merge on the
+        # next poll; the question clears but the box move rejects.
+        deadline = time.time() + 15
+        st = None
+        while time.time() < deadline:
+            try:
+                st = self.read_state(lid)
+            except (FileNotFoundError, OSError, ValueError):
+                st = None
+            if st is not None and st.get("needs_lead") is None:
+                break
+            time.sleep(0.2)
+        self.assertIsNotNone(st)
+        self.assertIsNone(st.get("needs_lead"))
+        last = (st.get("consults") or [])[-1]
+        self.assertEqual(last.get("by"), "lead")
+        self.assertIn("go left", last.get("answer_preview") or "")
+        merged = {}
+        for fn in os.listdir(self.lane_path(lid)):
+            if fn.startswith("lead-") and fn.endswith(".merged"):
+                try:
+                    with open(self.lane_path(lid, fn)) as f:
+                        sc = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(sc, dict):
+                    merged[sc.get("kind")] = sc
+        self.assertIn("consult", merged)
+        self.assertIn("clear", merged)
+        self.assertIn("box", merged)
+        self.assertIn("lane not waiting", merged["box"].get("rejected") or "")
+        self.assertNotIn("rejected", merged["consult"])
+        self.assertNotIn("rejected", merged["clear"])
+        unmerged = [fn for fn in os.listdir(self.lane_path(lid))
+                    if fn.startswith("lead-") and fn.endswith(".json")]
+        self.assertEqual(unmerged, [])
+        # Nothing moves: lane box unchanged, no ticket of ours anywhere.
+        self.assertEqual(self.read_lane(lid).get("box"), "box-nw1")
+        self.assertIsNone(self.read_state(lid).get("box_state"))
+        broot = os.path.join(self.lanes, "_boxes")
+        if os.path.isdir(broot):
+            for box in os.listdir(broot):
+                bdir = os.path.join(broot, box)
+                if not os.path.isdir(bdir):
+                    continue
+                own = [fn for fn in os.listdir(bdir) if fn.endswith("-" + lid)]
+                self.assertEqual(own, [], "ticket appeared in %s" % box)
+        self.assertIn("box move to box-nw2 refused: lane not waiting",
+                      st.get("box_move_refusals") or [])
+        r2 = self.run_lane("stop", lid)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.wait_status(lid, "stopped", timeout=20)
+        with open(self.lane_path(lid, "summary.md")) as f:
+            self.assertIn("box move to box-nw2 refused: lane not waiting",
+                          f.read())
+
+
+class TestBoxSidecarLiveCombined(LaneBase):
+    def test_combined_text_and_box_applies_both(self):
+        ts = os.path.join(self.state_dir, "accept-bc.log")
+        b = self.write_brief("b1.md", "box combined live work")
+        lid1 = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                               accept="sleep 30", box="box-bc1")
+        self.wait_state_field(lid1, "box_state", "held", timeout=15)
+        lid2 = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                               accept="echo BC-RAN >> %s; sleep 5" % ts,
+                               box="box-bc1")
+        self.wait_state_field(lid2, "box_state", "queued", timeout=15)
+        r = self.run_lane("answer", lid2, "--text", "lead says go",
+                          "--box", "box-bc2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("box move requested", r.stdout)
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            self.assertIn("lead says go", f.read())
+        # Both land: the waiter holds the new box and the lead consult
+        # is logged.
+        self.wait_state_field(lid2, "box_state", "held", timeout=15)
+        self.assertEqual(self.read_lane(lid2).get("box"), "box-bc2")
+        old = [fn for fn in os.listdir(os.path.join(self.lanes, "_boxes", "box-bc1"))
+               if fn.endswith("-" + lid2)]
+        self.assertEqual(old, [])
+        st = self.read_state(lid2)
+        self.assertIsNone(st.get("needs_lead"))
+        last = (st.get("consults") or [])[-1]
+        self.assertEqual(last.get("by"), "lead")
+        self.assertIn("lead says go", last.get("answer_preview") or "")
+        kinds = {}
+        for fn in os.listdir(self.lane_path(lid2)):
+            if fn.startswith("lead-") and fn.endswith(".merged"):
+                try:
+                    with open(self.lane_path(lid2, fn)) as f:
+                        sc = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(sc, dict):
+                    kinds[sc.get("kind")] = sc
+        self.assertIn("consult", kinds)
+        self.assertIn("box", kinds)
+        self.assertNotIn("clear", kinds)
+        self.assertNotIn("rejected", kinds["box"])
+        self.wait_status(lid2, "done", timeout=20)
+        self.assertTrue(os.path.exists(ts))
+        r = self.run_lane("stop", lid1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_status(lid1, "stopped", timeout=20)
+
+
+class TestBoxSidecarInvalidReject(LaneBase):
+    def test_invalid_box_sidecar_rejected_and_noted(self):
+        b = self.write_brief("b1.md", "box invalid work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "sleeper",
+                                              "FAKE_SLEEP": "60"},
+                              box="box-iv1")
+        self.wait_status(lid, {"running", "retry_wait"}, timeout=15)
+        mod = _load_lane_module()
+        mod.write_lead_sidecar(self.lane_path(lid), "box", {"box": "a/b"})
+        deadline = time.time() + 15
+        rej = None
+        while time.time() < deadline:
+            try:
+                fns = os.listdir(self.lane_path(lid))
+            except OSError:
+                fns = []
+            for fn in fns:
+                if fn.startswith("lead-") and fn.endswith(".merged"):
+                    try:
+                        with open(self.lane_path(lid, fn)) as f:
+                            sc = json.load(f)
+                    except (OSError, ValueError):
+                        continue
+                    if (isinstance(sc, dict) and sc.get("kind") == "box" and
+                            "rejected" in sc):
+                        rej = sc
+                        break
+            if rej is not None:
+                break
+            time.sleep(0.1)
+        self.assertIsNotNone(rej, "invalid box sidecar never merged as rejected")
+        self.assertIn("invalid", rej.get("rejected") or "")
+        self.assertEqual(self.read_lane(lid).get("box"), "box-iv1")
+        broot = os.path.join(self.lanes, "_boxes")
+        if os.path.isdir(broot):
+            for box in os.listdir(broot):
+                bdir = os.path.join(broot, box)
+                if not os.path.isdir(bdir):
+                    continue
+                own = [fn for fn in os.listdir(bdir) if fn.endswith("-" + lid)]
+                self.assertEqual(own, [], "ticket appeared in %s" % box)
+        # Recorded for the summary like any other refusal.
+        deadline = time.time() + 10
+        st = None
+        while time.time() < deadline:
+            try:
+                st = self.read_state(lid)
+            except (FileNotFoundError, OSError, ValueError):
+                st = None
+            if st is not None and st.get("box_move_refusals"):
+                break
+            time.sleep(0.1)
+        self.assertTrue((st or {}).get("box_move_refusals"),
+                        "invalid refusal never recorded")
+        self.assertIn("invalid", " ".join(st.get("box_move_refusals") or []))
+        r = self.run_lane("stop", lid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_status(lid, "stopped", timeout=20)
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("refused", summ)
+        self.assertIn("invalid", summ)
 
 
 class TestBoxOrphanOrder(LaneBase):

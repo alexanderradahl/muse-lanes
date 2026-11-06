@@ -3831,10 +3831,10 @@ def cmd_run(lane_id):
         clear drops a matching open needs-lead event, consult appends the
         lead's consult entry (n reassigned past in-memory entries), box
         queues a move for the box waiter when the lane is inside its wait
-        loop and queued, and is rejected otherwise (held or not waiting):
-        the merged file gains a `rejected` reason and the refusal is noted
-        for the summary. Unparseable files are still marked merged so one
-        bad file cannot wedge every poll.
+        loop and queued, and is rejected otherwise (invalid, held, or not
+        waiting): the merged file gains a `rejected` reason and the refusal
+        is noted for the summary. Unparseable files are still marked merged
+        so one bad file cannot wedge every poll.
         """
         try:
             names = sorted(os.listdir(ldir))
@@ -3881,6 +3881,8 @@ def cmd_run(lane_id):
                         if _berr is not None:
                             rejected_reason = "invalid box %r: %s" % (_target, _berr)
                             slog("rejected lead box move to %r: %s" % (_target, _berr))
+                            box_refusals_holder["v"].append(
+                                "box move to %s refused: %s" % (_target, rejected_reason))
                         elif (in_box_wait_holder.get("v") and
                                 box_state_holder.get("v") == "queued"):
                             pending_box_moves.append({
@@ -5046,6 +5048,10 @@ def cmd_run(lane_id):
         box_state_holder["v"] = "queued"
         set_phase("box_wait")
         slog("box %s: queued with ticket %s" % (box, ticket_name))
+        # Inside the wait before the entry heartbeat: a sidecar already
+        # present merges as queued, not as "lane not waiting".
+        in_box_wait_holder["v"] = True
+        cur_box = box
         head_cur, commits_cur = git_snapshot()
         write_state("accepting", steps, last_att0, None, now_iso(),
                     current_last_event, head_cur, commits_cur, "",
@@ -5053,8 +5059,6 @@ def cmd_run(lane_id):
         wait_start_m = time.monotonic()
         timeout_raised = False
         last_update_m = 0.0
-        cur_box = box
-        in_box_wait_holder["v"] = True
         while True:
             if stop_requested["flag"] or _stop_marker_present():
                 in_box_wait_holder["v"] = False
