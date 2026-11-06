@@ -66,6 +66,10 @@ DEFAULT_ADVISOR_CMD = ["claude", "-p", "--model", "{model}",
 NEEDS_LEAD_RE = r"^LANE-NEEDS-LEAD: (\S+) ?(.*)$"
 SCOPE_DETAIL_CAP = 2000
 NEEDS_LEAD_DETAIL_CAP = 2000
+ADVISOR_ANSWER_CAP = 8000
+ADVISOR_DEFAULT_MODEL = "sonnet"
+ADVISOR_DEFAULT_MAX = 3
+ADVISOR_MODELS = ("sonnet", "opus")
 
 
 def lanes_root():
@@ -227,6 +231,52 @@ def accept_needs_lead_for_exit(exit_code, log_text, config):
     if isinstance(mapped, str) and mapped in ACCEPT_MAPPABLE_KINDS:
         return mapped, "accept exit %s" % exit_code
     return "accept_failed_code", "accept exit %s" % exit_code
+
+
+def parse_escalate_reason(text):
+    """Reason after ESCALATE:, or None. First non-blank line wins."""
+    if not text:
+        return None
+    for line in str(text).splitlines():
+        if not line.strip():
+            continue
+        s = line.lstrip()
+        if s.startswith("ESCALATE:"):
+            return s[len("ESCALATE:"):].strip()
+        return None
+    return None
+
+
+def build_advisor_cmd(advisor_cmd, model, claude_bin=None):
+    """Advisor argv with {model} filled; $CLAUDE_BIN overrides argv[0]."""
+    base = list(advisor_cmd) if isinstance(advisor_cmd, list) and advisor_cmd else list(DEFAULT_ADVISOR_CMD)
+    filled = [str(p).replace("{model}", str(model)) for p in base]
+    override = (claude_bin or "").strip() if isinstance(claude_bin, str) else ""
+    if override:
+        filled[0] = override
+    return filled
+
+
+def build_advisor_prompt(question, ask_name, accept_cmd, scope_globs, step, n):
+    """Stdin prompt for the advisor: question, paths, accept, scope, rules."""
+    q = (question or "(empty)").strip() or "(empty)"
+    scope_txt = ", ".join(scope_globs) if scope_globs else "(none)"
+    L = []
+    L.append("You are the advisor for a Muse lane. Answer one mid-step question.")
+    L.append("Read-only: do not modify, create, or delete any files. Do not run long commands.")
+    L.append("")
+    L.append("Question from step %d (saved as .lane/%s):" % (step, ask_name))
+    L.append("")
+    L.append(q)
+    L.append("")
+    L.append("Acceptance command (you may not change it): %s" % (accept_cmd or "(none)"))
+    L.append("Scope (allowed globs, you may not change it): %s" % scope_txt)
+    L.append("Read the .lane/%s file and any paths the question names." % ask_name)
+    L.append("")
+    L.append("If this needs a lead decision (different acceptance, scope, or a product choice),")
+    L.append("answer with the first line `ESCALATE: <one line>` and nothing else.")
+    L.append("Keep the answer short and concrete; cite file:line paths you read.")
+    return "\n".join(L) + "\n"
 
 
 def now_iso():
@@ -1685,9 +1735,12 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
             except Exception:
                 en = "?"
             helper = e.get("helper") or ("answered" if e.get("answered") else "?")
+            by = e.get("by") or ("lead" if helper == "lead" else "muse")
+            esc = bool(e.get("escalated"))
             q = (e.get("question_preview") or "").strip().splitlines()
             q1 = q[0][:160] if q and q[0] else "(empty)"
-            lines.append("- Step %s #%s [%s]: %s" % (ek, en, helper, q1))
+            lines.append("- Step %s #%s [%s by=%s escalated=%s]: %s" % (
+                ek, en, helper, by, esc, q1))
         lines.append("")
     for k in range(1, steps + 1):
         lines.append("## Step %d final" % k)
@@ -2071,11 +2124,32 @@ def cmd_start(args):
     if consult_timeout_min <= 0:
         print("muse-lane: --consult-timeout-min must be > 0", file=sys.stderr)
         return 1
+    advisor_model_raw = getattr(args, "advisor_model", None)
+    advisor_max_raw = getattr(args, "advisor_max", None)
+    advisor_cfg = None
+    if advisor_model_raw is not None or advisor_max_raw is not None:
+        _am = advisor_model_raw or ADVISOR_DEFAULT_MODEL
+        if _am not in ADVISOR_MODELS:
+            print("muse-lane: invalid --advisor-model (sonnet|opus)", file=sys.stderr)
+            return 1
+        try:
+            _ax = ADVISOR_DEFAULT_MAX if advisor_max_raw is None else int(advisor_max_raw)
+        except (TypeError, ValueError):
+            print("muse-lane: invalid --advisor-max", file=sys.stderr)
+            return 1
+        if _ax < 0:
+            print("muse-lane: --advisor-max must be >= 0", file=sys.stderr)
+            return 1
+        advisor_cfg = {"model": _am, "max": _ax}
     exec_env = {}
     try:
         exec_env["MUSE_BIN"] = os.environ.get("MUSE_BIN", "") or ""
     except Exception:
         exec_env["MUSE_BIN"] = ""
+    try:
+        exec_env["CLAUDE_BIN"] = os.environ.get("CLAUDE_BIN", "") or ""
+    except Exception:
+        exec_env["CLAUDE_BIN"] = ""
     try:
         exec_env["PATH"] = os.environ.get("PATH", "") or ""
     except Exception:
@@ -2116,6 +2190,7 @@ def cmd_start(args):
         "scope": scope_globs,
         "box": box_name,
         "config": cfg,
+        "advisor": advisor_cfg,
     }
     atomic_write_json(os.path.join(ldir, "lane.json"), lane)
     # Write queued state before spawning so stop/status never see a gap.
@@ -2954,7 +3029,7 @@ def cmd_run(lane_id):
     exec_env = lane.get("exec_env") if isinstance(lane.get("exec_env"), dict) else {}
     eff = dict(os.environ)
     for k, v in exec_env.items():
-        if k == "MUSE_BIN" or k == "PATH" or k.startswith("MUSE_LANE_"):
+        if k in ("MUSE_BIN", "CLAUDE_BIN") or k == "PATH" or k.startswith("MUSE_LANE_"):
             eff[k] = v
     poll_sec = _parse_poll_sec(eff)
     backoff = _parse_backoff(eff)
@@ -3003,6 +3078,33 @@ def cmd_run(lane_id):
     if consult_timeout_sec <= 0:
         consult_timeout_sec = 1.0
     muse_bin = (eff.get("MUSE_BIN", "") or "muse") or "muse"
+    lane_advisor = lane.get("advisor") if isinstance(lane.get("advisor"), dict) else None
+    advisor_model = None
+    advisor_max = 0
+    if lane_advisor is not None:
+        _am = lane_advisor.get("model") or ADVISOR_DEFAULT_MODEL
+        advisor_model = _am if _am in ADVISOR_MODELS else ADVISOR_DEFAULT_MODEL
+        try:
+            advisor_max = int(lane_advisor.get("max", ADVISOR_DEFAULT_MAX))
+        except (TypeError, ValueError):
+            advisor_max = ADVISOR_DEFAULT_MAX
+        if advisor_max < 0:
+            advisor_max = 0
+    advisor_enabled = bool(lane_advisor is not None and advisor_max > 0)
+    lane_config_early = lane.get("config") if isinstance(lane.get("config"), dict) else {}
+    try:
+        advisor_timeout_sec = float(lane_config_early.get("advisor_timeout_min", 15)) * 60.0
+    except (TypeError, ValueError):
+        advisor_timeout_sec = 15 * 60.0
+    try:
+        _ato = eff.get("MUSE_LANE_ADVISOR_TIMEOUT_SEC")
+        if _ato is not None and str(_ato).strip() != "":
+            advisor_timeout_sec = float(_ato)
+    except (TypeError, ValueError):
+        pass
+    if advisor_timeout_sec <= 0:
+        advisor_timeout_sec = 1.0
+    claude_bin = (eff.get("CLAUDE_BIN", "") or "").strip()
 
     secrets = secrets_from_env_file(env_file)
     # In-memory snapshot (never on disk): redaction always uses the union
@@ -3357,6 +3459,7 @@ def cmd_run(lane_id):
         status in {"ok", "timeout", "failed"}."""
         brief = ("You are answering one mid-step question from a Muse agent working in this directory.\n"
                  "Read-only: this session cannot write files. Do not modify, create, or delete anything. Do not run long commands.\n"
+                 "If this needs a lead decision (different acceptance, scope, or a product choice), answer with the first line `ESCALATE: <one line>`.\n"
                  "\n"
                  "Question from step %d (saved as .lane/ASK-%d.md):\n"
                  "\n%s\n"
@@ -3478,8 +3581,162 @@ def cmd_run(lane_id):
             return ("ok", text or "")
         return ("failed", text or "")
 
+    def run_advisor(k, n, question):
+        """One advisor call for ASK-n. Returns (status, text_or_paths).
+
+        status in {"ok", "timeout", "failed", "dirty"}; for "dirty" the
+        second item is the sorted changed-paths list, else answer text.
+        """
+        advisor_calls_holder["v"] = int(advisor_calls_holder.get("v") or 0) + 1
+        ask_name = "ASK-%d.md" % n
+        prompt = build_advisor_prompt(question, ask_name, accept_cmd, lane_scope, k, n)
+        prompt_path = os.path.join(ldir, "advisor-prompt-%d.md" % n)
+        try:
+            atomic_write_text(prompt_path, redact_text(prompt, secrets))
+        except OSError:
+            return ("failed", "")
+        out_path = os.path.join(ldir, "advisor-%d.out" % n)
+        err_path = os.path.join(ldir, "advisor-%d.err" % n)
+        cfg_cmd = lane_config.get("advisor_cmd") if isinstance(lane_config, dict) else None
+        cmd = build_advisor_cmd(cfg_cmd, advisor_model, claude_bin)
+        slog("consult step %d #%d advisor (%s): %s" % (k, n, advisor_model, " ".join(cmd)))
+        try:
+            head_before = get_git_head(cwd) if os.path.isdir(cwd) else None
+        except Exception:
+            head_before = None
+        status_before = get_git_status_tracked(cwd)
+        try:
+            inf = open(prompt_path, "r", encoding="utf-8", errors="replace")
+            outf = open(out_path, "w", encoding="utf-8", errors="replace")
+            try:
+                os.fchmod(outf.fileno(), 0o600)
+            except OSError:
+                pass
+            ef = open(err_path, "w", encoding="utf-8", errors="replace")
+            try:
+                os.fchmod(ef.fileno(), 0o600)
+            except OSError:
+                pass
+        except OSError:
+            for _f in ("inf", "outf", "ef"):
+                try:
+                    locals()[_f].close()
+                except Exception:
+                    pass
+            return ("failed", "")
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, env=muse_env,
+                                    stdin=inf, stdout=outf, stderr=ef,
+                                    start_new_session=True)
+        except Exception as e:
+            try:
+                inf.close()
+            except Exception:
+                pass
+            try:
+                outf.close()
+            except Exception:
+                pass
+            try:
+                ef.close()
+            except Exception:
+                pass
+            slog("advisor spawn failed: %s" % e)
+            return ("failed", "")
+        start_m = time.monotonic()
+        timed_out = False
+        rc = None
+        while True:
+            if stop_requested["flag"] or _stop_marker_present():
+                _kill_process_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    _kill_process_group(proc, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                try:
+                    inf.close()
+                except Exception:
+                    pass
+                try:
+                    outf.close()
+                except Exception:
+                    pass
+                try:
+                    ef.close()
+                except Exception:
+                    pass
+                redact_file_inplace(out_path, secrets)
+                redact_file_inplace(err_path, secrets)
+                return ("failed", "")
+            ret = proc.poll()
+            now_m = time.monotonic()
+            if ret is None and now_m - start_m >= advisor_timeout_sec:
+                timed_out = True
+                slog("consult step %d #%d advisor timed out after %.0fs" % (k, n, now_m - start_m))
+                _kill_process_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    _kill_process_group(proc, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                ret = proc.returncode
+            if ret is not None:
+                rc = ret
+                break
+            time.sleep(min(0.2, poll_sec))
+        try:
+            inf.close()
+        except Exception:
+            pass
+        try:
+            outf.close()
+        except Exception:
+            pass
+        try:
+            ef.close()
+        except Exception:
+            pass
+        _chmod_0600(out_path)
+        _chmod_0600(err_path)
+        redact_file_inplace(out_path, secrets)
+        redact_file_inplace(err_path, secrets)
+        try:
+            head_after = get_git_head(cwd) if os.path.isdir(cwd) else None
+        except Exception:
+            head_after = None
+        status_after = get_git_status_tracked(cwd)
+        if ((head_before or "") != (head_after or "")
+                or (status_before or "") != (status_after or "")):
+            changed = review_changed_paths(cwd, head_before, head_after,
+                                            status_before, status_after)
+            detail = "advisor session changed tracked files" + (
+                ": " + ", ".join(changed) if changed else "")
+            slog(detail)
+            return ("dirty", changed)
+        if timed_out:
+            return ("timeout", "")
+        if rc is not None and rc != 0:
+            return ("failed", "")
+        try:
+            with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        return ("ok", (text or "")[:ADVISOR_ANSWER_CAP])
+
     def maybe_handle_consult(k):
-        """Answer one pending ASK.md for step k. True when one was handled."""
+        """Answer one pending ASK.md for step k.
+
+        True when one was handled, False when none was pending, or
+        ("advisor_dirty", paths) when the advisor changed tracked files.
+        """
         lane_dot = os.path.join(cwd, ".lane")
         ask_path = os.path.join(lane_dot, "ASK.md")
         try:
@@ -3509,16 +3766,35 @@ def cmd_run(lane_id):
                                   "question_preview": redact_text(
                                       question[:CONSULT_QUESTION_PREVIEW], secrets),
                                   "answered": False, "helper": "limited",
+                                  "by": "muse", "escalated": False,
                                   "answer_preview": ""})
             slog("consult step %d #%d limited (max %d)" % (k, n, consult_max))
             return True
-        status, final_text = run_consult_helper(k, n, question)
+        use_advisor = bool(advisor_enabled and
+                           int(advisor_calls_holder.get("v") or 0) < advisor_max)
+        if use_advisor:
+            by = "claude-%s" % (advisor_model or ADVISOR_DEFAULT_MODEL)
+            status, payload = run_advisor(k, n, question)
+            if status == "dirty":
+                paths = list(payload or [])
+                consults_done.append({"step": k, "n": n,
+                                      "question_preview": redact_text(
+                                          question[:CONSULT_QUESTION_PREVIEW], secrets),
+                                      "answered": False, "helper": "failed",
+                                      "by": by, "escalated": False,
+                                      "answer_preview": ""})
+                return ("advisor_dirty", paths)
+            final_text = payload if status == "ok" else ""
+        else:
+            by = "muse"
+            status, final_text = run_consult_helper(k, n, question)
         ans_n = os.path.join(lane_dot, "ANSWER-%d.md" % n)
-        # The helper cannot write (--disable-write); its final answer text is
-        # the answer and the supervisor writes both files itself.
+        # Neither backend can write; its final answer text is the answer and
+        # the supervisor writes both files itself.
         answer = (final_text or "") if status == "ok" else ""
         answered = bool(answer.strip())
         fail_reason = ""
+        escalated = False
         if status == "ok" and not answered:
             # Completed but produced no answer text: the answer below falls
             # back to the failure text, so never report this as ok.
@@ -3526,18 +3802,47 @@ def cmd_run(lane_id):
             fail_reason = "completed with no answer text"
         elif status == "failed":
             fail_reason = "helper did not complete"
+        esc_reason = parse_escalate_reason(answer) if answered else None
+        if answered and esc_reason is not None:
+            escalated = True
+            reason_txt = (esc_reason or "").strip()
+            raise_needs_lead("question", reason_txt, step=k)
+            if reason_txt:
+                answer = ("The lead was asked about this question (ESCALATE: %s). "
+                          "Keep working on other parts or wait for a later ANSWER.md." % reason_txt)
+            else:
+                answer = ("The lead was asked about this question. "
+                          "Keep working on other parts or wait for a later ANSWER.md.")
+            try:
+                atomic_write_text(ans_n, answer + "\n")
+            except OSError:
+                pass
+            try:
+                atomic_write_text(os.path.join(lane_dot, "ANSWER.md"), answer + "\n")
+            except OSError:
+                pass
+            consults_done.append({"step": k, "n": n,
+                                  "question_preview": redact_text(
+                                      question[:CONSULT_QUESTION_PREVIEW], secrets),
+                                  "answered": True, "helper": status,
+                                  "by": by, "escalated": True,
+                                  "answer_preview": redact_text(
+                                      (final_text or "")[:CONSULT_ANSWER_PREVIEW], secrets)})
+            slog("consult step %d #%d %s by=%s escalated" % (k, n, status, by))
+            return True
         if answered:
             try:
                 atomic_write_text(ans_n, answer if answer.endswith("\n") else answer + "\n")
             except OSError:
                 pass
         if not answered:
+            who = "advisor" if use_advisor else "consult helper"
             if status == "timeout":
-                answer = ("The consult helper timed out; no answer is coming. "
-                          "Keep working without it.")
+                answer = ("The %s timed out; no answer is coming. "
+                          "Keep working without it." % who)
             else:
-                answer = ("The consult helper failed; no answer is coming. "
-                          "Keep working without it.")
+                answer = ("The %s failed; no answer is coming. "
+                          "Keep working without it." % who)
             try:
                 atomic_write_text(ans_n, answer + "\n")
             except OSError:
@@ -3551,12 +3856,13 @@ def cmd_run(lane_id):
                               "question_preview": redact_text(
                                   question[:CONSULT_QUESTION_PREVIEW], secrets),
                               "answered": answered, "helper": status,
+                              "by": by, "escalated": False,
                               "answer_preview": redact_text(
                                   answer[:CONSULT_ANSWER_PREVIEW], secrets)})
         if fail_reason:
-            slog("consult step %d #%d %s: %s" % (k, n, status, fail_reason))
+            slog("consult step %d #%d %s by=%s: %s" % (k, n, status, by, fail_reason))
         else:
-            slog("consult step %d #%d %s" % (k, n, status))
+            slog("consult step %d #%d %s by=%s" % (k, n, status, by))
         return True
 
     # ---- step execution (also used for post-review re-runs of the last step) ----
@@ -3747,7 +4053,41 @@ def cmd_run(lane_id):
                         last_snap_m = now_m
                     if consult_max > 0:
                         try:
-                            if maybe_handle_consult(k):
+                            _cr = maybe_handle_consult(k)
+                            if (isinstance(_cr, tuple) and len(_cr) == 2
+                                    and _cr[0] == "advisor_dirty"):
+                                _paths = list(_cr[1] or [])
+                                _detail = ", ".join(_paths) if _paths else ""
+                                _reason = "advisor session changed tracked files" + (
+                                    ": " + _detail if _detail else "")
+                                _reason = redact_text(_reason, secrets)
+                                _kill_process_group(proc, signal.SIGTERM)
+                                try:
+                                    proc.wait(timeout=5)
+                                except Exception:
+                                    _kill_process_group(proc, signal.SIGKILL)
+                                    try:
+                                        proc.wait(timeout=5)
+                                    except Exception:
+                                        pass
+                                try:
+                                    jf.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    ef.close()
+                                except Exception:
+                                    pass
+                                redact_file_inplace(jsonl_path, secrets)
+                                redact_file_inplace(err_path, secrets)
+                                try:
+                                    _tail = "\n".join(read_tail_filtered(err_path))
+                                except Exception:
+                                    _tail = ""
+                                return finish_terminal("failed", k, n, _reason, accept_exit,
+                                                       current_last_event,
+                                                       redact_text(_tail, secrets))
+                            if _cr:
                                 activity = True
                         except Exception as e:
                             slog("consult handling failed: %s" % e)
@@ -4545,6 +4885,10 @@ def build_parser():
     ps.add_argument("--scope", dest="scope", action="append", default=None,
                     help="Allowed path glob for changed files (repeatable; fnmatch, ** allowed).")
     ps.add_argument("--box", default=None, help="Box name for the box queue (stored; queue lands in step C).")
+    ps.add_argument("--advisor-model", default=None, choices=["sonnet", "opus"],
+                    help="Advisor model (default with --advisor-max: sonnet; no flag = no advisor).")
+    ps.add_argument("--advisor-max", type=int, default=None,
+                    help="Advisor calls per lane (default with --advisor-model: 3).")
     pr = sub.add_parser("_run", help="Run the supervisor (internal).")
     pr.add_argument("id", help="Lane id.")
     pt = sub.add_parser("status", help="Show lane status.")

@@ -243,6 +243,46 @@ else:
     sys.exit(0)
 """
 
+FAKE_CLAUDE = r"""#!/usr/bin/env python3
+import json, os, sys, time
+_argv_file = os.environ.get("FAKE_ARGV_FILE", "")
+if _argv_file:
+    try:
+        with open(_argv_file, "a") as _af:
+            _af.write(json.dumps(sys.argv) + "\n")
+    except Exception:
+        pass
+try:
+    _prompt = sys.stdin.read()
+except Exception:
+    _prompt = ""
+_prompt_file = os.environ.get("FAKE_CLAUDE_PROMPT_FILE", "")
+if _prompt_file:
+    try:
+        with open(_prompt_file, "w") as _pf:
+            _pf.write(_prompt)
+    except Exception:
+        pass
+time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "0.1")))
+if os.environ.get("FAKE_CLAUDE_DIRTY", "") == "1":
+    try:
+        with open(os.environ.get("FAKE_CLAUDE_DIRTY_FILE", "tracked.txt"), "a") as _df:
+            _df.write("advisor was here\n")
+    except Exception as _e:
+        sys.stderr.write("dirty write failed: %s\n" % _e)
+try:
+    _n = int(os.environ.get("FAKE_CLAUDE_ANSWER_LEN", "0") or "0")
+except Exception:
+    _n = 0
+if _n > 0:
+    _ans = "A" * _n
+else:
+    _ans = os.environ.get("FAKE_CLAUDE_ANSWER", "claude answer 7")
+sys.stdout.write(_ans)
+sys.stdout.flush()
+sys.exit(int(os.environ.get("FAKE_CLAUDE_EXIT", "0") or "0"))
+"""
+
 
 class LaneBase(unittest.TestCase):
     def setUp(self):
@@ -258,6 +298,10 @@ class LaneBase(unittest.TestCase):
         with open(self.fake_muse, "w") as f:
             f.write(FAKE_MUSE)
         os.chmod(self.fake_muse, 0o755)
+        self.fake_claude = os.path.join(self.fakebin, "claude")
+        with open(self.fake_claude, "w") as f:
+            f.write(FAKE_CLAUDE)
+        os.chmod(self.fake_claude, 0o755)
         self.state_dir = os.path.join(self.root, "state")
         os.makedirs(self.state_dir, exist_ok=True)
         self.base_env = dict(os.environ)
@@ -349,6 +393,10 @@ class LaneBase(unittest.TestCase):
             cmd += ["--scope", sc]
         if kwargs.get("box"):
             cmd += ["--box", kwargs["box"]]
+        if kwargs.get("advisor_model"):
+            cmd += ["--advisor-model", kwargs["advisor_model"]]
+        if kwargs.get("advisor_max") is not None:
+            cmd += ["--advisor-max", str(kwargs["advisor_max"])]
         r = self.run_lane(*cmd, env_extra=env_extra)
         self.assertEqual(r.returncode, 0, "start failed: %s %s" % (r.stdout, r.stderr))
         lid = r.stdout.strip().splitlines()[-1].strip()
@@ -2684,6 +2732,372 @@ class TestStatusV03Fields(LaneBase):
         o2 = self.status_obj(lid)
         self.assertIsNone(o2["branch"])
         self.assertIsNone(o2["head"])
+
+
+class TestAdvisorStart(LaneBase):
+    def test_no_flags_no_advisor(self):
+        b = self.write_brief("b1.md", "no advisor work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"})
+        self.assertIsNone(self.read_lane(lid).get("advisor"))
+        self.wait_status(lid, "done", timeout=20)
+
+    def test_model_only_defaults_max(self):
+        b = self.write_brief("b1.md", "advisor model work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              advisor_model="opus")
+        self.assertEqual(self.read_lane(lid).get("advisor"),
+                         {"model": "opus", "max": 3})
+        self.wait_status(lid, "done", timeout=20)
+
+    def test_max_only_defaults_model(self):
+        b = self.write_brief("b1.md", "advisor max work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              advisor_max=5)
+        self.assertEqual(self.read_lane(lid).get("advisor"),
+                         {"model": "sonnet", "max": 5})
+        self.wait_status(lid, "done", timeout=20)
+
+    def test_both_stored(self):
+        b = self.write_brief("b1.md", "advisor both work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              advisor_model="opus", advisor_max=1)
+        self.assertEqual(self.read_lane(lid).get("advisor"),
+                         {"model": "opus", "max": 1})
+        self.wait_status(lid, "done", timeout=20)
+
+    def test_invalid_max_rejected(self):
+        b = self.write_brief("b1.md", "bad advisor work")
+        r = self.run_lane("start", "--cwd", self.cwd, "--brief", b,
+                          "--advisor-max", "-1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("advisor-max", r.stderr)
+
+
+class TestAdvisorUnits(LaneBase):
+    def test_parse_escalate(self):
+        mod = _load_lane_module()
+        p = mod.parse_escalate_reason
+        self.assertEqual(p("ESCALATE: pick one"), "pick one")
+        self.assertEqual(p("\n\n  ESCALATE: spaced\nmore"), "spaced")
+        self.assertIsNone(p("hello\nESCALATE: not first"))
+        self.assertIsNone(p("Just a note about ESCALATE: x"))
+        self.assertEqual(p("ESCALATE:"), "")
+        self.assertIsNone(p(""))
+        self.assertIsNone(p("   \n  \n"))
+        self.assertIsNone(p("escalate: lower"))
+
+    def test_build_cmd_model_fill_and_override(self):
+        mod = _load_lane_module()
+        cmd = mod.build_advisor_cmd(None, "sonnet", None)
+        self.assertEqual(cmd[0], "claude")
+        self.assertIn("sonnet", cmd)
+        self.assertNotIn("{model}", " ".join(cmd))
+        custom = ["/usr/bin/claude", "-p", "--model", "{model}", "--extra"]
+        out = mod.build_advisor_cmd(custom, "opus", "")
+        self.assertEqual(out[0], "/usr/bin/claude")
+        self.assertIn("opus", out)
+        over = mod.build_advisor_cmd(custom, "opus", "/tmp/fake-claude")
+        self.assertEqual(over[0], "/tmp/fake-claude")
+        self.assertIn("opus", over)
+
+    def test_build_prompt_has_accept_scope_rule(self):
+        mod = _load_lane_module()
+        txt = mod.build_advisor_prompt("How to test?\nPaths: foo.py",
+                                       "ASK-1.md", "make check", ["src/**"], 1, 1)
+        self.assertIn("How to test?", txt)
+        self.assertIn("ASK-1.md", txt)
+        self.assertIn("make check", txt)
+        self.assertIn("src/**", txt)
+        self.assertIn("may not change", txt)
+        self.assertIn("ESCALATE:", txt)
+
+
+class TestAdvisorRouting(LaneBase):
+    def test_routes_to_advisor(self):
+        argv_file = os.path.join(self.state_dir, "argv-advisor.log")
+        prompt_file = os.path.join(self.state_dir, "advisor-prompt.txt")
+        b = self.write_brief("b1.md", "advisor route work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "1",
+                            "FAKE_CLAUDE_ANSWER": "ADVISOR-ANSWER-1",
+                            "CLAUDE_BIN": self.fake_claude,
+                            "FAKE_ARGV_FILE": argv_file,
+                            "FAKE_CLAUDE_PROMPT_FILE": prompt_file},
+            advisor_model="sonnet", advisor_max=3)
+        self.wait_status(lid, "done", timeout=30)
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(len(consults), 1)
+        self.assertEqual(consults[0].get("by"), "claude-sonnet")
+        self.assertIs(consults[0].get("escalated"), False)
+        self.assertTrue(consults[0].get("answered"))
+        self.assertEqual(consults[0].get("helper"), "ok")
+        self.assertEqual(st.get("advisor_calls"), 1)
+        self.assertEqual(self.status_obj(lid).get("advisor_calls"), 1)
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            self.assertIn("ADVISOR-ANSWER-1", f.read())
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("by=claude-sonnet", summ)
+        self.assertIn("escalated=False", summ)
+        with open(argv_file) as f:
+            argvs = [json.loads(ln) for ln in f.read().splitlines() if ln.strip()]
+        claude_argvs = [a for a in argvs if a and a[0] == self.fake_claude]
+        self.assertTrue(claude_argvs, "fake claude was never invoked")
+        self.assertIn("sonnet", claude_argvs[0])
+        with open(prompt_file) as f:
+            prompt = f.read()
+        self.assertIn("Question 1", prompt)
+        self.assertIn("ESCALATE:", prompt)
+
+    def test_budget_fallback_to_muse(self):
+        b = self.write_brief("b1.md", "advisor fallback work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "2",
+                            "FAKE_CLAUDE_ANSWER": "ADVISOR-FIRST",
+                            "FAKE_CONSULT_ANSWER": "MUSE-SECOND",
+                            "CLAUDE_BIN": self.fake_claude},
+            advisor_model="sonnet", advisor_max=1)
+        self.wait_status(lid, "done", timeout=40)
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(len(consults), 2)
+        self.assertEqual(consults[0].get("by"), "claude-sonnet")
+        self.assertEqual(consults[1].get("by"), "muse")
+        self.assertEqual(st.get("advisor_calls"), 1)
+        with open(self.lane_path(lid, "step1-final.md")) as f:
+            final = f.read()
+        self.assertIn("ADVISOR-FIRST", final)
+        self.assertIn("MUSE-SECOND", final)
+
+    def test_model_fill_opus(self):
+        argv_file = os.path.join(self.state_dir, "argv-opus.log")
+        b = self.write_brief("b1.md", "opus fill work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "1",
+                            "FAKE_CLAUDE_ANSWER": "OPUS-ANS",
+                            "CLAUDE_BIN": self.fake_claude,
+                            "FAKE_ARGV_FILE": argv_file},
+            advisor_model="opus", advisor_max=2)
+        self.wait_status(lid, "done", timeout=30)
+        st = self.read_state(lid)
+        self.assertEqual((st.get("consults") or [])[0].get("by"), "claude-opus")
+        with open(argv_file) as f:
+            argvs = [json.loads(ln) for ln in f.read().splitlines() if ln.strip()]
+        claude_argvs = [a for a in argvs if a and a[0] == self.fake_claude]
+        self.assertTrue(claude_argvs)
+        self.assertIn("opus", claude_argvs[0])
+        self.assertNotIn("sonnet", claude_argvs[0])
+
+    def test_claude_bin_override(self):
+        cfg_path = os.path.join(self.root, "advisor-cfg.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"advisor_cmd": ["/nonexistent-claude-xyz", "-p",
+                                       "--model", "{model}"]}, f)
+        argv_file = os.path.join(self.state_dir, "argv-override.log")
+        b = self.write_brief("b1.md", "override work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "1",
+                            "MUSE_LANES_CONFIG": cfg_path,
+                            "FAKE_CLAUDE_ANSWER": "OVERRIDE-OK",
+                            "CLAUDE_BIN": self.fake_claude,
+                            "FAKE_ARGV_FILE": argv_file},
+            advisor_model="sonnet", advisor_max=1)
+        self.wait_status(lid, "done", timeout=30)
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            self.assertIn("OVERRIDE-OK", f.read())
+        with open(argv_file) as f:
+            argvs = [json.loads(ln) for ln in f.read().splitlines() if ln.strip()]
+        claude_argvs = [a for a in argvs if a and a[0] == self.fake_claude]
+        self.assertTrue(claude_argvs, "override binary was not used")
+        self.assertIn("sonnet", claude_argvs[0])
+
+    def test_prompt_contains_accept_and_scope(self):
+        prompt_file = os.path.join(self.state_dir, "advisor-prompt2.txt")
+        b = self.write_brief("b1.md", "prompt content work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "1",
+                            "FAKE_CLAUDE_ANSWER": "PROMPT-OK",
+                            "CLAUDE_BIN": self.fake_claude,
+                            "FAKE_CLAUDE_PROMPT_FILE": prompt_file},
+            advisor_max=1, accept="echo accept-marker-456; exit 0",
+            scope=["src/**"])
+        self.wait_status(lid, "done", timeout=30)
+        with open(prompt_file) as f:
+            prompt = f.read()
+        self.assertIn("accept-marker-456", prompt)
+        self.assertIn("src/**", prompt)
+        self.assertIn("may not change", prompt)
+        self.assertIn("ESCALATE:", prompt)
+        self.assertIn("Question 1", prompt)
+
+
+class TestAdvisorTimeoutCapDirty(LaneBase):
+    def test_timeout(self):
+        b = self.write_brief("b1.md", "advisor timeout work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "1",
+                            "FAKE_CLAUDE_SLEEP": "30",
+                            "MUSE_LANE_ADVISOR_TIMEOUT_SEC": "1",
+                            "CLAUDE_BIN": self.fake_claude},
+            advisor_max=2)
+        self.wait_status(lid, "done", timeout=30)
+        st = self.read_state(lid)
+        consults = st.get("consults") or []
+        self.assertEqual(consults[0].get("helper"), "timeout")
+        self.assertFalse(consults[0].get("answered"))
+        self.assertEqual(consults[0].get("by"), "claude-sonnet")
+        self.assertEqual(st.get("advisor_calls"), 1)
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            self.assertIn("timed out", f.read().lower())
+
+    def test_answer_cap_8000(self):
+        b = self.write_brief("b1.md", "advisor cap work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "1",
+                            "FAKE_CLAUDE_ANSWER_LEN": "9000",
+                            "CLAUDE_BIN": self.fake_claude},
+            advisor_max=1)
+        self.wait_status(lid, "done", timeout=30)
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            body = f.read().strip()
+        self.assertEqual(len(body), 8000)
+        self.assertEqual(body, "A" * 8000)
+        with open(os.path.join(self.cwd, ".lane", "ANSWER-1.md")) as f:
+            self.assertEqual(len(f.read().strip()), 8000)
+
+    def test_dirty_fails_lane(self):
+        self.init_git_repo()
+        tracked = os.path.join(self.cwd, "tracked.txt")
+        with open(tracked, "w") as f:
+            f.write("v1\n")
+        subprocess.run(["git", "add", "."], cwd=self.cwd, capture_output=True,
+                       timeout=15, check=True)
+        subprocess.run(["git", "commit", "-m", "add tracked"], cwd=self.cwd,
+                       capture_output=True, timeout=15, check=True)
+        b = self.write_brief("b1.md", "advisor dirty work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "1",
+                            "FAKE_CLAUDE_DIRTY": "1",
+                            "FAKE_CLAUDE_DIRTY_FILE": "tracked.txt",
+                            "CLAUDE_BIN": self.fake_claude},
+            advisor_max=3)
+        st = self.wait_status(lid, "failed", timeout=30)
+        self.assertIn("advisor", (st.get("reason") or "").lower())
+        self.assertIn("tracked.txt", st.get("reason") or "")
+        self.assertEqual(st.get("advisor_calls"), 1)
+        with open(tracked) as f:
+            self.assertIn("advisor was here", f.read())
+
+
+class TestEscalateQuestion(LaneBase):
+    def test_advisor_escalate_raises_question(self):
+        b = self.write_brief("b1.md", "advisor escalate work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "1",
+                            "FAKE_CLAUDE_ANSWER": "ESCALATE: pick the red box",
+                            "CLAUDE_BIN": self.fake_claude},
+            advisor_max=3)
+        st = self.wait_status(lid, "done", timeout=30)
+        nl = st.get("needs_lead")
+        self.assertIsNotNone(nl)
+        self.assertEqual(nl.get("kind"), "question")
+        self.assertEqual(nl.get("seq"), 1)
+        self.assertIn("pick the red box", nl.get("detail") or "")
+        consults = st.get("consults") or []
+        self.assertTrue(consults[0].get("escalated"))
+        self.assertEqual(consults[0].get("by"), "claude-sonnet")
+        self.assertTrue(consults[0].get("answered"))
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            body = f.read()
+        self.assertIn("lead was asked", body.lower())
+        self.assertIn("Keep working", body)
+        self.assertIn("wait", body.lower())
+        self.assertIn("ANSWER.md", body)
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("NEEDS LEAD", summ)
+        self.assertIn("question", summ)
+        self.assertIn("escalated=True", summ)
+
+    def test_helper_escalate_raises_question(self):
+        b = self.write_brief("b1.md", "helper escalate work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "1",
+                                              "FAKE_CONSULT_ANSWER": "ESCALATE: choose wisely"})
+        st = self.wait_status(lid, "done", timeout=30)
+        nl = st.get("needs_lead")
+        self.assertIsNotNone(nl)
+        self.assertEqual(nl.get("kind"), "question")
+        self.assertEqual(nl.get("seq"), 1)
+        self.assertIn("choose wisely", nl.get("detail") or "")
+        consults = st.get("consults") or []
+        self.assertTrue(consults[0].get("escalated"))
+        self.assertEqual(consults[0].get("by"), "muse")
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            self.assertIn("lead was asked", f.read().lower())
+        with open(self.lane_path(lid, "consult-brief-1.md")) as f:
+            self.assertIn("ESCALATE:", f.read())
+
+    def test_non_first_line_does_not_escalate(self):
+        b = self.write_brief("b1.md", "no escalate work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "ask",
+                                              "FAKE_ASK_COUNT": "1",
+                                              "FAKE_CONSULT_ANSWER": "Just a note\nESCALATE: not first"})
+        st = self.wait_status(lid, "done", timeout=30)
+        self.assertIsNone(st.get("needs_lead"))
+        consults = st.get("consults") or []
+        self.assertIs(consults[0].get("escalated"), False)
+
+    def test_seq_increments_two_escalates(self):
+        b = self.write_brief("b1.md", "two escalates work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "2",
+                            "FAKE_CLAUDE_ANSWER": "ESCALATE: decide now",
+                            "CLAUDE_BIN": self.fake_claude},
+            advisor_max=3)
+        st = self.wait_status(lid, "done", timeout=40)
+        self.assertEqual(st.get("needs_lead", {}).get("seq"), 2)
+        self.assertEqual(st.get("needs_lead", {}).get("kind"), "question")
+        consults = st.get("consults") or []
+        self.assertEqual(len(consults), 2)
+        self.assertTrue(all(c.get("escalated") for c in consults))
+
+    def test_answer_clears_escalated_question(self):
+        b = self.write_brief("b1.md", "answer clears work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "sleeper", "FAKE_SLEEP": "60",
+                            "FAKE_CLAUDE_ANSWER": "ESCALATE: which way",
+                            "CLAUDE_BIN": self.fake_claude},
+            advisor_max=3)
+        self.wait_status(lid, {"running", "retry_wait"}, timeout=15)
+        lane_dot = os.path.join(self.cwd, ".lane")
+        os.makedirs(lane_dot, exist_ok=True)
+        with open(os.path.join(lane_dot, "ASK.md"), "w") as f:
+            f.write("Which way?\nPaths: foo.py\n")
+        deadline = time.time() + 25
+        nl = None
+        while time.time() < deadline:
+            try:
+                nl = self.read_state(lid).get("needs_lead")
+            except (FileNotFoundError, OSError, ValueError):
+                nl = None
+            if isinstance(nl, dict) and nl.get("kind") == "question":
+                break
+            time.sleep(0.2)
+        self.assertIsNotNone(nl, "escalated question never raised")
+        self.assertEqual(nl.get("seq"), 1)
+        r = self.run_lane("answer", lid, "--text", "go left")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(lane_dot, "ANSWER.md")) as f:
+            self.assertIn("go left", f.read())
+        st = self.read_state(lid)
+        self.assertIsNone(st.get("needs_lead"))
+        last = (st.get("consults") or [])[-1]
+        self.assertEqual(last.get("by"), "lead")
+        r2 = self.run_lane("stop", lid)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.wait_status(lid, "stopped", timeout=20)
 
 
 if __name__ == "__main__":
