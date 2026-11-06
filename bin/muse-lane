@@ -449,7 +449,7 @@ def move_own_box_tickets(lane_id, new_box, root=None):
             old_pid = None
         for _try in range(5):
             now = datetime.datetime.now(datetime.timezone.utc)
-            cand = "%s-%s" % (box_ticket_stamp(now), lane_id)
+            cand = fn
             dst = os.path.join(target, cand)
             body = json.dumps({"lane": lane_id, "box": new_box,
                                "queued_at": now.isoformat(),
