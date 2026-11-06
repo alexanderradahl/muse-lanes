@@ -3521,6 +3521,16 @@ class TestAnswerBox(LaneBase):
         self.assertIsNotNone(nl, "box_wait_timeout never raised")
         r = self.run_lane("answer", lid2, "--box", "box-m2")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("box move requested", r.stdout)
+        # Supervisor-applied: lane.json flips on the next poll, not in answer.
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                if self.read_lane(lid2).get("box") == "box-m2":
+                    break
+            except (FileNotFoundError, OSError, ValueError):
+                pass
+            time.sleep(0.1)
         self.assertEqual(self.read_lane(lid2).get("box"), "box-m2")
         self.wait_status(lid2, "done", timeout=20)
         st2 = self.read_state(lid2)
@@ -3655,11 +3665,33 @@ class TestBoxMoveFreshStampLive(LaneBase):
         self.assertEqual(len(olds), 1)
         r = self.run_lane("answer", lid2, "--box", "box-fs2")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("box move requested", r.stdout)
+        # Supervisor-applied: lane.json flips on the next poll, not in answer.
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                if self.read_lane(lid2).get("box") == "box-fs2":
+                    break
+            except (FileNotFoundError, OSError, ValueError):
+                pass
+            time.sleep(0.1)
         self.assertEqual(self.read_lane(lid2).get("box"), "box-fs2")
-        news = os.listdir(os.path.join(self.lanes, "_boxes", "box-fs2"))
-        self.assertEqual(len(news), 1)
-        self.assertNotEqual(news[0], olds[0])
-        self.assertGreater(news[0].split("-", 1)[0], olds[0].split("-", 1)[0])
+        # Fresh stamp (now): the moved ticket joins the BACK of box-fs2.
+        # The accept is instant, so the ticket is already gone by done;
+        # the supervisor log names the applied ticket deterministically.
+        with open(self.lane_path(lid2, "supervisor.log")) as f:
+            slog_text = f.read()
+        import re as _re
+        m = None
+        for line in slog_text.splitlines():
+            mm = _re.search(
+                r"box move to box-fs2 applied; re-queued with ticket (\S+)", line)
+            if mm:
+                m = mm
+        self.assertIsNotNone(m, "applied move not logged:\n%s" % slog_text[-2000:])
+        self.assertNotEqual(m.group(1), olds[0])
+        self.assertGreater(m.group(1).split("-", 1)[0],
+                           olds[0].split("-", 1)[0])
         self.wait_status(lid2, "done", timeout=20)
         self.assertTrue(os.path.exists(ts))
         self.assertEqual(os.listdir(os.path.join(self.lanes, "_boxes", "box-fs2")), [])
@@ -3995,6 +4027,16 @@ class TestBoxMoveResetsTimer(LaneBase):
         self.assertEqual(nl.get("seq"), 1)
         r = self.run_lane("answer", lidB, "--box", "box-s7c")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("box move requested", r.stdout)
+        # Supervisor-applied: lane.json flips on the next poll, not in answer.
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                if self.read_lane(lidB).get("box") == "box-s7c":
+                    break
+            except (FileNotFoundError, OSError, ValueError):
+                pass
+            time.sleep(0.1)
         self.assertEqual(self.read_lane(lidB).get("box"), "box-s7c")
         # The merged clear lands while the lane is still queued behind
         # the box-s7c holder.
@@ -4130,6 +4172,208 @@ class TestBoxesMalformedConfig(LaneBase):
         self.assertEqual(by_box["box-n3"]["queue"], [])
         self.assertIn("box_wait_max_min", r.stderr)
         self.assertIn("leases unavailable", r.stderr)
+
+
+class TestBoxSidecarLiveMove(LaneBase):
+    def test_sidecar_move_holds_new_box(self):
+        ts = os.path.join(self.state_dir, "accept-bs.log")
+        b = self.write_brief("b1.md", "box sidecar live work")
+        lid1 = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                               accept="sleep 30", box="box-bs1")
+        self.wait_state_field(lid1, "box_state", "held", timeout=15)
+        lid2 = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                               accept="echo BS-RAN >> %s; sleep 5" % ts,
+                               box="box-bs1")
+        self.wait_state_field(lid2, "box_state", "queued", timeout=15)
+        r = self.run_lane("answer", lid2, "--box", "box-bs2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("box move requested", r.stdout)
+        # The supervisor's poll applies the sidecar: the waiter holds the
+        # new box and leaves no ticket of itself on the old one.
+        self.wait_state_field(lid2, "box_state", "held", timeout=15)
+        self.assertEqual(self.read_lane(lid2).get("box"), "box-bs2")
+        old = [fn for fn in os.listdir(os.path.join(self.lanes, "_boxes", "box-bs1"))
+               if fn.endswith("-" + lid2)]
+        self.assertEqual(old, [])
+        new = [fn for fn in os.listdir(os.path.join(self.lanes, "_boxes", "box-bs2"))
+               if fn.endswith("-" + lid2)]
+        self.assertEqual(len(new), 1)
+        self.wait_status(lid2, "done", timeout=20)
+        self.assertIsNone(self.read_state(lid2).get("needs_lead"))
+        self.assertTrue(os.path.exists(ts))
+        box_merged = []
+        for fn in os.listdir(self.lane_path(lid2)):
+            if fn.startswith("lead-") and fn.endswith(".merged"):
+                try:
+                    with open(self.lane_path(lid2, fn)) as f:
+                        sc = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(sc, dict) and sc.get("kind") == "box":
+                    box_merged.append(sc)
+        self.assertTrue(box_merged, "no merged box sidecar found")
+        self.assertTrue(all("rejected" not in sc for sc in box_merged))
+        r = self.run_lane("stop", lid1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_status(lid1, "stopped", timeout=20)
+
+
+class TestBoxSidecarHeldReject(LaneBase):
+    def test_held_box_sidecar_rejected(self):
+        b = self.write_brief("b1.md", "box held reject work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              accept="sleep 8", box="box-bh1")
+        self.wait_state_field(lid, "box_state", "held", timeout=15)
+        mod = _load_lane_module()
+        mod.write_lead_sidecar(self.lane_path(lid), "box", {"box": "box-bh2"})
+        # Rejected on the next supervisor poll: merged with a reason.
+        deadline = time.time() + 15
+        rej = None
+        while time.time() < deadline:
+            try:
+                fns = os.listdir(self.lane_path(lid))
+            except OSError:
+                fns = []
+            for fn in fns:
+                if fn.startswith("lead-") and fn.endswith(".merged"):
+                    try:
+                        with open(self.lane_path(lid, fn)) as f:
+                            sc = json.load(f)
+                    except (OSError, ValueError):
+                        continue
+                    if (isinstance(sc, dict) and sc.get("kind") == "box" and
+                            "rejected" in sc):
+                        rej = sc
+                        break
+            if rej is not None:
+                break
+            time.sleep(0.1)
+        self.assertIsNotNone(rej, "box sidecar never merged as rejected")
+        self.assertIn("held", rej.get("rejected") or "")
+        # The ticket stays in its box; nothing moves while held.
+        here = [fn for fn in os.listdir(os.path.join(self.lanes, "_boxes", "box-bh1"))
+                if fn.endswith("-" + lid)]
+        self.assertEqual(len(here), 1)
+        other_dir = os.path.join(self.lanes, "_boxes", "box-bh2")
+        if os.path.isdir(other_dir):
+            other = [fn for fn in os.listdir(other_dir) if fn.endswith("-" + lid)]
+            self.assertEqual(other, [])
+        self.assertEqual(self.read_lane(lid).get("box"), "box-bh1")
+        self.assertEqual(self.read_state(lid).get("box_state"), "held")
+        self.wait_status(lid, "done", timeout=20)
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("box move to box-bh2 refused: lane held box-bh1", summ)
+
+
+class TestBoxSidecarNoTouch(LaneBase):
+    def test_answer_writes_no_lane_or_ticket_live(self):
+        b = self.write_brief("b1.md", "box no-touch work")
+        lid1 = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                               accept="sleep 30", box="box-bn1")
+        self.wait_state_field(lid1, "box_state", "held", timeout=15)
+        lid2 = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                               accept="sleep 6", box="box-bn1")
+        self.wait_state_field(lid2, "box_state", "queued", timeout=15)
+        sup = self.read_state(lid2).get("supervisor_pid")
+        self.assertTrue(sup)
+        lane_json = self.lane_path(lid2, "lane.json")
+        box1_dir = os.path.join(self.lanes, "_boxes", "box-bn1")
+        box2_dir = os.path.join(self.lanes, "_boxes", "box-bn2")
+        # Freeze the supervisor so its poll cannot land between answer and
+        # our assertions: anything changed here is answer's own doing.
+        os.kill(int(sup), signal.SIGSTOP)
+        try:
+            time.sleep(0.3)
+            lane_mtime = os.path.getmtime(lane_json)
+            lane_box = self.read_lane(lid2).get("box")
+            before1 = sorted(os.listdir(box1_dir))
+            before2 = sorted(os.listdir(box2_dir)) if os.path.isdir(box2_dir) else None
+            r = self.run_lane("answer", lid2, "--box", "box-bn2")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("box move requested", r.stdout)
+            self.assertEqual(os.path.getmtime(lane_json), lane_mtime)
+            self.assertEqual(self.read_lane(lid2).get("box"), lane_box)
+            self.assertEqual(sorted(os.listdir(box1_dir)), before1)
+            if before2 is None:
+                self.assertFalse(os.path.isdir(box2_dir))
+            else:
+                self.assertEqual(sorted(os.listdir(box2_dir)), before2)
+            sides = [fn for fn in os.listdir(self.lane_path(lid2))
+                     if fn.startswith("lead-") and fn.endswith(".json")]
+            self.assertEqual(len(sides), 1)
+            with open(self.lane_path(lid2, sides[0])) as f:
+                sc = json.load(f)
+            self.assertEqual(sc.get("kind"), "box")
+            self.assertEqual((sc.get("payload") or {}).get("box"), "box-bn2")
+        finally:
+            os.kill(int(sup), signal.SIGCONT)
+        # The supervisor's poll applies it: lane flips, ticket re-queues.
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                if self.read_lane(lid2).get("box") == "box-bn2":
+                    break
+            except (FileNotFoundError, OSError, ValueError):
+                pass
+            time.sleep(0.1)
+        self.assertEqual(self.read_lane(lid2).get("box"), "box-bn2")
+        self.wait_state_field(lid2, "box_state", "held", timeout=15)
+        gone = [fn for fn in os.listdir(box1_dir) if fn.endswith("-" + lid2)]
+        self.assertEqual(gone, [])
+        self.wait_status(lid2, "done", timeout=20)
+        r = self.run_lane("stop", lid1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_status(lid1, "stopped", timeout=20)
+
+
+class TestBoxOrphanOrder(LaneBase):
+    def _mk_lane(self, lid, box):
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        ldir = os.path.join(self.lanes, lid)
+        os.makedirs(ldir, exist_ok=True)
+        lane = {"id": lid, "label": "L", "cwd": self.cwd, "briefs": ["b.md"],
+                "created_at": now, "owner_session": None, "stall_sec": 2400,
+                "env_file": None, "scope": [], "box": box,
+                "config": {"accept_exit_kinds": {}}}
+        state = {"status": "running", "step": 1, "steps": 1, "attempt": 1,
+                 "supervisor_pid": None, "supervisor_started": None,
+                 "muse_pid": None, "muse_started": None,
+                 "started_at": now, "updated_at": now,
+                 "last_activity_at": now, "last_event": None,
+                 "head_start": None, "head": None, "commits": 0,
+                 "stderr_tail": "", "accept_exit": None, "retry_at": None,
+                 "reason": None, "phase": "box_wait", "phase_started": now,
+                 "review_rounds": [], "review_error": None, "consults": [],
+                 "needs_lead": None, "needs_lead_seq": 0,
+                 "box_state": "queued", "box_queued_at": now,
+                 "evidence": None, "advisor_calls": 0}
+        with open(os.path.join(ldir, "lane.json"), "w") as f:
+            json.dump(lane, f)
+        with open(os.path.join(ldir, "state.json"), "w") as f:
+            json.dump(state, f)
+        return ldir
+
+    def test_orphan_writes_lane_before_ticket(self):
+        lid = "lane-orphan-order"
+        self._mk_lane(lid, "box-bo1")
+        ticket = "20260101T000000.000000-%s" % lid
+        bdir1 = os.path.join(self.lanes, "_boxes", "box-bo1")
+        os.makedirs(bdir1, exist_ok=True)
+        with open(os.path.join(bdir1, ticket), "w") as f:
+            f.write("{}\n")
+        r = self.run_lane("answer", lid, "--box", "box-bo2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.read_lane(lid).get("box"), "box-bo2")
+        names = os.listdir(os.path.join(self.lanes, "_boxes", "box-bo2"))
+        self.assertEqual(len(names), 1)
+        lane_mtime = os.path.getmtime(self.lane_path(lid, "lane.json"))
+        ticket_mtime = os.path.getmtime(
+            os.path.join(self.lanes, "_boxes", "box-bo2", names[0]))
+        self.assertLessEqual(lane_mtime, ticket_mtime)
+        self.assertEqual([fn for fn in os.listdir(self.lane_path(lid))
+                          if fn.startswith("lead-")], [])
 
 
 if __name__ == "__main__":

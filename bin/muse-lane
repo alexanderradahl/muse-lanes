@@ -2075,6 +2075,12 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
     else:
         lines.append("(none)")
     lines.append("")
+    box_notes = state.get("box_move_refusals") or []
+    if box_notes:
+        lines.append("## Box moves")
+        for _bn in box_notes:
+            lines.append("- %s" % _bn)
+        lines.append("")
     rcfg = lane.get("review") or {}
     rrounds = state.get("review_rounds") or []
     rerr = state.get("review_error")
@@ -2633,6 +2639,7 @@ def cmd_start(args):
         "needs_lead_seq": 0,
         "box_state": None,
         "box_queued_at": None,
+        "box_move_refusals": [],
         "evidence": None,
         "advisor_calls": 0,
     }
@@ -2676,6 +2683,7 @@ def _default_queued_state(lane):
         "needs_lead_seq": 0,
         "box_state": None,
         "box_queued_at": None,
+        "box_move_refusals": [],
         "evidence": None,
         "advisor_calls": 0,
     }
@@ -2718,6 +2726,7 @@ def _build_status_obj(lid, lane, state, disp):
     obj.setdefault("needs_lead_seq", 0)
     obj.setdefault("box_state", None)
     obj.setdefault("box_queued_at", None)
+    obj.setdefault("box_move_refusals", [])
     obj.setdefault("evidence", None)
     obj.setdefault("advisor_calls", 0)
     try:
@@ -2953,6 +2962,7 @@ def _build_stopped_state(lane, state):
         "needs_lead_seq": _seq,
         "box_state": state.get("box_state"),
         "box_queued_at": state.get("box_queued_at"),
+        "box_move_refusals": state.get("box_move_refusals") or [],
         "evidence": None,
         "advisor_calls": _ac,
     }
@@ -3316,11 +3326,34 @@ def cmd_answer(args):
             "escalated": False,
             "answer_preview": redact_text(text[:CONSULT_ANSWER_PREVIEW], secrets),
         }
-    moved_names = []
-    clear_box_timeout = False
+    # Liveness first: under a live supervisor answer never touches
+    # lane.json or tickets itself. A check-then-move here races the
+    # supervisor's hold decision (it can switch to held between our
+    # state.json read and our ticket move, freeing the old box while
+    # our waiter still counts as queued on it). The live path writes a
+    # box sidecar only; the supervisor applies it inside its wait loop
+    # in the same poll iteration that decides whether to hold.
+    try:
+        live = supervisor_alive(ldir)
+    except Exception:
+        live = False
+    if box_b is not None and live:
+        try:
+            if lead_entry is not None:
+                write_lead_sidecar(ldir, "consult", {"entry": lead_entry})
+                if clear_question:
+                    write_lead_sidecar(ldir, "clear", {"kind": "question", "seq": seq})
+            write_lead_sidecar(ldir, "box", {"box": box_b})
+        except OSError as e:
+            print("muse-lane: cannot write lead sidecar: %s" % e, file=sys.stderr)
+            return 1
+        print("box move requested")
+        return 0
     if box_b is not None:
-        # lane.json first: the waiter derives its box from lane.json each
-        # poll, then adopts the moved ticket below it.
+        # Orphaned direct path (a live supervisor returned above):
+        # lane.json first, then the ticket move, so a waiter that
+        # wakes mid-move derives the new box before adopting the
+        # ticket below it.
         lane["box"] = box_b
         try:
             atomic_write_json(os.path.join(ldir, "lane.json"), lane)
@@ -3328,31 +3361,19 @@ def cmd_answer(args):
             print("muse-lane: cannot write lane: %s" % e, file=sys.stderr)
             return 1
         try:
-            moved_names = move_own_box_tickets(lane_id, box_b)
+            move_own_box_tickets(lane_id, box_b)
         except OSError as e:
             print("muse-lane: cannot move box ticket: %s" % e, file=sys.stderr)
             return 1
-        if isinstance(nl, dict) and nl.get("kind") == "box_wait_timeout":
-            clear_box_timeout = True
-    try:
-        live = supervisor_alive(ldir)
-    except Exception:
-        live = False
     if live:
         # Never rewrite state.json under a live supervisor: it merges
         # these sidecars into its in-memory state on its next poll.
+        # (A live box move returned above; this is the text-only path.)
         try:
             if lead_entry is not None:
                 write_lead_sidecar(ldir, "consult", {"entry": lead_entry})
                 if clear_question:
                     write_lead_sidecar(ldir, "clear", {"kind": "question", "seq": seq})
-            if box_b is not None:
-                write_lead_sidecar(ldir, "box", {
-                    "box": box_b,
-                    "ticket": moved_names[0] if moved_names else None,
-                })
-                if clear_box_timeout:
-                    write_lead_sidecar(ldir, "clear", {"kind": "box_wait_timeout", "seq": seq})
         except OSError as e:
             print("muse-lane: cannot write lead sidecar: %s" % e, file=sys.stderr)
             return 1
@@ -3771,6 +3792,9 @@ def cmd_run(lane_id):
     needs_lead_holder = {"current": _nl_cur, "seq": _nl_seq}
     box_state_holder = {"v": (prev_state or {}).get("box_state")}
     box_queued_at_holder = {"v": (prev_state or {}).get("box_queued_at")}
+    in_box_wait_holder = {"v": False}
+    _br0 = (prev_state or {}).get("box_move_refusals")
+    box_refusals_holder = {"v": list(_br0) if isinstance(_br0, list) else []}
     pending_box_moves = []
     try:
         _ac = int((prev_state or {}).get("advisor_calls") or 0)
@@ -3806,8 +3830,11 @@ def cmd_run(lane_id):
 
         clear drops a matching open needs-lead event, consult appends the
         lead's consult entry (n reassigned past in-memory entries), box
-        queues a move for the box waiter. Unparseable files are still
-        marked merged so one bad file cannot wedge every poll.
+        queues a move for the box waiter when the lane is inside its wait
+        loop and queued, and is rejected otherwise (held or not waiting):
+        the merged file gains a `rejected` reason and the refusal is noted
+        for the summary. Unparseable files are still marked merged so one
+        bad file cannot wedge every poll.
         """
         try:
             names = sorted(os.listdir(ldir))
@@ -3824,6 +3851,7 @@ def cmd_run(lane_id):
                     sc = json.load(f)
             except (OSError, ValueError):
                 sc = None
+            rejected_reason = None
             try:
                 if isinstance(sc, dict):
                     kind = sc.get("kind")
@@ -3847,16 +3875,54 @@ def cmd_run(lane_id):
                             consults_done.append(entry)
                             slog("merged lead consult n=%s" % entry.get("n"))
                     elif kind == "box":
-                        pending_box_moves.append({
-                            "box": payload.get("box"),
-                            "ticket": payload.get("ticket"),
-                        })
-                        slog("merged lead box move to %s" % payload.get("box"))
+                        _target = payload.get("box")
+                        _berr = (box_name_error(_target)
+                                 if isinstance(_target, str) else "must be non-empty")
+                        if _berr is not None:
+                            rejected_reason = "invalid box %r: %s" % (_target, _berr)
+                            slog("rejected lead box move to %r: %s" % (_target, _berr))
+                        elif (in_box_wait_holder.get("v") and
+                                box_state_holder.get("v") == "queued"):
+                            pending_box_moves.append({
+                                "box": _target,
+                                "ticket": payload.get("ticket"),
+                            })
+                            slog("merged lead box move to %s" % _target)
+                        else:
+                            if box_state_holder.get("v") == "held":
+                                _held_box = None
+                                try:
+                                    _fresh = load_json(os.path.join(ldir, "lane.json"), None)
+                                    if isinstance(_fresh, dict):
+                                        _held_box = _fresh.get("box")
+                                except Exception:
+                                    _held_box = None
+                                if not _held_box:
+                                    try:
+                                        _held_box = lane.get("box")
+                                    except Exception:
+                                        _held_box = None
+                                rejected_reason = "lane held %s" % (_held_box or "?")
+                            else:
+                                rejected_reason = "lane not waiting"
+                            slog("rejected lead box move to %s: %s" % (
+                                _target, rejected_reason))
+                            box_refusals_holder["v"].append(
+                                "box move to %s refused: %s" % (_target, rejected_reason))
             finally:
                 try:
                     os.rename(path, path + LEAD_SIDECAR_MERGED_SUFFIX)
                 except OSError:
                     pass
+                else:
+                    if rejected_reason is not None and isinstance(sc, dict):
+                        try:
+                            _m = dict(sc)
+                            _m["rejected"] = rejected_reason
+                            _m["rejected_at"] = now_iso()
+                            atomic_write_json(path + LEAD_SIDECAR_MERGED_SUFFIX, _m)
+                        except OSError:
+                            pass
     # Resume past a passed accept goes straight to review: all step finals are
     # present (start_step > steps) and the accept already passed (accept_exit 0).
     skip_accept = bool(review_enabled and start_step > steps and accept_exit == 0)
@@ -3924,6 +3990,7 @@ def cmd_run(lane_id):
             "needs_lead_seq": needs_lead_holder["seq"],
             "box_state": box_state_holder["v"],
             "box_queued_at": box_queued_at_holder["v"],
+            "box_move_refusals": list(box_refusals_holder["v"]),
             "evidence": evidence_holder["v"],
             "advisor_calls": advisor_calls_holder["v"],
         }
@@ -4001,6 +4068,7 @@ def cmd_run(lane_id):
             "needs_lead_seq": needs_lead_holder["seq"],
             "box_state": box_state_holder["v"],
             "box_queued_at": box_queued_at_holder["v"],
+            "box_move_refusals": list(box_refusals_holder["v"]),
             "evidence": evidence_holder["v"],
             "advisor_calls": advisor_calls_holder["v"],
         }
@@ -4966,9 +5034,13 @@ def cmd_run(lane_id):
 
         Returns ("held", box) or ("finished", code) after a stop. Heartbeats
         state so the wait never reads as a stall; past the budget raises
-        box_wait_timeout once and keeps waiting in place. The box comes
-        from lane.json each poll and the ticket is adopted from the box
-        dir, so a lead move (answer --box) lands mid-wait.
+        box_wait_timeout once and keeps waiting in place. Lead box moves
+        (answer --box sidecars) are applied here, in the same poll
+        iteration that decides whether to hold: the move lands, the wait
+        clock resets, an open box_wait_timeout clears, then the hold is
+        decided. The box still comes from lane.json each poll and the
+        ticket is adopted from the box dir, so an orphaned direct move
+        also lands mid-wait.
         """
         box_queued_at_holder["v"] = now_iso()
         box_state_holder["v"] = "queued"
@@ -4982,20 +5054,57 @@ def cmd_run(lane_id):
         timeout_raised = False
         last_update_m = 0.0
         cur_box = box
+        in_box_wait_holder["v"] = True
         while True:
             if stop_requested["flag"] or _stop_marker_present():
+                in_box_wait_holder["v"] = False
                 release_box_ticket(ticket_name)
                 return ("finished", finish_terminal("stopped", steps, last_att0,
                                                     "stopped", None,
                                                     current_last_event, ""))
             merge_lead_sidecars()
             if pending_box_moves:
-                # A lead move re-queues us: the wait timer and the
-                # once-per-wait timeout flag restart with it.
-                del pending_box_moves[:]
-                wait_start_m = time.monotonic()
-                timeout_raised = False
-                box_queued_at_holder["v"] = now_iso()
+                # Supervisor-applied lead moves: lane.json and the ticket
+                # move here, before the hold decision below, so no
+                # check-then-move race can free the old box under us.
+                # Each move re-queues us at the back of the new box and
+                # restarts the wait timer and the once-per-wait flag.
+                while pending_box_moves:
+                    _mv = pending_box_moves.pop(0)
+                    _nb = _mv.get("box")
+                    if not isinstance(_nb, str) or box_name_error(_nb) is not None:
+                        slog("box move to %r ignored: invalid box name" % (_nb,))
+                        continue
+                    _nb = _nb.strip()
+                    try:
+                        _fresh_lane = load_json(lane_path, None)
+                        if isinstance(_fresh_lane, dict):
+                            _fresh_lane["box"] = _nb
+                            atomic_write_json(lane_path, _fresh_lane)
+                        try:
+                            lane["box"] = _nb
+                        except Exception:
+                            pass
+                    except OSError as e:
+                        slog("box move to %s failed: cannot write lane: %s" % (_nb, e))
+                        continue
+                    try:
+                        _moved = move_own_box_tickets(lane_id, _nb)
+                    except OSError as e:
+                        slog("box move to %s failed: cannot move ticket: %s" % (_nb, e))
+                        continue
+                    cur_box = _nb
+                    if _moved:
+                        ticket_name = _moved[-1]
+                    wait_start_m = time.monotonic()
+                    timeout_raised = False
+                    box_queued_at_holder["v"] = now_iso()
+                    _open = needs_lead_holder.get("current")
+                    if isinstance(_open, dict) and _open.get("kind") == "box_wait_timeout":
+                        needs_lead_holder["current"] = None
+                        slog("box %s: cleared open box_wait_timeout on lead move" % _nb)
+                    slog("box move to %s applied; re-queued with ticket %s" % (
+                        _nb, ticket_name))
             fresh = fresh_lane_box()
             if fresh:
                 cur_box = fresh
@@ -5021,8 +5130,8 @@ def cmd_run(lane_id):
                 own = [(cur_box, ticket_name)]
             own_here = sorted(fn for (b, fn) in own if b == cur_box)
             if not own_here:
-                # Our ticket lives in another box dir: a lead move is in
-                # flight. Wait for it; never read this as first place.
+                # Our ticket lives in another box dir: an external move is
+                # in flight. Wait for it; never read this as first place.
                 older = None
             else:
                 if ticket_name not in own_here:
@@ -5051,6 +5160,7 @@ def cmd_run(lane_id):
                             None, None, last_reason)
                 last_update_m = now_m
             time.sleep(min(0.2, poll_sec))
+        in_box_wait_holder["v"] = False
         box_state_holder["v"] = "held"
         cur_nl = needs_lead_holder["current"]
         if isinstance(cur_nl, dict) and cur_nl.get("kind") == "box_wait_timeout":
