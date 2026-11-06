@@ -3883,8 +3883,7 @@ def cmd_run(lane_id):
                             slog("rejected lead box move to %r: %s" % (_target, _berr))
                             box_refusals_holder["v"].append(
                                 "box move to %s refused: %s" % (_target, rejected_reason))
-                        elif (in_box_wait_holder.get("v") and
-                                box_state_holder.get("v") == "queued"):
+                        elif box_state_holder.get("v") in ("queued", "held"):
                             pending_box_moves.append({
                                 "box": _target,
                                 "ticket": payload.get("ticket"),
