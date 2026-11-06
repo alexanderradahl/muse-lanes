@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.0 — 2026-11-06
+
+One lead runs a fleet of lanes directly. Design: [docs/v0.3-plan.md](docs/v0.3-plan.md).
+
+- Needs-lead events: typed `needs_lead` facts (`question`, `review_failed`, `accept_failed_code`,
+  `accept_failed_harness`, `box_wait_timeout`, `scope_violation`), claimed once with `ack --lead <seq>`.
+  Accepts report their kind with `LANE-NEEDS-LEAD:` lines or `accept_exit_kinds`.
+- `scope` globs on `lane_start`; a change outside them ends the lane `scope_violation`.
+- Claude advisor for consults (`advisor: {model, max}`), read-only, budgeted per lane; any consult answer
+  starting `ESCALATE:` raises a `question` instead of deciding for the lead.
+- Box queue: `box` on `lane_start`, ticket files ordered by queue time, liveness from supervisor locks (no
+  process-name matching), `LANE_BOX` for the accept, `box_wait_timeout` past budget. `boxes --json` adds the
+  lease file holder.
+- `answer` / `lane_answer` (text, box) and `lane_boxes`.
+- Done lanes carry ready-to-merge evidence (branch, head, commits, accept log, review files).
+- Config file (`$MUSE_LANES_CONFIG` or `<root>/config.json`) with a SimGoodie adapter in `examples/`.
+- Hook: one prompt per poll from a persisted outbox (digest for several events), the submit never awaited, a
+  dropped one resent next poll; toasts and notifications only for needs-lead events; status line counts lanes
+  that need the lead; the pane gains a header, a Boxes section, needs-lead flags and per-lane drill-down.
+
 ## 0.2.3 — 2026-11-05
 
 - Final-answer extraction is one shared helper: the last non-blank completed terminal text, falling back

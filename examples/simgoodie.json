@@ -1,0 +1,8 @@
+{
+  "accept_exit_kinds": { "5": "accept_failed_harness", "6": "box_wait_timeout" },
+  "box_wait_max_min": 30,
+  "lease_file": "~/r12-master/LEASES.md",
+  "lease_claim_re": "^(?P<at>\\S+) CLAIM (?P<box>\\S+) by (?P<who>[^:]+): (?P<what>.*)$",
+  "lease_release_re": "^(?P<at>\\S+) RELEASE (?P<box>\\S+) by ",
+  "advisor_timeout_min": 15
+}

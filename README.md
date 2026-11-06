@@ -10,20 +10,27 @@ Claude stays the lead that plans and reviews, and Muse does the long, checkable 
 
 - **Tools:**
   - `lane_start` starts a lane. A lane is one or more steps, each a brief file or inline prompt, run in order in one
-    working directory, with an optional acceptance command, an optional Muse pre-review, and mid-step consults.
+    working directory, with an optional acceptance command, Muse pre-review, mid-step consults, a Claude
+    advisor, a path scope, and a gate box.
   - `lane_status` shows the active view (live lanes plus those ended in the last 24 h, with a count of older
     lanes), one lane by id, or every lane with `all: true`.
-  - `lane_summary` gives attempts, commits, acceptance output, pre-review rounds, consults, and each step's final answer.
-  - `lane_stop` stops a lane.
-  - `lane_resume` continues a lane whose supervisor died, from the step it recorded.
-- **Panel:** `/muse` opens a pane listing your lanes: status, step/attempt, phase and its elapsed time, total
-  elapsed, idle minutes (marked past 75% of the stall budget), commits with the last subject, and the last
-  accept lines on failure. This session's lanes come first.
-- **Wake-up:** when one of this session's lanes ends, the plugin submits its summary as a prompt. Each lane
-  wakes the session that started it once, and no other session. A one-line toast names the lane and its end
-  state alongside the prompt.
-- **Status line:** with exactly one owned working lane the plugin pins `muse: <label> <phase>` under the
-  prompt; with more it pins `muse: N running`. It clears when none remain.
+  - `lane_summary` gives attempts, commits, acceptance output, pre-review rounds, consults, each step's final
+    answer, and for a finished lane the ready-to-merge evidence.
+  - `lane_answer` is the lead's reply to a lane that needs it: `text` answers an escalated question, `box` moves
+    a lane off a busy box.
+  - `lane_boxes` lists gate boxes: the lane holding each, the lanes queued for it, and the lease file's holder.
+  - `lane_stop` stops a lane; `lane_resume` continues a lane whose supervisor died.
+- **Pane:** `/muse` opens a pane (it also opens on `lane_start` when the window is wide enough). A header counts
+  running lanes, lanes that need the lead, and lanes ready to merge. A Boxes section shows each box's holder,
+  queue and lease. Each lane gets a row: a needs-lead flag, label, status, phase and its elapsed time, box,
+  total time, idle minutes, pre-review verdict, then commits with the last subject and branch, then the
+  needs-lead detail or failed accept tail. Lanes that need the lead come first, then this session's working
+  lanes. The `▸` toggle expands a row with its summary (or live status), the merge evidence, and `stop`,
+  `resume` and `refresh` buttons.
+- **Wake-ups:** the session is woken when one of its lanes ends or needs the lead, never for routine progress.
+  Several events in one poll arrive as one digest prompt. See [Needs-lead events](#needs-lead-events).
+- **Status line:** `muse: <label> <phase>` with one working lane, else `muse: N running · M need lead`.
+- **Toasts:** only for lanes that need the lead or ended other than `done`.
 
 ## Requirements
 
@@ -133,10 +140,60 @@ lane_start(..., accept="""
 """)
 ```
 
+## Needs-lead events
+
+The runner records a typed fact when a lane needs a decision only the lead can make:
+
+| Kind | Raised when | Lane after |
+| --- | --- | --- |
+| `question` | A consult answer starts `ESCALATE: <reason>` | Keeps working; `lane_answer` with `text` replies |
+| `review_failed` | Pre-review FAIL after the last fix round | Ends `review_failed` |
+| `accept_failed_code` | Accept exits nonzero with no other mapping | Ends `failed` |
+| `accept_failed_harness` | Accept exit code mapped to it, or a `LANE-NEEDS-LEAD:` line | Ends `failed` |
+| `box_wait_timeout` | The box queue waited past its budget, or an accept exit mapped to it | Queue: keeps its place; `lane_answer` with `box` moves it |
+| `scope_violation` | A step changed a path outside the lane's `scope` globs | Ends `failed` |
+
+An accept reports its own failure kind with `LANE-NEEDS-LEAD: <kind> <detail>` (the last line wins) or through
+`accept_exit_kinds` in the config. The runner never guesses a kind from log text.
+
+Each event is claimed exactly once and goes into an outbox kept in the session's state. One prompt carries the
+outbox: a single event in full, several as a digest with one block per lane and a pointer to `lane_summary`. A
+lane that ends `done` reads **READY TO MERGE** with its branch, head, commits, accept log and review files. The
+plugin never merges; the lead does, with its own merge script.
+
+## Advisor
+
+`advisor: {model, max}` on `lane_start` routes a lane's consults to a read-only Claude session (`sonnet` by
+default, `opus` when the brief needs it, `max` calls per lane, default 3) before the Muse helper. The advisor
+reads files only, runs with mods and hooks off, and sees the lane's accept command and scope. It may not change
+either: a question that needs a different acceptance, scope or product decision comes back `ESCALATE:` and
+wakes the lead. Every call is logged in the summary with who answered and whether it escalated.
+
+## Boxes
+
+`box` on `lane_start` hands the lane a gate box. Before each accept the supervisor takes a ticket in
+`<root>/_boxes/<box>/` and waits, in phase `box_wait`, until its ticket is the oldest whose lane is alive. It
+checks liveness through each lane's supervisor lock (pid plus start time), never by matching process names: two
+`pgrep -f` waiters once deadlocked on each other's command text. The accept sees `LANE_BOX` and holds the box
+until it ends. Past `box_wait_max_min` the lane wakes the lead with `box_wait_timeout` and keeps its place.
+
+The queue orders this plugin's lanes only. The project's gate script still claims the real box; the pane reads
+the project's lease file to show who holds it.
+
+## Config
+
+The runner reads `$MUSE_LANES_CONFIG`, else `<lanes root>/config.json`, and copies it into each lane at start.
+Keys: `accept_exit_kinds`, `box_wait_max_min`, `lease_file`, `lease_claim_re`, `lease_release_re`
+(named groups `box`, `who`, `what`, `at`), `advisor_cmd`, `advisor_timeout_min`. The core names no project;
+[`examples/simgoodie.json`](examples/simgoodie.json) is the SimGoodie adapter (gate exit 5 = harness, 6 = box
+wait timeout, `LEASES.md` claims).
+
 ## Known limits
 
-- **A wake-up can be lost.** The announcement is recorded just before the prompt is delivered, so a plugin
-  reload in that moment loses the wake-up. `lane_status` still shows the lane as finished.
+- **A wake-up can repeat.** A claimed event stays in the outbox until its prompt's turn starts, so a plugin
+  reload in between submits it again. A dropped prompt is resent on the next poll.
+- **No OS banner in the Desktop app.** `$.ui.notify` reaches terminals only; a `Notification` settings hook
+  (type `plugin_notification`) can raise a banner there.
 - **Only the starting session is woken.** A lane started before a Claude Code restart is not announced to the new
   session; use `lane_status`.
 - **Marketplace installs are lightly tested.** Installing from the marketplace was tested; loading the tools
