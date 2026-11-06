@@ -9,6 +9,7 @@ import argparse
 import datetime
 import errno
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -43,11 +44,28 @@ LOCK_NAME = "supervisor.lock"
 STOP_MARKER = "stop.requested"
 ANNOUNCE_MARKER = "announced"
 ORPHAN_MARKER_PREFIX = "announced-orphan-"
+LEAD_MARKER_PREFIX = "announced-lead-"
 MIN_SECRET_LEN = 12
 QUEUED_ORPHAN_AFTER_SEC = 30.0
 LOCK_RETRY_SEC = 2.0
 ACK_EXISTS_EXIT = 3
 CLASSIFY_TAIL_LINES = 40
+NEEDS_LEAD_KINDS = {"question", "review_failed", "accept_failed_code",
+                    "accept_failed_harness", "box_wait_timeout",
+                    "scope_violation"}
+ACCEPT_MAPPABLE_KINDS = {"accept_failed_code", "accept_failed_harness",
+                         "box_wait_timeout"}
+CONFIG_KEYS = ("accept_exit_kinds", "box_wait_max_min", "lease_file",
+               "lease_claim_re", "lease_release_re", "advisor_cmd",
+               "advisor_timeout_min")
+DEFAULT_ADVISOR_CMD = ["claude", "-p", "--model", "{model}",
+                       "--tools", "Read,Grep,Glob",
+                       "--permission-mode", "dontAsk",
+                       "--no-session-persistence",
+                       "--settings", '{"disableAllHooks":true}']
+NEEDS_LEAD_RE = r"^LANE-NEEDS-LEAD: (\S+) ?(.*)$"
+SCOPE_DETAIL_CAP = 2000
+NEEDS_LEAD_DETAIL_CAP = 2000
 
 
 def lanes_root():
@@ -57,6 +75,158 @@ def lanes_root():
 
 def lane_dir(lane_id):
     return os.path.join(lanes_root(), lane_id)
+
+
+def default_config():
+    return {
+        "accept_exit_kinds": {},
+        "box_wait_max_min": 30,
+        "lease_file": None,
+        "lease_claim_re": None,
+        "lease_release_re": None,
+        "advisor_cmd": list(DEFAULT_ADVISOR_CMD),
+        "advisor_timeout_min": 15,
+    }
+
+
+def config_file_path():
+    """Configured file, or None for defaults. Env wins over the root file."""
+    env = os.environ.get("MUSE_LANES_CONFIG")
+    if env and str(env).strip():
+        return os.path.abspath(os.path.expanduser(str(env).strip())), True
+    root_p = os.path.join(lanes_root(), "config.json")
+    if os.path.isfile(root_p):
+        return root_p, False
+    return None, False
+
+
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _validate_config_key(key, val):
+    """(ok, normalized_or_reason)."""
+    if key == "accept_exit_kinds":
+        if not isinstance(val, dict):
+            return False, "must be an object mapping exit codes to kinds"
+        norm = {}
+        for k, v in val.items():
+            try:
+                code = int(str(k).strip())
+            except (TypeError, ValueError):
+                return False, "key %r is not an exit code" % (k,)
+            if code < 0 or code > 255:
+                return False, "exit code %r out of range 0-255" % (k,)
+            if not isinstance(v, str) or v not in ACCEPT_MAPPABLE_KINDS:
+                return False, "value %r must be one of %s" % (
+                    v, sorted(ACCEPT_MAPPABLE_KINDS))
+            norm[str(code)] = v
+        return True, norm
+    if key == "box_wait_max_min":
+        if not _is_num(val) or val <= 0:
+            return False, "must be a number > 0"
+        return True, val
+    if key == "lease_file":
+        if val is not None and not isinstance(val, str):
+            return False, "must be a string or null"
+        return True, val
+    if key in ("lease_claim_re", "lease_release_re"):
+        if val is not None:
+            if not isinstance(val, str):
+                return False, "must be a string or null"
+            try:
+                re.compile(val)
+            except re.error as e:
+                return False, "invalid regex: %s" % e
+        return True, val
+    if key == "advisor_cmd":
+        if (not isinstance(val, list) or not val or
+                not all(isinstance(x, str) for x in val)):
+            return False, "must be a non-empty list of strings"
+        return True, list(val)
+    if key == "advisor_timeout_min":
+        if not _is_num(val) or val <= 0:
+            return False, "must be a number > 0"
+        return True, val
+    return True, val
+
+
+def load_effective_config():
+    """(config, error). Unknown keys ignored; malformed names the key."""
+    cfg = default_config()
+    path, from_env = config_file_path()
+    if path is None:
+        return cfg, None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        if from_env:
+            return None, "config file not found: %s" % path
+        return cfg, None
+    except (OSError, ValueError) as e:
+        return None, "malformed config file %s: %s" % (path, e)
+    if not isinstance(raw, dict):
+        return None, "malformed config file %s: must be a JSON object" % path
+    for key in CONFIG_KEYS:
+        if key not in raw:
+            continue
+        ok, norm = _validate_config_key(key, raw[key])
+        if not ok:
+            return None, "invalid config key %r in %s: %s" % (key, path, norm)
+        cfg[key] = norm
+    return cfg, None
+
+
+def lead_marker_name(seq):
+    return "%s%s" % (LEAD_MARKER_PREFIX, seq)
+
+
+def is_lead_announced(ldir, seq):
+    if seq is None:
+        return False
+    try:
+        return os.path.exists(os.path.join(ldir, lead_marker_name(seq)))
+    except OSError:
+        return False
+
+
+def parse_needs_lead_last(log_text):
+    """Last LANE-NEEDS-LEAD line: (kind, detail, raw) or None."""
+    if not log_text:
+        return None
+    last = None
+    for line in str(log_text).splitlines():
+        m = re.match(NEEDS_LEAD_RE, line)
+        if m:
+            last = (m.group(1), m.group(2) or "", line.strip())
+    return last
+
+
+def accept_needs_lead_for_exit(exit_code, log_text, config):
+    """(kind, detail) for a nonzero accept exit; the last line wins."""
+    last = parse_needs_lead_last(log_text or "")
+    if last is not None:
+        kind_raw, detail_raw, raw_line = last
+        if kind_raw in NEEDS_LEAD_KINDS:
+            return kind_raw, (detail_raw or "").strip()[:NEEDS_LEAD_DETAIL_CAP]
+        return "accept_failed_code", raw_line[:NEEDS_LEAD_DETAIL_CAP]
+    mapping = {}
+    try:
+        mapping = (config or {}).get("accept_exit_kinds") or {}
+    except Exception:
+        mapping = {}
+    mapped = None
+    if isinstance(mapping, dict):
+        mapped = mapping.get(str(exit_code))
+        if mapped is None:
+            try:
+                mapped = mapping.get(int(str(exit_code)))
+            except (TypeError, ValueError):
+                mapped = None
+    if isinstance(mapped, str) and mapped in ACCEPT_MAPPABLE_KINDS:
+        return mapped, "accept exit %s" % exit_code
+    return "accept_failed_code", "accept exit %s" % exit_code
 
 
 def now_iso():
@@ -623,6 +793,98 @@ def get_last_subject(cwd):
         return None
     s = (r.stdout or "").strip()
     return s or None
+
+
+def get_git_branch(cwd):
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    r = _git(["branch", "--show-current"], cwd)
+    if r is not None and r.returncode == 0:
+        b = (r.stdout or "").strip()
+        if b:
+            return b
+    r2 = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    if r2 is not None and r2.returncode == 0:
+        b2 = (r2.stdout or "").strip()
+        if b2 and b2 != "HEAD":
+            return b2
+    return None
+
+
+def scope_violating_paths(cwd, head_start, scope_globs):
+    """Sorted changed paths matching no scope glob. Empty scope skips."""
+    if not scope_globs:
+        return []
+    if not cwd or not os.path.isdir(cwd):
+        return []
+    changed = set()
+    if head_start:
+        try:
+            head_now = get_git_head(cwd)
+        except Exception:
+            head_now = None
+        if head_now and head_start != head_now:
+            r = _git(["diff", "--name-only",
+                      "%s..%s" % (head_start, head_now)], cwd)
+            if r is not None and r.returncode == 0:
+                for ln in (r.stdout or "").splitlines():
+                    ln = ln.strip()
+                    if ln:
+                        changed.add(ln)
+    try:
+        status_out = get_git_status_output(cwd)
+    except Exception:
+        status_out = None
+    if status_out is None:
+        # Not a git repo (or git failed): nothing checkable.
+        if not changed:
+            return []
+    else:
+        for p in _parse_porcelain_paths(status_out):
+            changed.add(p)
+    if not changed:
+        return []
+    bad = []
+    for p in changed:
+        hit = False
+        for pat in scope_globs:
+            try:
+                if fnmatch.fnmatch(p, pat):
+                    hit = True
+                    break
+            except Exception:
+                continue
+        if not hit:
+            bad.append(p)
+    return sorted(bad)
+
+
+def build_evidence(ldir, lane, state, head, commits, branch=None):
+    """Evidence dict for a done lane."""
+    cwd = (lane or {}).get("cwd") or ""
+    if branch is None:
+        try:
+            branch = get_git_branch(cwd) if cwd else None
+        except Exception:
+            branch = None
+    accept_log_p = os.path.join(ldir, "accept.log")
+    accept_log = accept_log_p if os.path.exists(accept_log_p) else ""
+    review_files = []
+    try:
+        for fn in sorted(os.listdir(ldir)):
+            if fn.startswith("REVIEW-") and fn.endswith(".md"):
+                review_files.append(os.path.join(ldir, fn))
+    except OSError:
+        pass
+    return {
+        "branch": branch,
+        "head": head,
+        "head_start": (state or {}).get("head_start"),
+        "commits": int(commits or 0),
+        "accept_log": accept_log,
+        "review_files": review_files,
+        "summary_path": os.path.join(ldir, "summary.md"),
+    }
 
 
 def get_commit_log(cwd, head_start, head, max_lines=40):
@@ -1228,6 +1490,41 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
     lines.append("Wall time: %s" % wall_str)
     lines.append("Cwd: %s" % cwd)
     lines.append("")
+    nl = state.get("needs_lead") if isinstance(state.get("needs_lead"), dict) else None
+    ev = state.get("evidence") if isinstance(state.get("evidence"), dict) else None
+    if nl is not None:
+        lines.append("## NEEDS LEAD")
+        lines.append("kind: %s" % (nl.get("kind") or "?"))
+        lines.append("detail: %s" % (nl.get("detail") or "(none)"))
+        lines.append("seq: %s" % (nl.get("seq") if nl.get("seq") is not None else "?"))
+        if nl.get("step") is not None:
+            lines.append("step: %s" % nl.get("step"))
+        if nl.get("at"):
+            lines.append("at: %s" % nl.get("at"))
+        lines.append("")
+    if final_status == "done":
+        lines.append("## READY TO MERGE")
+        if ev is not None:
+            lines.append("branch: %s" % (ev.get("branch") or "(none)"))
+            lines.append("head: %s" % (ev.get("head") or "(none)"))
+            lines.append("head_start: %s" % (ev.get("head_start") or "(none)"))
+            lines.append("commits: %s" % ev.get("commits", 0))
+            lines.append("accept_log: %s" % (ev.get("accept_log") or "(none)"))
+            rf = ev.get("review_files") or []
+            if rf:
+                lines.append("review_files: %s" % ", ".join(rf))
+            else:
+                lines.append("review_files: (none)")
+            lines.append("summary_path: %s" % (ev.get("summary_path") or "(none)"))
+        else:
+            lines.append("branch: (none)")
+            lines.append("head: %s" % (head or "(none)"))
+            lines.append("head_start: %s" % (head_start or "(none)"))
+            lines.append("commits: %s" % commits)
+            lines.append("accept_log: (none)")
+            lines.append("review_files: (none)")
+            lines.append("summary_path: %s" % os.path.join(ldir, "summary.md"))
+        lines.append("")
     lines.append("## Attempts")
     if steps <= 0:
         lines.append("(no steps)")
@@ -1668,6 +1965,26 @@ def cmd_start(args):
             print("muse-lane: --env-file not readable: %s" % args.env_file, file=sys.stderr)
             return 1
     label = args.label or ""
+    cfg, cfg_err = load_effective_config()
+    if cfg_err is not None:
+        print("muse-lane: %s" % cfg_err, file=sys.stderr)
+        return 1
+    scope_globs = list(getattr(args, "scope", None) or [])
+    for g in scope_globs:
+        if not isinstance(g, str) or not g.strip():
+            print("muse-lane: invalid --scope (must be a non-empty glob)", file=sys.stderr)
+            return 1
+    box_name = getattr(args, "box", None)
+    if box_name is not None:
+        box_name = str(box_name).strip()
+        if not box_name:
+            print("muse-lane: invalid --box (must be non-empty)", file=sys.stderr)
+            return 1
+        if "/" in box_name:
+            print("muse-lane: invalid --box: %s" % box_name, file=sys.stderr)
+            return 1
+    else:
+        box_name = None
     root = lanes_root()
     try:
         os.makedirs(root, exist_ok=True)
@@ -1796,6 +2113,9 @@ def cmd_start(args):
         "review": review_cfg,
         "consult_max": consult_max,
         "consult_timeout_sec": consult_timeout_min * 60.0,
+        "scope": scope_globs,
+        "box": box_name,
+        "config": cfg,
     }
     atomic_write_json(os.path.join(ldir, "lane.json"), lane)
     # Write queued state before spawning so stop/status never see a gap.
@@ -1831,6 +2151,12 @@ def cmd_start(args):
         "review_rounds": [],
         "review_error": None,
         "consults": [],
+        "needs_lead": None,
+        "needs_lead_seq": 0,
+        "box_state": None,
+        "box_queued_at": None,
+        "evidence": None,
+        "advisor_calls": 0,
     }
     atomic_write_json(os.path.join(ldir, "state.json"), queued_state)
     pid = spawn_supervisor(lane_id)
@@ -1868,6 +2194,12 @@ def _default_queued_state(lane):
         "review_rounds": [],
         "review_error": None,
         "consults": [],
+        "needs_lead": None,
+        "needs_lead_seq": 0,
+        "box_state": None,
+        "box_queued_at": None,
+        "evidence": None,
+        "advisor_calls": 0,
     }
 
 
@@ -1904,6 +2236,16 @@ def _build_status_obj(lid, lane, state, disp):
     obj.setdefault("review_rounds", [])
     obj.setdefault("review_error", None)
     obj.setdefault("consults", [])
+    obj.setdefault("needs_lead", None)
+    obj.setdefault("needs_lead_seq", 0)
+    obj.setdefault("box_state", None)
+    obj.setdefault("box_queued_at", None)
+    obj.setdefault("evidence", None)
+    obj.setdefault("advisor_calls", 0)
+    try:
+        obj["advisor_calls"] = int(obj.get("advisor_calls") or 0)
+    except (TypeError, ValueError):
+        obj["advisor_calls"] = 0
     obj["id"] = lid
     obj["label"] = lane.get("label") or ""
     obj["cwd"] = lane.get("cwd") or ""
@@ -1912,14 +2254,29 @@ def _build_status_obj(lid, lane, state, disp):
     obj["announced"] = is_announced(ldir)
     obj["orphan_announced"] = is_orphan_announced(ldir, state)
     obj["stall_sec"] = lane.get("stall_sec")
-    # One git subprocess per lane; ended lanes keep a null subject so a
-    # full listing never shells out for lanes nobody is watching.
+    nl = obj.get("needs_lead")
+    seq = nl.get("seq") if isinstance(nl, dict) else None
+    obj["needs_lead_announced"] = is_lead_announced(ldir, seq)
+    obj["box"] = lane.get("box")
+    # Branch/head live-only: ended lanes run no git at all.
     if _is_live_display_status(disp):
+        cwd = lane.get("cwd") or ""
         try:
-            obj["last_subject"] = get_last_subject(lane.get("cwd") or "")
+            obj["branch"] = get_git_branch(cwd)
+        except Exception:
+            obj["branch"] = None
+        try:
+            fresh_head = get_git_head(cwd)
+        except Exception:
+            fresh_head = None
+        obj["head"] = fresh_head if fresh_head is not None else state.get("head")
+        try:
+            obj["last_subject"] = get_last_subject(cwd)
         except Exception:
             obj["last_subject"] = None
     else:
+        obj["branch"] = None
+        obj["head"] = None
         obj["last_subject"] = None
     try:
         with open(os.path.join(ldir, "accept.log"), "r", encoding="utf-8", errors="replace") as f:
@@ -2079,6 +2436,14 @@ def _build_stopped_state(lane, state):
     except Exception:
         commits = int(state.get("commits") or 0)
     ended = now_iso()
+    try:
+        _seq = int(state.get("needs_lead_seq") or 0)
+    except (TypeError, ValueError):
+        _seq = 0
+    try:
+        _ac = int(state.get("advisor_calls") or 0)
+    except (TypeError, ValueError):
+        _ac = 0
     new_state = {
         "status": "stopped",
         "step": int(state.get("step") or 1),
@@ -2106,6 +2471,12 @@ def _build_stopped_state(lane, state):
         "review_rounds": state.get("review_rounds") or [],
         "review_error": state.get("review_error"),
         "consults": state.get("consults") or [],
+        "needs_lead": state.get("needs_lead"),
+        "needs_lead_seq": _seq,
+        "box_state": state.get("box_state"),
+        "box_queued_at": state.get("box_queued_at"),
+        "evidence": None,
+        "advisor_calls": _ac,
     }
     for k, v in list(new_state.items()):
         if isinstance(v, str):
@@ -2303,7 +2674,28 @@ def cmd_ack(args):
         print("muse-lane: lane has no state: %s" % lane_id, file=sys.stderr)
         return 1
     want_orphan = bool(getattr(args, "orphan", False))
-    if want_orphan:
+    want_lead = getattr(args, "lead", None)
+    if want_orphan and want_lead is not None:
+        print("muse-lane: cannot combine --orphan and --lead", file=sys.stderr)
+        return 1
+    if want_lead is not None:
+        try:
+            want_seq = int(want_lead)
+        except (TypeError, ValueError):
+            print("muse-lane: invalid --lead seq: %r" % (want_lead,), file=sys.stderr)
+            return 1
+        nl = state.get("needs_lead") if isinstance(state.get("needs_lead"), dict) else None
+        cur = None
+        if nl is not None:
+            try:
+                cur = int(nl.get("seq"))
+            except (TypeError, ValueError):
+                cur = None
+        if nl is None or cur != want_seq:
+            print("muse-lane: lane has no needs-lead seq %s" % want_seq, file=sys.stderr)
+            return 2
+        marker = lead_marker_name(want_seq)
+    elif want_orphan:
         disp = display_status(state.get("status"), state.get("supervisor_pid"),
                               lane_id=lane_id, state=state, lane=lane)
         if disp != "orphaned":
@@ -2330,6 +2722,106 @@ def cmd_ack(args):
     except OSError:
         pass
     _chmod_0600(path)
+    return 0
+
+
+def _consult_next_n(state, cwd):
+    m = 0
+    for e in (state or {}).get("consults") or []:
+        try:
+            m = max(m, int(e.get("n") or 0))
+        except (TypeError, ValueError):
+            pass
+    try:
+        for fn in os.listdir(os.path.join(cwd, ".lane")):
+            if fn.startswith("ASK-") and fn.endswith(".md"):
+                try:
+                    m = max(m, int(fn[4:-3]))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return m + 1
+
+
+def cmd_answer(args):
+    lane_id = args.id
+    ldir = lane_dir(lane_id)
+    lane = load_lane(lane_id)
+    if lane is None:
+        print("muse-lane: unknown lane: %s" % lane_id, file=sys.stderr)
+        return 1
+    state = load_state(lane_id)
+    if state is None:
+        print("muse-lane: lane has no state: %s" % lane_id, file=sys.stderr)
+        return 1
+    if state.get("status") in TERMINAL:
+        print("muse-lane: lane is %s, cannot answer an ended lane" % state.get("status"),
+              file=sys.stderr)
+        return 1
+    text = getattr(args, "text", None)
+    text_file = getattr(args, "text_file", None)
+    if text is not None and text_file is not None:
+        print("muse-lane: cannot combine --text and --text-file", file=sys.stderr)
+        return 1
+    if text_file is not None:
+        try:
+            with open(os.path.abspath(os.path.expanduser(text_file)), "r",
+                      encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            print("muse-lane: --text-file not readable: %s" % e, file=sys.stderr)
+            return 1
+    if text is None:
+        print("muse-lane: answer requires --text or --text-file", file=sys.stderr)
+        return 1
+    cwd = lane.get("cwd") or ""
+    lane_dot = os.path.join(cwd, ".lane")
+    try:
+        os.makedirs(lane_dot, exist_ok=True)
+    except OSError as e:
+        print("muse-lane: cannot create .lane dir: %s" % e, file=sys.stderr)
+        return 1
+    nl = state.get("needs_lead") if isinstance(state.get("needs_lead"), dict) else None
+    seq = nl.get("seq") if nl is not None else None
+    body = text if text.endswith("\n") else text + "\n"
+    try:
+        atomic_write_text(os.path.join(lane_dot, "ANSWER.md"), body)
+        if seq is not None:
+            atomic_write_text(os.path.join(lane_dot, "ANSWER-lead-%s.md" % seq), body)
+    except OSError as e:
+        print("muse-lane: cannot write answer: %s" % e, file=sys.stderr)
+        return 1
+    secrets = secrets_from_env_file(lane.get("env_file"))
+    new_nl = nl
+    if nl is not None and nl.get("kind") == "question":
+        new_nl = None
+    try:
+        step = int(state.get("step") or 1)
+    except (TypeError, ValueError):
+        step = 1
+    qprev = ""
+    if nl is not None:
+        qprev = redact_text(str(nl.get("detail") or "")[:CONSULT_QUESTION_PREVIEW], secrets)
+    consults = list(state.get("consults") or [])
+    consults.append({
+        "step": step,
+        "n": _consult_next_n(state, cwd),
+        "question_preview": qprev,
+        "answered": True,
+        "helper": "lead",
+        "by": "lead",
+        "escalated": False,
+        "answer_preview": redact_text(text[:CONSULT_ANSWER_PREVIEW], secrets),
+    })
+    state["needs_lead"] = new_nl
+    state["consults"] = consults
+    state["updated_at"] = now_iso()
+    try:
+        atomic_write_json(os.path.join(ldir, "state.json"), state)
+    except OSError as e:
+        print("muse-lane: cannot write state: %s" % e, file=sys.stderr)
+        return 1
     return 0
 
 
@@ -2609,7 +3101,51 @@ def cmd_run(lane_id):
     review_rounds_done = list((prev_state or {}).get("review_rounds") or [])
     review_error_holder = {"v": (prev_state or {}).get("review_error")}
     consults_done = list((prev_state or {}).get("consults") or [])
+    try:
+        _nl_seq = int((prev_state or {}).get("needs_lead_seq") or 0)
+    except (TypeError, ValueError):
+        _nl_seq = 0
+    _nl_cur = (prev_state or {}).get("needs_lead")
+    if isinstance(_nl_cur, dict):
+        try:
+            _nl_cur_seq = int(_nl_cur.get("seq") or 0)
+        except (TypeError, ValueError):
+            _nl_cur_seq = 0
+        if _nl_cur_seq > _nl_seq:
+            _nl_seq = _nl_cur_seq
+    else:
+        _nl_cur = None
+    needs_lead_holder = {"current": _nl_cur, "seq": _nl_seq}
+    box_state_holder = {"v": (prev_state or {}).get("box_state")}
+    box_queued_at_holder = {"v": (prev_state or {}).get("box_queued_at")}
+    try:
+        _ac = int((prev_state or {}).get("advisor_calls") or 0)
+    except (TypeError, ValueError):
+        _ac = 0
+    advisor_calls_holder = {"v": _ac}
+    evidence_holder = {"v": (prev_state or {}).get("evidence")}
+    lane_scope = list(lane.get("scope") or []) if isinstance(lane.get("scope"), list) else []
+    lane_config = lane.get("config") if isinstance(lane.get("config"), dict) else {}
     current_last_event = (prev_state or {}).get("last_event")
+
+    def raise_needs_lead(kind, detail, step=None):
+        """Record a needs-lead event; each raise bumps seq. Returns the event."""
+        try:
+            seq = int(needs_lead_holder.get("seq") or 0) + 1
+        except (TypeError, ValueError):
+            seq = 1
+        needs_lead_holder["seq"] = seq
+        det = redact_text((detail or "")[:NEEDS_LEAD_DETAIL_CAP], secrets)
+        ev = {"seq": seq, "kind": kind, "detail": det, "at": now_iso()}
+        if step is not None:
+            try:
+                ev["step"] = int(step)
+            except (TypeError, ValueError):
+                pass
+        needs_lead_holder["current"] = ev
+        slog("needs-lead %s seq=%d step=%s: %s" % (
+            kind, seq, ev.get("step"), det[:160]))
+        return ev
     # Resume past a passed accept goes straight to review: all step finals are
     # present (start_step > steps) and the accept already passed (accept_exit 0).
     skip_accept = bool(review_enabled and start_step > steps and accept_exit == 0)
@@ -2672,6 +3208,12 @@ def cmd_run(lane_id):
             "review_rounds": review_rounds_done,
             "review_error": review_error_holder["v"],
             "consults": consults_done,
+            "needs_lead": needs_lead_holder["current"],
+            "needs_lead_seq": needs_lead_holder["seq"],
+            "box_state": box_state_holder["v"],
+            "box_queued_at": box_queued_at_holder["v"],
+            "evidence": evidence_holder["v"],
+            "advisor_calls": advisor_calls_holder["v"],
         }
         for k, v in list(st.items()):
             if isinstance(v, str):
@@ -2702,6 +3244,19 @@ def cmd_run(lane_id):
         head, commits = git_snapshot()
         ended = now_iso()
         prev = load_json(state_path, {}) or {}
+        if status == "done":
+            try:
+                _br = get_git_branch(cwd) if cwd and os.path.isdir(cwd) else None
+            except Exception:
+                _br = None
+            try:
+                ev = build_evidence(ldir, lane, {"head_start": head_start},
+                                    head, commits, branch=_br)
+            except Exception:
+                ev = None
+            evidence_holder["v"] = ev
+        else:
+            evidence_holder["v"] = None
         final = {
             "status": status,
             "step": int(step),
@@ -2729,6 +3284,12 @@ def cmd_run(lane_id):
             "review_rounds": review_rounds_done,
             "review_error": review_error_holder["v"],
             "consults": consults_done,
+            "needs_lead": needs_lead_holder["current"],
+            "needs_lead_seq": needs_lead_holder["seq"],
+            "box_state": box_state_holder["v"],
+            "box_queued_at": box_queued_at_holder["v"],
+            "evidence": evidence_holder["v"],
+            "advisor_calls": advisor_calls_holder["v"],
         }
         # Summary BEFORE terminal state on every exit path.
         try:
@@ -3371,6 +3932,23 @@ def cmd_run(lane_id):
             # Should be unreachable (gave_up returns), but guard anyway.
             return finish_terminal("gave_up", k, MAX_ATTEMPTS, last_reason or "out of attempts",
                                    accept_exit, current_last_event, "")
+        if lane_scope:
+            try:
+                violating = scope_violating_paths(cwd, head_start, lane_scope)
+            except Exception as e:
+                slog("scope check failed: %s" % e)
+                violating = []
+            if violating:
+                detail = ", ".join(violating)[:SCOPE_DETAIL_CAP]
+                raise_needs_lead("scope_violation", detail, step=k)
+                reason = "scope violation: %s" % detail
+                last_reason = redact_text(reason, secrets)
+                try:
+                    _tail = tail_final
+                except NameError:
+                    _tail = ""
+                return finish_terminal("failed", k, n, last_reason,
+                                       accept_exit, current_last_event, _tail)
         return ("ok",)
 
     # ---- acceptance ----
@@ -3430,6 +4008,10 @@ def cmd_run(lane_id):
                 atomic_write_text(accept_log, reason + "\n")
             except OSError:
                 pass
+            _map = lane_config.get("accept_exit_kinds") or {}
+            _m127 = _map.get("127", _map.get(127)) if isinstance(_map, dict) else None
+            _k127 = _m127 if _m127 in ACCEPT_MAPPABLE_KINDS else "accept_failed_code"
+            raise_needs_lead(_k127, reason, step=steps)
             return ("finished", finish_terminal("failed", steps, last_att0, reason, 127,
                                                 current_last_event, ""))
         try:
@@ -3446,6 +4028,10 @@ def cmd_run(lane_id):
                 atomic_write_text(accept_log, reason + "\n")
             except OSError:
                 pass
+            _map = lane_config.get("accept_exit_kinds") or {}
+            _m127 = _map.get("127", _map.get(127)) if isinstance(_map, dict) else None
+            _k127 = _m127 if _m127 in ACCEPT_MAPPABLE_KINDS else "accept_failed_code"
+            raise_needs_lead(_k127, reason, step=steps)
             return ("finished", finish_terminal("failed", steps, last_att0, reason, 127,
                                                 current_last_event, ""))
         try:
@@ -3529,9 +4115,11 @@ def cmd_run(lane_id):
             alog_f.close()
         except Exception:
             pass
+        full_text = ""
         try:
             with open(accept_log, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.read().splitlines()
+            full_text = "\n".join(lines)
             atomic_write_text(accept_log, redact_text("\n".join(lines[-60:]) + ("\n" if lines else ""), secrets))
         except OSError:
             pass
@@ -3542,9 +4130,27 @@ def cmd_run(lane_id):
         except Exception:
             last_att = 1
         if timed_out:
+            last = parse_needs_lead_last(full_text)
+            if last is not None:
+                tk, td = accept_needs_lead_for_exit(124, full_text, lane_config)
+            else:
+                _map = lane_config.get("accept_exit_kinds") or {}
+                _m = _map.get("124", _map.get(124)) if isinstance(_map, dict) else None
+                tk = _m if _m in ACCEPT_MAPPABLE_KINDS else "accept_failed_code"
+                td = "accept timeout after 2h"
+            raise_needs_lead(tk, td, step=steps)
             return ("finished", finish_terminal("failed", steps, last_att,
                                                 "accept timeout after 2h", 124,
                                                 current_last_event, ""))
+        if accept_rc is not None and accept_rc != 0:
+            if not full_text:
+                try:
+                    with open(accept_log, "r", encoding="utf-8", errors="replace") as f:
+                        full_text = f.read()
+                except (FileNotFoundError, OSError):
+                    full_text = ""
+            ak, ad = accept_needs_lead_for_exit(accept_rc, full_text, lane_config)
+            raise_needs_lead(ak, ad, step=steps)
         return ("accept_done", accept_rc, last_att, "")
 
     def last_attempt_of_last_step():
@@ -3894,6 +4500,9 @@ def cmd_run(lane_id):
             return finish_terminal("done", steps, last_attempt_of_last_step(),
                                    last_reason, accept_exit, current_last_event, "")
         if rnd >= review_total:
+            _find = (rres[1] or "").strip()[:NEEDS_LEAD_DETAIL_CAP]
+            _det = _find or "pre-review FAILed with no fix re-runs left"
+            raise_needs_lead("review_failed", _det, step=steps)
             return finish_terminal("review_failed", steps, last_attempt_of_last_step(),
                                    "pre-review FAILed with no fix re-runs left",
                                    accept_exit, current_last_event, "")
@@ -3933,6 +4542,9 @@ def build_parser():
     ps.add_argument("--review-rounds", type=int, default=1, help="Max fix re-runs after a FAIL review (default: 1; 0 reviews once with no fix).")
     ps.add_argument("--consult-max", type=int, default=3, help="Max consult answers per step, 0 disables (default: 3).")
     ps.add_argument("--consult-timeout-min", type=float, default=15.0, help="Consult helper timeout in minutes (default: 15).")
+    ps.add_argument("--scope", dest="scope", action="append", default=None,
+                    help="Allowed path glob for changed files (repeatable; fnmatch, ** allowed).")
+    ps.add_argument("--box", default=None, help="Box name for the box queue (stored; queue lands in step C).")
     pr = sub.add_parser("_run", help="Run the supervisor (internal).")
     pr.add_argument("id", help="Lane id.")
     pt = sub.add_parser("status", help="Show lane status.")
@@ -3953,6 +4565,12 @@ def build_parser():
     pa.add_argument("id", help="Lane id.")
     pa.add_argument("--orphan", action="store_true",
                     help="Claim the orphan announcement for the current incarnation.")
+    pa.add_argument("--lead", default=None,
+                    help="Claim the needs-lead announcement for this seq.")
+    pw = sub.add_parser("answer", help="Reply to a lane (writes .lane/ANSWER.md).")
+    pw.add_argument("id", help="Lane id.")
+    pw.add_argument("--text", default=None, help="Reply text.")
+    pw.add_argument("--text-file", default=None, help="File containing reply text.")
     return p
 
 
@@ -3980,6 +4598,8 @@ def main(argv=None):
         return cmd_root(args)
     if args.cmd == "ack":
         return cmd_ack(args)
+    if args.cmd == "answer":
+        return cmd_answer(args)
     parser.print_help()
     return 2
 

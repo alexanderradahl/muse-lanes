@@ -345,6 +345,10 @@ class LaneBase(unittest.TestCase):
             cmd += ["--consult-max", str(kwargs["consult_max"])]
         if kwargs.get("consult_timeout_min") is not None:
             cmd += ["--consult-timeout-min", str(kwargs["consult_timeout_min"])]
+        for sc in (kwargs.get("scope") or []):
+            cmd += ["--scope", sc]
+        if kwargs.get("box"):
+            cmd += ["--box", kwargs["box"]]
         r = self.run_lane(*cmd, env_extra=env_extra)
         self.assertEqual(r.returncode, 0, "start failed: %s %s" % (r.stdout, r.stderr))
         lid = r.stdout.strip().splitlines()[-1].strip()
@@ -358,6 +362,33 @@ class LaneBase(unittest.TestCase):
     def read_state(self, lid):
         with open(self.lane_path(lid, "state.json")) as f:
             return json.load(f)
+
+    def read_lane(self, lid):
+        with open(self.lane_path(lid, "lane.json")) as f:
+            return json.load(f)
+
+    def status_obj(self, lid):
+        r = self.run_lane("status", lid, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)[0]
+
+    def init_git_repo(self):
+        subprocess.run(["git", "init"], cwd=self.cwd, capture_output=True,
+                       timeout=15, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=self.cwd,
+                       capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=self.cwd,
+                       capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=self.cwd,
+                       capture_output=True, timeout=15)
+        subprocess.run(["git", "config", "init.defaultBranch", "main"], cwd=self.cwd,
+                       capture_output=True, timeout=15)
+        with open(os.path.join(self.cwd, "seed.txt"), "w") as f:
+            f.write("seed\n")
+        subprocess.run(["git", "add", "."], cwd=self.cwd, capture_output=True,
+                       timeout=15, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.cwd,
+                       capture_output=True, timeout=15, check=True)
 
     def wait_status(self, lid, want, timeout=30):
         if isinstance(want, str):
@@ -2172,9 +2203,20 @@ class TestStatusActiveCost(LaneBase):
         self.assertIn(live_id, by_id)
         self.assertEqual(by_id[live_id]["status"], "running")
         self.assertEqual(by_id[live_id]["last_subject"], "shim-subject-line")
+        self.assertEqual(by_id[live_id]["branch"], "shim-subject-line")
+        self.assertEqual(by_id[live_id]["head"], "shim-subject-line")
         for rid in recent_ids:
             self.assertIn(rid, by_id)
             self.assertIsNone(by_id[rid]["last_subject"], rid)
+            self.assertIsNone(by_id[rid]["branch"], rid)
+            self.assertIsNone(by_id[rid]["head"], rid)
+            self.assertIsNone(by_id[rid]["needs_lead"], rid)
+            self.assertIs(by_id[rid]["needs_lead_announced"], False, rid)
+            self.assertIsNone(by_id[rid]["box"], rid)
+            self.assertIsNone(by_id[rid]["box_state"], rid)
+            self.assertIsNone(by_id[rid]["box_queued_at"], rid)
+            self.assertIsNone(by_id[rid]["evidence"], rid)
+            self.assertEqual(by_id[rid]["advisor_calls"], 0, rid)
         for oid in old_ids:
             self.assertNotIn(oid, by_id)
         try:
@@ -2182,12 +2224,17 @@ class TestStatusActiveCost(LaneBase):
                 calls = [l for l in f.read().splitlines() if l.strip()]
         except FileNotFoundError:
             calls = []
-        self.assertEqual(len(calls), 1,
-                         "status --active ran git %d times, want at most 1: %s"
+        # Live lane: branch + head + subject. Ended lanes: no git at all.
+        self.assertEqual(len(calls), 3,
+                         "status --active ran git %d times, want 3 live-only: %s"
                          % (len(calls), calls[:5]))
-        self.assertIn(" log ", " " + calls[0] + " ")
-        got_pwd = calls[0].split(" :: ")[0]
-        self.assertEqual(os.path.realpath(got_pwd), os.path.realpath(live_cwd))
+        for c in calls:
+            got_pwd = c.split(" :: ")[0]
+            self.assertEqual(os.path.realpath(got_pwd), os.path.realpath(live_cwd), c)
+        joined = " ".join(calls)
+        self.assertIn("branch", joined)
+        self.assertIn("rev-parse", joined)
+        self.assertIn(" log ", " " + joined + " ")
 
 
 class TestSandboxNetworkArgv(LaneBase):
@@ -2207,6 +2254,436 @@ class TestSandboxNetworkArgv(LaneBase):
         self.assertLess(argv.index("--json"), argv.index("--sandbox-network"))
         i = argv.index("--sandbox-network")
         self.assertEqual(argv[i + 1], "restricted")
+
+
+class TestConfigLoading(LaneBase):
+    def test_defaults_copied_when_no_config(self):
+        b = self.write_brief("b1.md", "config defaults work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"})
+        lane = self.read_lane(lid)
+        cfg = lane.get("config")
+        self.assertIsInstance(cfg, dict)
+        self.assertEqual(cfg.get("accept_exit_kinds"), {})
+        self.assertEqual(cfg.get("box_wait_max_min"), 30)
+        self.assertIsNone(lane.get("box"))
+        self.assertEqual(lane.get("scope"), [])
+        self.wait_status(lid, "done", timeout=20)
+
+    def test_env_config_copied_and_unknown_keys_ignored(self):
+        cfg_path = os.path.join(self.root, "lanes-config.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"accept_exit_kinds": {"5": "accept_failed_harness"},
+                       "box_wait_max_min": 7,
+                       "nope_unknown_key": 123}, f)
+        b = self.write_brief("b1.md", "env config work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "MUSE_LANES_CONFIG": cfg_path})
+        cfg = self.read_lane(lid).get("config")
+        self.assertEqual(cfg.get("accept_exit_kinds"), {"5": "accept_failed_harness"})
+        self.assertEqual(cfg.get("box_wait_max_min"), 7)
+        self.assertNotIn("nope_unknown_key", cfg)
+        self.wait_status(lid, "done", timeout=20)
+
+    def test_root_config_used_and_env_wins(self):
+        root_cfg = os.path.join(self.lanes, "config.json")
+        with open(root_cfg, "w") as f:
+            json.dump({"box_wait_max_min": 11}, f)
+        b = self.write_brief("b1.md", "root config work")
+        lid1 = self.start_lane([b], env_extra={"FAKE_MODE": "complete"})
+        self.assertEqual(self.read_lane(lid1)["config"]["box_wait_max_min"], 11)
+        self.wait_status(lid1, "done", timeout=20)
+        env_cfg = os.path.join(self.root, "env-config.json")
+        with open(env_cfg, "w") as f:
+            json.dump({"box_wait_max_min": 22}, f)
+        lid2 = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                               "MUSE_LANES_CONFIG": env_cfg})
+        self.assertEqual(self.read_lane(lid2)["config"]["box_wait_max_min"], 22)
+        self.wait_status(lid2, "done", timeout=20)
+
+    def test_malformed_key_is_start_error_naming_key(self):
+        cfg_path = os.path.join(self.root, "bad-config.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"box_wait_max_min": "soon"}, f)
+        b = self.write_brief("b1.md", "bad config work")
+        r = self.run_lane("start", "--cwd", self.cwd, "--brief", b,
+                          env_extra={"MUSE_LANES_CONFIG": cfg_path})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("box_wait_max_min", r.stderr)
+        cfg2 = os.path.join(self.root, "bad-config2.json")
+        with open(cfg2, "w") as f:
+            json.dump({"accept_exit_kinds": {"1": "frobnicate"}}, f)
+        r2 = self.run_lane("start", "--cwd", self.cwd, "--brief", b,
+                           env_extra={"MUSE_LANES_CONFIG": cfg2})
+        self.assertNotEqual(r2.returncode, 0)
+        self.assertIn("accept_exit_kinds", r2.stderr)
+
+    def test_malformed_json_is_start_error(self):
+        cfg_path = os.path.join(self.root, "broken.json")
+        with open(cfg_path, "w") as f:
+            f.write("{not json")
+        b = self.write_brief("b1.md", "broken config work")
+        r = self.run_lane("start", "--cwd", self.cwd, "--brief", b,
+                          env_extra={"MUSE_LANES_CONFIG": cfg_path})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("config", r.stderr.lower())
+
+    def test_running_lane_keeps_config_snapshot(self):
+        cfg_path = os.path.join(self.root, "snap-config.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"box_wait_max_min": 9}, f)
+        b = self.write_brief("b1.md", "snapshot work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "MUSE_LANES_CONFIG": cfg_path})
+        with open(cfg_path, "w") as f:
+            json.dump({"box_wait_max_min": 99}, f)
+        self.assertEqual(self.read_lane(lid)["config"]["box_wait_max_min"], 9)
+        self.wait_status(lid, "done", timeout=20)
+
+
+class TestAcceptExitMapping(LaneBase):
+    def _cfg(self, mapping):
+        p = os.path.join(self.root, "cfg-%d.json" % time.time_ns())
+        with open(p, "w") as f:
+            json.dump({"accept_exit_kinds": mapping}, f)
+        return p
+
+    def test_exit_5_maps_to_harness(self):
+        cfg = self._cfg({"5": "accept_failed_harness"})
+        b = self.write_brief("b1.md", "harness map work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "MUSE_LANES_CONFIG": cfg},
+                              accept="exit 5")
+        st = self.wait_status(lid, "failed", timeout=20)
+        nl = st.get("needs_lead")
+        self.assertIsNotNone(nl)
+        self.assertEqual(nl.get("kind"), "accept_failed_harness")
+        self.assertEqual(nl.get("seq"), 1)
+        self.assertIn("accept exit 5", nl.get("detail") or "")
+        o = self.status_obj(lid)
+        self.assertEqual(o["needs_lead"]["kind"], "accept_failed_harness")
+        self.assertIs(o["needs_lead_announced"], False)
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("NEEDS LEAD", summ)
+        self.assertIn("accept_failed_harness", summ)
+
+    def test_exit_6_maps_to_box_wait_timeout_failed(self):
+        cfg = self._cfg({"6": "box_wait_timeout"})
+        b = self.write_brief("b1.md", "box timeout map work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "MUSE_LANES_CONFIG": cfg},
+                              accept="exit 6")
+        st = self.wait_status(lid, "failed", timeout=20)
+        self.assertEqual(st["needs_lead"]["kind"], "box_wait_timeout")
+        self.assertEqual(st["needs_lead"]["seq"], 1)
+
+    def test_unmapped_exit_is_code(self):
+        b = self.write_brief("b1.md", "code default work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              accept="exit 1")
+        st = self.wait_status(lid, "failed", timeout=20)
+        self.assertEqual(st["needs_lead"]["kind"], "accept_failed_code")
+        self.assertIn("accept exit 1", st["needs_lead"]["detail"])
+
+
+class TestNeedsLeadLine(LaneBase):
+    def test_line_wins_over_exit_code(self):
+        b = self.write_brief("b1.md", "line wins work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "complete"},
+            accept="echo 'LANE-NEEDS-LEAD: accept_failed_harness gate exploded'; exit 1")
+        st = self.wait_status(lid, "failed", timeout=20)
+        self.assertEqual(st["needs_lead"]["kind"], "accept_failed_harness")
+        self.assertIn("gate exploded", st["needs_lead"]["detail"])
+        self.assertNotIn("accept exit 1", st["needs_lead"]["detail"])
+
+    def test_last_line_wins(self):
+        b = self.write_brief("b1.md", "last wins work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "complete"},
+            accept="echo 'LANE-NEEDS-LEAD: accept_failed_harness first'; "
+                   "echo 'LANE-NEEDS-LEAD: box_wait_timeout still queued'; exit 1")
+        st = self.wait_status(lid, "failed", timeout=20)
+        self.assertEqual(st["needs_lead"]["kind"], "box_wait_timeout")
+        self.assertIn("still queued", st["needs_lead"]["detail"])
+
+    def test_unknown_kind_becomes_code_with_raw_line(self):
+        b = self.write_brief("b1.md", "unknown kind work")
+        lid = self.start_lane(
+            [b], env_extra={"FAKE_MODE": "complete"},
+            accept="echo 'LANE-NEEDS-LEAD: frobnicate oops'; exit 1")
+        st = self.wait_status(lid, "failed", timeout=20)
+        self.assertEqual(st["needs_lead"]["kind"], "accept_failed_code")
+        self.assertIn("LANE-NEEDS-LEAD: frobnicate oops", st["needs_lead"]["detail"])
+
+
+class TestScopeViolation(LaneBase):
+    def test_violation_ends_failed_with_paths(self):
+        self.init_git_repo()
+        with open(os.path.join(self.cwd, "evil.txt"), "w") as f:
+            f.write("outside\n")
+        b = self.write_brief("b1.md", "scope violation work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              scope=["allowed/*"])
+        self.assertEqual(self.read_lane(lid).get("scope"), ["allowed/*"])
+        st = self.wait_status(lid, "failed", timeout=20)
+        self.assertEqual(st["needs_lead"]["kind"], "scope_violation")
+        self.assertEqual(st["needs_lead"]["seq"], 1)
+        self.assertIn("evil.txt", st["needs_lead"]["detail"])
+        self.assertIn("scope violation", (st.get("reason") or "").lower())
+        with open(self.lane_path(lid, "summary.md")) as f:
+            self.assertIn("scope_violation", f.read())
+
+    def test_allowed_paths_pass(self):
+        self.init_git_repo()
+        os.makedirs(os.path.join(self.cwd, "allowed"), exist_ok=True)
+        with open(os.path.join(self.cwd, "allowed", "ok.txt"), "w") as f:
+            f.write("inside\n")
+        b = self.write_brief("b1.md", "scope pass work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              scope=["allowed/*", "seed.txt"])
+        self.wait_status(lid, "done", timeout=20)
+        self.assertIsNone(self.read_state(lid).get("needs_lead"))
+
+    def test_no_scope_no_check(self):
+        self.init_git_repo()
+        with open(os.path.join(self.cwd, "evil.txt"), "w") as f:
+            f.write("outside but unchecked\n")
+        b = self.write_brief("b1.md", "no scope work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"})
+        self.wait_status(lid, "done", timeout=20)
+        self.assertIsNone(self.read_state(lid).get("needs_lead"))
+
+    def test_committed_change_is_checked(self):
+        self.init_git_repo()
+        b = self.write_brief("b1.md", "committed scope work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "gitcommit"},
+                              scope=["allowed/*"])
+        st = self.wait_status(lid, "failed", timeout=25)
+        self.assertEqual(st["needs_lead"]["kind"], "scope_violation")
+        self.assertIn("lane-made.txt", st["needs_lead"]["detail"])
+
+    def test_double_star_matches_nested(self):
+        self.init_git_repo()
+        os.makedirs(os.path.join(self.cwd, "src", "sub"), exist_ok=True)
+        with open(os.path.join(self.cwd, "src", "sub", "b.py"), "w") as f:
+            f.write("x=1\n")
+        b = self.write_brief("b1.md", "globstar work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              scope=["src/**", "seed.txt"])
+        self.wait_status(lid, "done", timeout=20)
+        self.assertIsNone(self.read_state(lid).get("needs_lead"))
+
+
+class TestAckLead(LaneBase):
+    def test_ack_lead_exactly_once(self):
+        b = self.write_brief("b1.md", "ack lead work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              accept="exit 1")
+        self.wait_status(lid, "failed", timeout=20)
+        o = self.status_obj(lid)
+        self.assertEqual(o["needs_lead"]["seq"], 1)
+        self.assertIs(o["needs_lead_announced"], False)
+        a1 = self.run_lane("ack", lid, "--lead", "1")
+        self.assertEqual(a1.returncode, 0, a1.stderr)
+        self.assertTrue(os.path.exists(self.lane_path(lid, "announced-lead-1")))
+        self.assertIs(self.status_obj(lid)["needs_lead_announced"], True)
+        a2 = self.run_lane("ack", lid, "--lead", "1")
+        self.assertEqual(a2.returncode, 3)
+        a3 = self.run_lane("ack", lid, "--lead", "2")
+        self.assertEqual(a3.returncode, 2)
+
+    def test_ack_lead_without_needs_lead_refuses(self):
+        b = self.write_brief("b1.md", "ack lead none work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"})
+        self.wait_status(lid, "done", timeout=20)
+        r = self.run_lane("ack", lid, "--lead", "1")
+        self.assertEqual(r.returncode, 2)
+
+
+class TestAnswerLead(LaneBase):
+    def _mk_live_lane(self, lid, needs_lead):
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        ldir = os.path.join(self.lanes, lid)
+        os.makedirs(ldir, exist_ok=True)
+        lane = {"id": lid, "label": "L", "cwd": self.cwd, "briefs": ["b.md"],
+                "created_at": now, "owner_session": None, "stall_sec": 2400,
+                "env_file": None, "scope": [], "box": None,
+                "config": {"accept_exit_kinds": {}}}
+        state = {"status": "running", "step": 1, "steps": 1, "attempt": 1,
+                 "supervisor_pid": None, "supervisor_started": None,
+                 "muse_pid": None, "muse_started": None,
+                 "started_at": now, "updated_at": now,
+                 "last_activity_at": now, "last_event": None,
+                 "head_start": None, "head": None, "commits": 0,
+                 "stderr_tail": "", "accept_exit": None, "retry_at": None,
+                 "reason": None, "phase": "step:1", "phase_started": now,
+                 "review_rounds": [], "review_error": None, "consults": [],
+                 "needs_lead": needs_lead, "needs_lead_seq": 1,
+                 "box_state": None, "box_queued_at": None,
+                 "evidence": None, "advisor_calls": 0}
+        with open(os.path.join(ldir, "lane.json"), "w") as f:
+            json.dump(lane, f)
+        with open(os.path.join(ldir, "state.json"), "w") as f:
+            json.dump(state, f)
+        return ldir
+
+    def test_answer_clears_question_and_logs(self):
+        import datetime as _dt
+        nl = {"seq": 1, "kind": "question", "Detail": "ESCALATE: pick one",
+              "at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "step": 1}
+        lid = "lane-answer-q1"
+        self._mk_live_lane(lid, nl)
+        r = self.run_lane("answer", lid, "--text", "do the second thing")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.cwd, ".lane", "ANSWER.md")) as f:
+            self.assertIn("do the second thing", f.read())
+        with open(os.path.join(self.cwd, ".lane", "ANSWER-lead-1.md")) as f:
+            self.assertIn("do the second thing", f.read())
+        st = self.read_state(lid)
+        self.assertIsNone(st.get("needs_lead"))
+        self.assertEqual(st.get("needs_lead_seq"), 1)
+        last = (st.get("consults") or [])[-1]
+        self.assertEqual(last.get("by"), "lead")
+        self.assertIn("do the second thing", last.get("answer_preview") or "")
+
+    def test_answer_text_file(self):
+        import datetime as _dt
+        nl = {"seq": 4, "kind": "question", "Detail": "ESCALATE: which box",
+              "at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "step": 1}
+        lid = "lane-answer-file"
+        self._mk_live_lane(lid, nl)
+        with open(os.path.join(self.root, "reply.txt"), "w") as f:
+            f.write("use box seven")
+        r = self.run_lane("answer", lid, "--text-file",
+                          os.path.join(self.root, "reply.txt"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.cwd, ".lane", "ANSWER-lead-4.md")) as f:
+            self.assertIn("use box seven", f.read())
+        self.assertIsNone(self.read_state(lid).get("needs_lead"))
+
+    def test_answer_preserves_non_question(self):
+        import datetime as _dt
+        nl = {"seq": 2, "kind": "accept_failed_code", "Detail": "accept exit 1",
+              "at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "step": 1}
+        lid = "lane-answer-keep"
+        self._mk_live_lane(lid, nl)
+        r = self.run_lane("answer", lid, "--text", "noted")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        st = self.read_state(lid)
+        self.assertIsNotNone(st.get("needs_lead"))
+        self.assertEqual(st["needs_lead"]["kind"], "accept_failed_code")
+
+    def test_answer_refuses_ended_lane(self):
+        b = self.write_brief("b1.md", "answer ended work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"})
+        self.wait_status(lid, "done", timeout=20)
+        r = self.run_lane("answer", lid, "--text", "too late")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("ended", r.stderr.lower())
+
+
+class TestOldStateV03(LaneBase):
+    def test_old_state_without_v03_fields_lists(self):
+        b = self.write_brief("b1.md", "old v03 state work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              box="box-1")
+        self.wait_status(lid, "done", timeout=20)
+        sp = self.lane_path(lid, "state.json")
+        with open(sp) as f:
+            cur = json.load(f)
+        for k in ("needs_lead", "needs_lead_seq", "box_state", "box_queued_at",
+                  "evidence", "advisor_calls"):
+            cur.pop(k, None)
+        with open(sp, "w") as f:
+            json.dump(cur, f)
+        lp = self.lane_path(lid, "lane.json")
+        with open(lp) as f:
+            lane = json.load(f)
+        for k in ("config", "scope", "box"):
+            lane.pop(k, None)
+        with open(lp, "w") as f:
+            json.dump(lane, f)
+        o = self.status_obj(lid)
+        self.assertEqual(o["status"], "done")
+        self.assertIsNone(o["needs_lead"])
+        self.assertIs(o["needs_lead_announced"], False)
+        self.assertIsNone(o["box"])
+        self.assertIsNone(o["evidence"])
+        self.assertEqual(o["advisor_calls"], 0)
+        self.assertIsNone(o["branch"])
+        self.assertIsNone(o["head"])
+        r2 = self.run_lane("summary", lid)
+        self.assertEqual(r2.returncode, 0)
+
+
+class TestReviewFailedNeedsLead(LaneBase):
+    def test_review_fail_raises_needs_lead(self):
+        b = self.write_brief("b1.md", "review needs lead work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete",
+                                              "FAKE_REVIEW_VERDICT": "FAIL",
+                                              "FAKE_REVIEW_FINDINGS": "1. bad.py:1 must fix"},
+                              accept="exit 0", review=True, review_rounds=0)
+        st = self.wait_status(lid, "review_failed", timeout=25)
+        self.assertEqual(st["needs_lead"]["kind"], "review_failed")
+        self.assertEqual(st["needs_lead"]["seq"], 1)
+        self.assertIn("bad.py", st["needs_lead"]["detail"])
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("NEEDS LEAD", summ)
+        self.assertIn("review_failed", summ)
+
+
+class TestSummaryEvidence(LaneBase):
+    def test_ready_to_merge_and_evidence(self):
+        b = self.write_brief("b1.md", "ready merge work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              accept="exit 0")
+        self.wait_status(lid, "done", timeout=20)
+        o = self.status_obj(lid)
+        ev = o.get("evidence")
+        self.assertIsNotNone(ev)
+        for k in ("branch", "head", "head_start", "commits", "accept_log",
+                  "review_files", "summary_path"):
+            self.assertIn(k, ev)
+        self.assertIsInstance(ev["review_files"], list)
+        self.assertTrue(ev["summary_path"].endswith("summary.md"))
+        self.assertEqual(o["advisor_calls"], 0)
+        self.assertIsNone(o["needs_lead"])
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("READY TO MERGE", summ)
+        self.assertNotIn("NEEDS LEAD", summ)
+
+
+class TestStatusV03Fields(LaneBase):
+    def test_box_stored_and_shown(self):
+        b = self.write_brief("b1.md", "box field work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
+                              box="lab-box-2")
+        self.assertEqual(self.read_lane(lid).get("box"), "lab-box-2")
+        o = self.status_obj(lid)
+        self.assertEqual(o["box"], "lab-box-2")
+        self.assertIsNone(o["box_state"])
+        self.assertIsNone(o["box_queued_at"])
+        self.wait_status(lid, "done", timeout=20)
+
+    def test_branch_head_live_only(self):
+        self.init_git_repo()
+        b = self.write_brief("b1.md", "live branch work")
+        lid = self.start_lane([b], env_extra={"FAKE_MODE": "sleeper",
+                                              "FAKE_SLEEP": "60"})
+        self.wait_status(lid, {"running", "retry_wait"}, timeout=15)
+        o = self.status_obj(lid)
+        self.assertIsNotNone(o["head"])
+        self.assertIsNotNone(o["branch"])
+        r = self.run_lane("stop", lid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_status(lid, "stopped", timeout=20)
+        o2 = self.status_obj(lid)
+        self.assertIsNone(o2["branch"])
+        self.assertIsNone(o2["head"])
 
 
 if __name__ == "__main__":
