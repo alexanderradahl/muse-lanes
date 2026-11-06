@@ -347,8 +347,7 @@ def box_older_live_tickets(box, my_name, my_lane_id, root=None):
             break
         if lid == my_lane_id:
             continue
-        if box_ticket_owner_alive(lid):
-            older.append(fn)
+        older.append(fn)
     return older
 
 
