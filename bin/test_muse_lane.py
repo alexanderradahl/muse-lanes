@@ -1651,6 +1651,20 @@ class TestAckExclusive(LaneBase):
 class TestOrphanAckPerIncarnation(LaneBase):
     def _orphan(self, lid, timeout=15):
         st = self.wait_status(lid, {"running", "retry_wait"}, timeout=timeout)
+        # After a resume, state.json can still carry the previous (dead)
+        # incarnation's pid until the new supervisor's first write: wait
+        # for a live pid rather than killing a stale one.
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                os.kill(int(st.get("supervisor_pid")), 0)
+                break
+            except (OSError, TypeError, ValueError):
+                time.sleep(0.1)
+                try:
+                    st = self.read_state(lid)
+                except (FileNotFoundError, OSError, ValueError):
+                    pass
         os.kill(int(st["supervisor_pid"]), signal.SIGKILL)
         deadline = time.time() + 10
         while time.time() < deadline:
@@ -3488,7 +3502,7 @@ class TestAnswerBox(LaneBase):
         ts = os.path.join(self.state_dir, "accept-times3.log")
         b = self.write_brief("b1.md", "box move live work")
         lid1 = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
-                               accept="sleep 10", box="box-m1")
+                               accept="sleep 30", box="box-m1")
         self.wait_state_field(lid1, "box_state", "held", timeout=15)
         lid2 = self.start_lane(
             [b], env_extra={"FAKE_MODE": "complete",
@@ -3710,7 +3724,7 @@ class TestAnswerBoxHeld(LaneBase):
         ts = os.path.join(self.state_dir, "accept-held.log")
         b = self.write_brief("b1.md", "held clears work")
         lid1 = self.start_lane([b], env_extra={"FAKE_MODE": "complete"},
-                               accept="sleep 5", box="box-hc1")
+                               accept="sleep 15", box="box-hc1")
         self.wait_state_field(lid1, "box_state", "held", timeout=15)
         lid2 = self.start_lane(
             [b], env_extra={"FAKE_MODE": "complete",
@@ -3747,6 +3761,10 @@ class TestAdvisorToolsRefusal(LaneBase):
         self.assertIsNone(f(None))
         self.assertIsNone(f([]))
         self.assertIsNone(f(list(mod.DEFAULT_ADVISOR_CMD)))
+        default = list(mod.DEFAULT_ADVISOR_CMD)
+        self.assertIn("--tools", default)
+        self.assertEqual(default[default.index("--tools") + 1],
+                         "Read,Grep,Glob")
         self.assertIsNone(f(["claude", "-p", "--model", "x"]))
         self.assertIsNone(f(["claude", "--tools"]))
         self.assertIsNone(f(["claude", "--tools", "Read,Grep,Glob"]))
@@ -4068,7 +4086,7 @@ class TestBoxNameValidation(LaneBase):
     def test_answer_rejects_bad_names(self):
         lid = "lane-badbox"
         self._mk_lane(lid)
-        for bad in (".", "..", "a/b"):
+        for bad in (".", "..", "a/b", ""):
             r = self.run_lane("answer", lid, "--box", bad)
             self.assertNotEqual(r.returncode, 0, repr(bad))
             self.assertIn("invalid", r.stderr.lower())

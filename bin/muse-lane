@@ -75,7 +75,7 @@ ADVISOR_FORBIDDEN_TOOLS = ("Bash", "Edit", "Write", "NotebookEdit")
 BOXES_DIR = "_boxes"
 LEAD_SIDECAR_PREFIX = "lead-"
 LEAD_SIDECAR_SUFFIX = ".json"
-LEAD_SIDECAR_MERGED_SUFFIX = ".json.merged"
+LEAD_SIDECAR_MERGED_SUFFIX = ".merged"
 
 
 def lanes_root():
@@ -3854,7 +3854,7 @@ def cmd_run(lane_id):
                         slog("merged lead box move to %s" % payload.get("box"))
             finally:
                 try:
-                    os.rename(path, path + ".merged")
+                    os.rename(path, path + LEAD_SIDECAR_MERGED_SUFFIX)
                 except OSError:
                     pass
     # Resume past a passed accept goes straight to review: all step finals are
