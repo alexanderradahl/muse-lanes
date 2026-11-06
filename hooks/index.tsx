@@ -1,9 +1,10 @@
 // Muse lanes: tools to start/inspect/stop supervised `muse exec` runs, a pane listing them, and wake-ups when a lane needs the lead.
 // Refuses to supervise anything itself: bin/muse-lane owns retries, stalls, acceptance, box tickets and needs-lead facts, and survives this session.
 // Wake-ups are exactly-once across sessions: the runner records owner_session per lane, and `ack` claims each announcement.
-// Claimed events wait in an outbox ($.state, so a reload keeps them) until one prompt carries them: a single event
-// verbatim, several as a digest. The submit is never awaited (it resolves only when the turn starts) and a dropped
-// one stays in the outbox for the next poll. Routine progress never wakes.
+// An event enters the outbox ($.state, so a reload keeps it) before the runner's ack claims it, and leaves it
+// when one prompt carries it: a single event verbatim, several as a digest. The submit is never awaited (it
+// resolves only when the turn starts); a dropped one goes back to the outbox, retried after a growing pause.
+// Routine progress never wakes.
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
@@ -19,11 +20,14 @@ const outboxRef = atom({ plugin: 'muse', key: 'outbox' } as const, [] as Wake[])
 const triesRef = atom({ plugin: 'muse', key: 'summaryTries' } as const, {} as Record<string, number>)
 const TERMINAL = new Set(['done', 'failed', 'gave_up', 'stopped', 'review_failed'])
 const WORK = new Set(['running', 'retry_wait', 'accepting'])
+const LIVE = new Set(['queued', ...WORK])
 const POLL_MS = 20_000
 const SUMMARY_TRIES = 3
 const DETAIL_LINES = 40
 let pollInFlight = false
 let submitting = false
+let drops = 0
+let retryAt = 0
 
 const TOOLS = [
   {
@@ -107,6 +111,7 @@ async function sessionId($: any): Promise<string> {
 
 const name = (l: Lane) => l.label || l.id
 const isWorking = (l: Lane) => WORK.has(l.status)
+const isLive = (l: Lane) => LIVE.has(l.status)
 // A lane wants the lead while it is live with an open needs-lead fact, or after it ended any way but done.
 const wantsLead = (l: Lane) =>
   (!TERMINAL.has(l.status) && !!l.needs_lead) || l.status === 'orphaned' || (TERMINAL.has(l.status) && l.status !== 'done' && l.status !== 'stopped')
@@ -143,25 +148,49 @@ function digestBlock(l: Lane, kind: Wake['kind']): string {
 
 function wake(l: Lane, kind: Wake['kind'], full: string): Wake {
   const seq = kind === 'lead' ? l.needs_lead!.seq : 0
-  return { key: `${l.id}:${kind}:${seq}`, id: l.id, kind, full, block: digestBlock(l, kind), loud: kind !== 'end' || l.status !== 'done' }
+  return { key: `${l.id}:${kind}:${seq}`, id: l.id, kind, full, block: digestBlock(l, kind), loud: kind !== 'end' || (l.status !== 'done' && l.status !== 'stopped') }
 }
 
-// Hands the outbox to one prompt unless one is already on its way. Delivered entries leave the outbox when the
-// turn starts; a drop (an interrupt, a hook's refusal) leaves them for the next poll, never an immediate retry.
+// Hands the outbox to one prompt unless one is already on its way. Entries leave the outbox as the prompt is
+// queued, so a reload while it waits for its turn never sends them twice. A drop (an interrupt, a hook's refusal)
+// puts them back, retried no sooner than 20 s, doubling to 10 min while drops repeat.
 async function flush($: any) {
   if (submitting) return
-  const box = ((await read($, outboxRef)) as Wake[] | undefined) ?? []
+  if (retryAt && (await $.clock.now()) < retryAt) return
+  let box: Wake[] = []
+  await update($, outboxRef, o => {
+    box = o
+    return []
+  })
   if (box.length === 0) return
   submitting = true
-  const sent = new Set(box.map(w => w.key))
   const text =
     box.length === 1
       ? box[0]!.full
       : [`Muse: ${box.length} lane events.`, ...box.map(w => w.block), 'Full text: lane_summary <id>.'].join('\n\n')
-  void Promise.resolve($.prompt.submit({ text }))
-    .then((r: any) => (r && r.drop ? undefined : update($, outboxRef, o => o.filter(w => !sent.has(w.key)))))
+  const putBack = async () => {
+    drops += 1
+    retryAt = (await $.clock.now()) + Math.min(20_000 * 2 ** (drops - 1), 600_000)
+    await update($, outboxRef, o => [...box.filter(w => !o.some(x => x.key === w.key)), ...o])
+  }
+  void Promise.resolve()
+    .then(() => $.prompt.submit({ text }))
+    .then(async (r: any) => {
+      if (r && r.drop) return putBack()
+      drops = 0
+      retryAt = 0
+    }, putBack)
     .catch(() => undefined)
     .finally(() => { submitting = false })
+}
+
+// Queues an event, then claims it with the runner's ack. A reload between the two leaves it queued and unclaimed,
+// so the next poll claims it again under the same key; an ack someone else won takes it back out.
+async function claim($: any, w: Wake, ackArgs: string[]): Promise<number> {
+  await update($, outboxRef, o => (o.some(x => x.key === w.key) ? o : [...o, w]))
+  const a = await lane($, ackArgs)
+  if (a.code !== 0) await update($, outboxRef, o => o.filter(x => x.key !== w.key))
+  return a.code
 }
 
 async function poll($: any) {
@@ -204,14 +233,14 @@ async function poll($: any) {
     for (const l of mine) {
       if (l.status === 'orphaned') {
         if (l.orphan_announced) continue
-        if ((await lane($, ['ack', l.id, '--orphan'])).code !== 0) continue
-        wakes.push(wake(l, 'orphan', `Muse lane ${name(l)} (${l.id}) is orphaned: the supervisor died; \`lane_resume\` continues from the recorded step. Still watching for its terminal state.`))
+        const w = wake(l, 'orphan', `Muse lane ${name(l)} (${l.id}) is orphaned: the supervisor died; \`lane_resume\` continues from the recorded step. Still watching for its terminal state.`)
+        if ((await claim($, w, ['ack', l.id, '--orphan'])) === 0) wakes.push(w)
         continue
       }
       if (!TERMINAL.has(l.status)) {
         if (!l.needs_lead || l.needs_lead_announced) continue
-        if ((await lane($, ['ack', l.id, '--lead', String(l.needs_lead.seq)])).code !== 0) continue
-        wakes.push(wake(l, 'lead', needsLeadText(l)))
+        const w = wake(l, 'lead', needsLeadText(l))
+        if ((await claim($, w, ['ack', l.id, '--lead', String(l.needs_lead.seq)])) === 0) wakes.push(w)
         continue
       }
       if (l.announced) continue
@@ -228,9 +257,10 @@ async function poll($: any) {
         }
         text = (await lane($, ['status', l.id])).out
       }
-      const a = await lane($, ['ack', l.id])
-      if (a.code !== 0) {
-        if (a.code === 3 && l.id in tries) {
+      const w = wake(l, 'end', `Muse lane ${name(l)} (${l.id}) ended: ${l.status}.\n\n${text}`)
+      const code = await claim($, w, ['ack', l.id])
+      if (code !== 0) {
+        if (code === 3 && l.id in tries) {
           delete tries[l.id]
           triesDirty = true
         }
@@ -240,11 +270,10 @@ async function poll($: any) {
         delete tries[l.id]
         triesDirty = true
       }
-      wakes.push(wake(l, 'end', `Muse lane ${name(l)} (${l.id}) ended: ${l.status}.\n\n${text}`))
+      wakes.push(w)
     }
     if (triesDirty) await $.state.set({ plugin: 'muse', key: 'summaryTries' }, tries)
     if (wakes.length > 0) {
-      await update($, outboxRef, o => [...o, ...wakes.filter(w => !o.some(x => x.key === w.key))])
       const loud = wakes.filter(w => w.loud)
       const what = (w: Wake) => {
         const l = list.find(x => x.id === w.id)!
@@ -312,7 +341,7 @@ export const register: Register = (on, options) => {
       args.push('--brief', path)
     }
     if (e.label) args.push('--label', e.label)
-    if (e.accept) args.push('--accept', e.accept)
+    if (e.accept) args.push(`--accept=${e.accept}`)
     if (e.stall_min) args.push('--stall-min', String(e.stall_min))
     if (e.review === true) {
       args.push('--review')
@@ -347,7 +376,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__muse__lane_answer' }, async ($, e: any) => {
     if (!e.text && !e.box) return { result: 'lane_answer needs text, box, or both.', isError: true as const }
     const args = ['answer', e.id]
-    if (e.text) args.push('--text', String(e.text))
+    if (e.text) args.push(`--text=${String(e.text)}`)
     if (e.box) args.push('--box', String(e.box))
     return answer($, args)
   })
@@ -372,11 +401,11 @@ export const register: Register = (on, options) => {
       return `${Math.floor(sec / 3600)}h ${Math.round((sec % 3600) / 60)}m`
     }
     // Flagged until the lead has been woken for it; an ended lane drops to the bottom once announced.
-    const hot = (l: Lane) => wantsLead(l) && !(TERMINAL.has(l.status) && l.announced)
-    const rank = (l: Lane) => (hot(l) ? 0 : isWorking(l) ? (l.owner_session === me ? 1 : 2) : l.status === 'done' ? 3 : 4)
+    const isHot = (l: Lane) => wantsLead(l) && !(TERMINAL.has(l.status) && l.announced)
+    const rank = (l: Lane) => (isHot(l) ? 0 : isLive(l) ? (l.owner_session === me ? 1 : 2) : l.status === 'done' ? 3 : 4)
     const ordered = [...list].sort((a, b) => rank(a) - rank(b))
-    const running = list.filter(isWorking).length
-    const need = list.filter(hot).length
+    const running = list.filter(isLive).length
+    const need = list.filter(isHot).length
     const ready = list.filter(l => l.status === 'done' && l.evidence).length
 
     const review = (l: Lane) => {
@@ -386,33 +415,36 @@ export const register: Register = (on, options) => {
       const last = rounds[rounds.length - 1]!
       return `review ${last.verdict ?? '?'} r${last.round ?? rounds.length}`
     }
-    const line1 = (l: Lane) => {
+    // Row: the toggle names the lane (the Desktop app draws only a Button's label), then where it is now.
+    const now1 = (l: Lane) => {
       const done = TERMINAL.has(l.status)
-      const end = done ? ts(l.updated_at) : now
-      const bits = [`${hot(l) ? '!' : ' '} ${name(l)}`, l.status]
+      const bits = [l.status]
       if (l.phase) {
-        const el = dur(end - ts(l.phase_started))
+        const el = dur((done ? ts(l.updated_at) : now) - ts(l.phase_started))
         bits.push(`${l.phase}${el ? ` ${el}` : ''}`)
       }
-      if (l.box) bits.push(`box ${l.box}${l.box_state === 'queued' ? ' (queued)' : ''}`)
-      const total = dur(end - ts(l.started_at))
-      if (total) bits.push(`total ${total}`)
       if (!done) {
         const idleSec = now - ts(l.last_activity_at)
         if (Number.isFinite(idleSec) && idleSec >= 60) {
-          const hot = l.stall_sec ? idleSec > 0.75 * l.stall_sec : false
-          bits.push(`idle ${Math.round(idleSec / 60)}m${hot ? '!' : ''}`)
+          const nearStall = l.stall_sec ? idleSec > 0.75 * l.stall_sec : false
+          bits.push(`idle ${Math.round(idleSec / 60)}m${nearStall ? ' (near stall)' : ''}`)
         }
       }
-      const rv = review(l)
-      if (rv) bits.push(rv)
       return bits.join(' · ')
     }
+    // Second line: box, total time, pre-review, commits.
     const line2 = (l: Lane) => {
-      let s = `${l.commits ?? 0} commits`
-      if ((l.commits ?? 0) > 0 && l.last_subject) s += `: ${l.last_subject}`
-      if (l.branch) s += ` (${l.branch})`
-      return s
+      const bits: string[] = []
+      if (l.box) bits.push(`box ${l.box}${l.box_state === 'queued' ? ' (queued)' : ''}`)
+      const total = dur((TERMINAL.has(l.status) ? ts(l.updated_at) : now) - ts(l.started_at))
+      if (total) bits.push(`total ${total}`)
+      const rv = review(l)
+      if (rv) bits.push(rv)
+      let c = `${l.commits ?? 0} commits`
+      if ((l.commits ?? 0) > 0 && l.last_subject) c += `: ${l.last_subject}`
+      if (l.branch) c += ` (${l.branch})`
+      bits.push(c)
+      return bits.join(' · ')
     }
     const alert = (l: Lane): string | null => {
       if (l.needs_lead && l.status !== 'done') return `needs lead: ${l.needs_lead.kind}: ${l.needs_lead.detail}`
@@ -425,8 +457,11 @@ export const register: Register = (on, options) => {
       return null
     }
     const toggle = (l: Lane) => {
-      const open = !expanded[l.id]
-      void update($, expandedRef, x => ({ ...x, [l.id]: open })).then(() => (open ? loadDetail($, l) : undefined)).catch(() => undefined)
+      let opened = false
+      void update($, expandedRef, x => {
+        opened = !x[l.id]
+        return { ...x, [l.id]: opened }
+      }).then(() => (opened ? loadDetail($, l) : undefined)).catch(() => undefined)
     }
     const act = (args: string[]) => void lane($, args).then(() => kick($)).catch(() => undefined)
 
@@ -454,26 +489,29 @@ export const register: Register = (on, options) => {
           {ordered.length === 0 && <Text dimColor>No Muse lanes.</Text>}
           {ordered.slice(0, 30).map(l => {
             const done = TERMINAL.has(l.status)
+            const hot = isHot(l)
             const warn = alert(l)
             const open = !!expanded[l.id]
             return (
               <Box key={l.id} flexDirection="column" marginBottom={open ? 1 : 0}>
                 <Box flexDirection="row" gap={1}>
-                  <Button key={`row-${l.id}`} plain label={open ? '▾' : '▸'} onPress={() => toggle(l)} />
-                  <Text bold={!done} dimColor={done && !hot(l)} color={hot(l) ? 'warning' : undefined}>
-                    {line1(l)}
+                  <Button key={`row-${l.id}`} plain label={`${open ? '▾' : '▸'} ${hot ? '! ' : ''}${name(l)}`} onPress={() => toggle(l)} />
+                  <Text bold={!done} dimColor={done && !hot} color={hot ? 'warning' : undefined}>
+                    {now1(l)}
                   </Text>
                 </Box>
-                <Text dimColor>    {line2(l)}</Text>
-                {warn && <Text color="warning">    {warn}</Text>}
+                <Box flexDirection="column" marginLeft={2}>
+                  <Text dimColor>{line2(l)}</Text>
+                  {warn && <Text color="warning">{warn}</Text>}
+                </Box>
                 {open && (
-                  <Box flexDirection="column" marginLeft={4}>
+                  <Box flexDirection="column" marginLeft={2}>
                     {evidenceLines(l).map((s, i) => <Text key={`ev-${l.id}-${i}`} color="success">{s}</Text>)}
                     <Text dimColor>{details[l.id] ?? 'loading...'}</Text>
                     <Box flexDirection="row" gap={1}>
-                      {!done && l.status !== 'orphaned' && <Button key={`stop-${l.id}`} onPress={() => act(['stop', l.id])}>stop</Button>}
-                      {l.status === 'orphaned' && <Button key={`resume-${l.id}`} onPress={() => act(['resume', l.id])}>resume</Button>}
-                      <Button key={`refresh-${l.id}`} onPress={() => void loadDetail($, l).catch(() => undefined)}>refresh</Button>
+                      {!done && l.status !== 'orphaned' && <Button key={`stop-${l.id}`} label="stop" onPress={() => act(['stop', l.id])} />}
+                      {l.status === 'orphaned' && <Button key={`resume-${l.id}`} label="resume" onPress={() => act(['resume', l.id])} />}
+                      <Button key={`refresh-${l.id}`} label="refresh" onPress={() => void loadDetail($, l).catch(() => undefined)} />
                     </Box>
                   </Box>
                 )}

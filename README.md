@@ -190,8 +190,9 @@ wait timeout, `LEASES.md` claims).
 
 ## Known limits
 
-- **A wake-up can repeat.** A claimed event stays in the outbox until its prompt's turn starts, so a plugin
-  reload in between submits it again. A dropped prompt is resent on the next poll.
+- **A queued wake-up can be lost.** An event is queued before it is claimed and leaves the queue when its prompt
+  is submitted. A dropped prompt goes back and is retried after 20 s, doubling to 10 min. If the host drops the
+  prompt after a plugin reload or a session restart, the wake-up is lost; `lane_status` still shows the lane.
 - **No OS banner in the Desktop app.** `$.ui.notify` reaches terminals only; a `Notification` settings hook
   (type `plugin_notification`) can raise a banner there.
 - **Only the starting session is woken.** A lane started before a Claude Code restart is not announced to the new

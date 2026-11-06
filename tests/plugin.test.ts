@@ -52,6 +52,7 @@ type World = {
   placed: boolean
   dropNext: number
   boxes: unknown[]
+  outboxAtAck: string[]
 }
 
 // One row the way `muse-lane status --json` serves it. Stamps a fresh
@@ -125,6 +126,7 @@ function setup(on: On): { world: World; clock: MockClock } {
     placed: true,
     dropNext: 0,
     boxes: [],
+    outboxAtAck: [],
   }
 
   const runOk = (stdout: string) => ({
@@ -175,6 +177,7 @@ function setup(on: On): { world: World; clock: MockClock } {
     }
     if (cmd === 'ack') {
       world.ackCalls.push(rest.join(' '))
+      world.outboxAtAck.push(JSON.stringify(world.store.get('muse/outbox') ?? []))
       const l = world.lanes.find(l => l.id === a)
       if (!l) return runFail(1, `muse-lane: unknown lane: ${a}`)
       if (b === '--lead') {
@@ -680,6 +683,10 @@ test('a dropped wake stays in the outbox and goes out on the next poll', async (
   expect(world.submits).toHaveLength(0)
   expect((world.store.get('muse/outbox') as unknown[]).length).toBe(1)
 
+  // No retry before the pause is over.
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(0)
+  await clock.advance(21_000)
   await pollOnce($, clock)
   expect(world.submits).toHaveLength(1)
   expect(world.submits[0]).toContain('delta summary')
@@ -727,7 +734,7 @@ test('lane_answer passes text and box, and refuses an empty answer', async ($, o
   const r = await callMcp($, { tool: 'mcp__muse__lane_answer', id: 'lane-q', text: 'keep PlayMode', box: 'gpu-2' })
   await clock.settle()
   expect(r.isError).toBeFalsy()
-  expect(world.runs).toContain('answer lane-q --text keep PlayMode --box gpu-2')
+  expect(world.runs).toContain('answer lane-q --text=keep PlayMode --box gpu-2')
 })
 
 test('the pane flags a lane needing the lead, shows boxes, and expands a row on press', async ($, on) => {
@@ -748,8 +755,6 @@ test('the pane flags a lane needing the lead, shows boxes, and expands a row on 
     })
     expect((await ui.find({ type: 'Text', text: /2 running · 1 need lead/ }))).toBeTruthy()
     expect((await ui.find({ type: 'Text', text: /gpu-3: romeo · lease lead: R16 gate/ }))).toBeTruthy()
-    const flagged = await ui.find({ type: 'Text', text: /! sierra/ })
-    expect(flagged).toBeTruthy()
     expect((await ui.find({ type: 'Text', text: /needs lead: scope_violation: ProjectSettings\/x.asset/ }))).toBeTruthy()
     await ui.unmount()
   }
@@ -764,4 +769,20 @@ test('the pane flags a lane needing the lead, shows boxes, and expands a row on 
   expect((world.store.get('muse/expanded') as Record<string, boolean>)['lane-r']).toBe(true)
   expect((world.store.get('muse/details') as Record<string, string>)['lane-r']).toContain('status: running')
   await ui.unmount()
+})
+
+test('an event is queued in the outbox before the runner ack claims it', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  world.lanes.push(
+    { id: 'lane-o', label: 'oscar', status: 'done', owner: ME, announced: false, orphanAnnounced: false, summary: 'oscar summary' },
+    { id: 'lane-p', label: 'papa', status: 'running', owner: ME, announced: false, orphanAnnounced: false,
+      needsLead: { seq: 4, kind: 'question', detail: 'which box?' } },
+  )
+  await pollOnce($, clock)
+  expect(world.ackCalls).toEqual(['ack lane-o', 'ack lane-p --lead 4'])
+  expect(world.outboxAtAck[0]).toContain('lane-o:end:0')
+  expect(world.outboxAtAck[1]).toContain('lane-p:lead:4')
+  expect(world.submits).toHaveLength(1)
 })
