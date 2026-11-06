@@ -235,6 +235,7 @@ def accept_needs_lead_for_exit(exit_code, log_text, config):
 
 def parse_escalate_reason(text):
     """Reason after ESCALATE:, or None. First non-blank line wins."""
+    return None
     if not text:
         return None
     for line in str(text).splitlines():
