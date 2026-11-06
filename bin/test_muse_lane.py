@@ -236,6 +236,8 @@ elif mode == "ask":
                     break
             time.sleep(0.1)
         _got.append((_ans.strip()[:80] or "NO-ANSWER"))
+        if _i < _count:
+            time.sleep(float(os.environ.get("FAKE_ASK_GAP", "0")))
     emit("ask final; answers=%s" % ("|".join(_got)))
     sys.exit(0)
 elif mode == "writescope":
@@ -4075,11 +4077,17 @@ class TestBoxNameValidation(LaneBase):
 
 class TestStallRestartsAfterConsult(LaneBase):
     def test_long_consult_does_not_stall(self):
+        # Each consult blocks the poll loop 5s with a 2s stall budget; the
+        # gap forces idle iterations right after a consult, when a stale
+        # clock would read 5s. consult_max 10 keeps retries on real
+        # consults (no silent pass through "limited").
         b = self.write_brief("b1.md", "stall consult work")
         lid = self.start_lane(
             [b], env_extra={"FAKE_MODE": "ask", "FAKE_ASK_COUNT": "2",
+                            "FAKE_ASK_GAP": "0.5",
                             "FAKE_CONSULT_SLEEP": "5",
-                            "MUSE_LANE_STALL_SEC": "2"})
+                            "MUSE_LANE_STALL_SEC": "2"},
+            consult_max=10)
         st = self.wait_status(lid, "done", timeout=40)
         consults = st.get("consults") or []
         self.assertEqual(len(consults), 2)

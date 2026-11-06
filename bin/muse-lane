@@ -3203,6 +3203,16 @@ def cmd_ack(args):
     return 0
 
 
+def _max_consult_n(entries):
+    m = 0
+    for e in entries or []:
+        try:
+            m = max(m, int(e.get("n") or 0))
+        except (TypeError, ValueError):
+            pass
+    return m
+
+
 def _consult_next_n(state, cwd):
     m = 0
     for e in (state or {}).get("consults") or []:
@@ -3830,7 +3840,10 @@ def cmd_run(lane_id):
                         entry = payload.get("entry")
                         if isinstance(entry, dict):
                             entry = dict(entry)
-                            entry["n"] = consult_next_n()
+                            # Module helper, not the consult_next_n
+                            # closure: merge also runs on resume paths
+                            # reached before that closure is defined.
+                            entry["n"] = _max_consult_n(consults_done) + 1
                             consults_done.append(entry)
                             slog("merged lead consult n=%s" % entry.get("n"))
                     elif kind == "box":
@@ -4035,12 +4048,7 @@ def cmd_run(lane_id):
         return sum(1 for e in consults_done if e.get("step") == k)
 
     def consult_next_n():
-        m = 0
-        for e in consults_done:
-            try:
-                m = max(m, int(e.get("n") or 0))
-            except (TypeError, ValueError):
-                pass
+        m = _max_consult_n(consults_done)
         try:
             for fn in os.listdir(os.path.join(cwd, ".lane")):
                 if fn.startswith("ASK-") and fn.endswith(".md"):
