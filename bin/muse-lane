@@ -70,6 +70,8 @@ ADVISOR_ANSWER_CAP = 8000
 ADVISOR_DEFAULT_MODEL = "sonnet"
 ADVISOR_DEFAULT_MAX = 3
 ADVISOR_MODELS = ("sonnet", "opus")
+ADVISOR_ERROR_CAP = 300
+BOXES_DIR = "_boxes"
 
 
 def lanes_root():
@@ -277,6 +279,218 @@ def build_advisor_prompt(question, ask_name, accept_cmd, scope_globs, step, n):
     L.append("answer with the first line `ESCALATE: <one line>` and nothing else.")
     L.append("Keep the answer short and concrete; cite file:line paths you read.")
     return "\n".join(L) + "\n"
+
+
+def boxes_root(root=None):
+    return os.path.join(root or lanes_root(), BOXES_DIR)
+
+
+def box_ticket_stamp(dt=None):
+    """UTC stamp for a ticket name. Fixed width, no dashes, sorts in time order."""
+    if dt is None:
+        dt = datetime.datetime.now(datetime.timezone.utc)
+    return dt.strftime("%Y%m%dT%H%M%S.%f")
+
+
+def parse_box_ticket_name(fn):
+    """(queued_key, lane_id) for `<queued>-<lane id>`, else None.
+
+    Lenient on purpose: anything with a non-empty head and tail around the
+    first dash parses, so hand-made tickets still list. Unparseable names
+    are ignored by the queue, never blockers.
+    """
+    if not isinstance(fn, str) or "-" not in fn:
+        return None
+    q, lid = fn.split("-", 1)
+    if not q or not lid:
+        return None
+    if "/" in q or "/" in lid or lid in (".", ".."):
+        return None
+    return (q, lid)
+
+
+def list_box_tickets(box, root=None):
+    """Sorted [(ticket_name, lane_id)] of parseable tickets for a box."""
+    bdir = os.path.join(boxes_root(root), box)
+    try:
+        fns = os.listdir(bdir)
+    except OSError:
+        return []
+    out = []
+    for fn in fns:
+        p = parse_box_ticket_name(fn)
+        if p is None:
+            continue
+        if not os.path.isfile(os.path.join(bdir, fn)):
+            continue
+        out.append((fn, p[1]))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def box_ticket_owner_alive(lane_id):
+    """True when the ticket owner's supervisor currently holds its lock.
+
+    Flock probe only (see supervisor_alive): no process-name matching.
+    """
+    try:
+        return supervisor_alive(lane_dir(lane_id))
+    except Exception:
+        return False
+
+
+def box_older_live_tickets(box, my_name, my_lane_id, root=None):
+    """Names of older tickets whose lane supervisor is alive. Own lane skipped."""
+    older = []
+    for fn, lid in list_box_tickets(box, root):
+        if fn >= my_name:
+            break
+        if lid == my_lane_id:
+            continue
+        if box_ticket_owner_alive(lid):
+            older.append(fn)
+    return older
+
+
+def find_own_box_tickets(lane_id, root=None):
+    """[(box, ticket_name)] of this lane's tickets across all boxes."""
+    found = []
+    broot = boxes_root(root)
+    try:
+        boxes = os.listdir(broot)
+    except OSError:
+        return found
+    for box in boxes:
+        bdir = os.path.join(broot, box)
+        if not os.path.isdir(bdir):
+            continue
+        try:
+            fns = os.listdir(bdir)
+        except OSError:
+            continue
+        for fn in fns:
+            p = parse_box_ticket_name(fn)
+            if p is not None and p[1] == lane_id:
+                found.append((box, fn))
+    return found
+
+
+def remove_box_ticket(box, ticket_name, root=None):
+    try:
+        os.remove(os.path.join(boxes_root(root), box, ticket_name))
+        return True
+    except OSError:
+        return False
+
+
+def move_own_box_tickets(lane_id, new_box, root=None):
+    """Move this lane's tickets into box new_box, keeping names. Returns count."""
+    broot = boxes_root(root)
+    target = os.path.join(broot, new_box)
+    os.makedirs(target, exist_ok=True)
+    moved = 0
+    for box, fn in find_own_box_tickets(lane_id, root):
+        src = os.path.join(broot, box, fn)
+        dst = os.path.join(target, fn)
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue
+        os.rename(src, dst)
+        moved += 1
+    return moved
+
+
+def box_holder_and_queue(box, tickets=None, root=None):
+    """(holder_lane, queue) for a box from its tickets.
+
+    Dead lanes' tickets are skipped, not removed. The holder is the oldest
+    live ticket whose lane state shows box_state held; every other live
+    ticket lane queues oldest-first.
+    """
+    if tickets is None:
+        tickets = list_box_tickets(box, root)
+    holder = None
+    queue = []
+    for _fn, lid in sorted(tickets, key=lambda t: t[0]):
+        if not box_ticket_owner_alive(lid):
+            continue
+        held = False
+        try:
+            st = load_json(os.path.join(lane_dir(lid), "state.json"), None)
+            held = isinstance(st, dict) and st.get("box_state") == "held"
+        except Exception:
+            held = False
+        if held and holder is None:
+            holder = lid
+        else:
+            queue.append(lid)
+    return (holder, queue)
+
+
+def parse_box_leases(text, claim_re_s, release_re_s):
+    """({box: {who, what, since}}, {boxes seen}) from a lease file.
+
+    A box is held when its last CLAIM line has no later RELEASE line.
+    Missing groups read as None; unusable regexes or text parse nothing.
+    """
+    held = {}
+    seen = set()
+    if not text or not claim_re_s or not release_re_s:
+        return (held, seen)
+    try:
+        claim_re = re.compile(claim_re_s)
+    except re.error:
+        return (held, seen)
+    try:
+        release_re = re.compile(release_re_s)
+    except re.error:
+        return (held, seen)
+    last_claim = {}
+    last_release = {}
+    for i, line in enumerate(str(text).splitlines()):
+        m = claim_re.search(line)
+        if m is not None:
+            gd = m.groupdict()
+            b = gd.get("box")
+            if b:
+                seen.add(b)
+                last_claim[b] = (i, {"who": gd.get("who"),
+                                     "what": gd.get("what"),
+                                     "since": gd.get("at")})
+        m2 = release_re.search(line)
+        if m2 is not None:
+            b2 = m2.groupdict().get("box")
+            if b2:
+                seen.add(b2)
+                last_release[b2] = i
+    for b, (i, lease) in last_claim.items():
+        if last_release.get(b, -1) < i:
+            held[b] = lease
+    return (held, seen)
+
+
+def _last_nonblank_line(text):
+    for ln in reversed(str(text or "").splitlines()):
+        if ln.strip():
+            return ln.strip()
+    return ""
+
+
+def format_advisor_error(rc, err_text, out_text, secrets=None):
+    """'exit <rc>: <last line>' for a failed advisor call.
+
+    Prefers the last stderr line, falls back to stdout; redacted and
+    capped at ADVISOR_ERROR_CAP chars.
+    """
+    line = _last_nonblank_line(err_text) or _last_nonblank_line(out_text)
+    if rc is None:
+        base = "exit ?"
+    else:
+        try:
+            base = "exit %d" % int(rc)
+        except (TypeError, ValueError):
+            base = "exit %s" % rc
+    s = base if not line else "%s: %s" % (base, line)
+    return redact_text(s, secrets or [])[:ADVISOR_ERROR_CAP]
 
 
 def now_iso():
@@ -861,6 +1075,11 @@ def get_git_branch(cwd):
     return None
 
 
+def _is_lane_internal_path(p):
+    """True for the supervisor's own .lane/ files (ASK/ANSWER), never violations."""
+    return p == ".lane" or p.startswith(".lane/")
+
+
 def scope_violating_paths(cwd, head_start, scope_globs):
     """Sorted changed paths matching no scope glob. Empty scope skips."""
     if not scope_globs:
@@ -896,6 +1115,8 @@ def scope_violating_paths(cwd, head_start, scope_globs):
         return []
     bad = []
     for p in changed:
+        if _is_lane_internal_path(p):
+            continue
         hit = False
         for pat in scope_globs:
             try:
@@ -1737,10 +1958,13 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
             helper = e.get("helper") or ("answered" if e.get("answered") else "?")
             by = e.get("by") or ("lead" if helper == "lead" else "muse")
             esc = bool(e.get("escalated"))
+            adv_err = e.get("advisor_error") or ""
+            tags = "[%s by=%s escalated=%s%s]" % (
+                helper, by, esc,
+                (" advisor_error=%s" % adv_err) if adv_err else "")
             q = (e.get("question_preview") or "").strip().splitlines()
             q1 = q[0][:160] if q and q[0] else "(empty)"
-            lines.append("- Step %s #%s [%s by=%s escalated=%s]: %s" % (
-                ek, en, helper, by, esc, q1))
+            lines.append("- Step %s #%s %s: %s" % (ek, en, tags, q1))
         lines.append("")
     for k in range(1, steps + 1):
         lines.append("## Step %d final" % k)
@@ -2847,48 +3071,70 @@ def cmd_answer(args):
         except OSError as e:
             print("muse-lane: --text-file not readable: %s" % e, file=sys.stderr)
             return 1
-    if text is None:
-        print("muse-lane: answer requires --text or --text-file", file=sys.stderr)
+    box_b = getattr(args, "box", None)
+    if box_b is not None:
+        box_b = str(box_b).strip()
+        if not box_b or "/" in box_b:
+            print("muse-lane: invalid --box: %s" % box_b, file=sys.stderr)
+            return 1
+    if text is None and box_b is None:
+        print("muse-lane: answer requires --text/--text-file and/or --box",
+              file=sys.stderr)
         return 1
     cwd = lane.get("cwd") or ""
     lane_dot = os.path.join(cwd, ".lane")
-    try:
-        os.makedirs(lane_dot, exist_ok=True)
-    except OSError as e:
-        print("muse-lane: cannot create .lane dir: %s" % e, file=sys.stderr)
-        return 1
     nl = state.get("needs_lead") if isinstance(state.get("needs_lead"), dict) else None
     seq = nl.get("seq") if nl is not None else None
-    body = text if text.endswith("\n") else text + "\n"
-    try:
-        atomic_write_text(os.path.join(lane_dot, "ANSWER.md"), body)
-        if seq is not None:
-            atomic_write_text(os.path.join(lane_dot, "ANSWER-lead-%s.md" % seq), body)
-    except OSError as e:
-        print("muse-lane: cannot write answer: %s" % e, file=sys.stderr)
-        return 1
     secrets = secrets_from_env_file(lane.get("env_file"))
     new_nl = nl
-    if nl is not None and nl.get("kind") == "question":
-        new_nl = None
-    try:
-        step = int(state.get("step") or 1)
-    except (TypeError, ValueError):
-        step = 1
-    qprev = ""
-    if nl is not None:
-        qprev = redact_text(str(nl.get("detail") or "")[:CONSULT_QUESTION_PREVIEW], secrets)
     consults = list(state.get("consults") or [])
-    consults.append({
-        "step": step,
-        "n": _consult_next_n(state, cwd),
-        "question_preview": qprev,
-        "answered": True,
-        "helper": "lead",
-        "by": "lead",
-        "escalated": False,
-        "answer_preview": redact_text(text[:CONSULT_ANSWER_PREVIEW], secrets),
-    })
+    if text is not None:
+        try:
+            os.makedirs(lane_dot, exist_ok=True)
+        except OSError as e:
+            print("muse-lane: cannot create .lane dir: %s" % e, file=sys.stderr)
+            return 1
+        body = text if text.endswith("\n") else text + "\n"
+        try:
+            atomic_write_text(os.path.join(lane_dot, "ANSWER.md"), body)
+            if seq is not None:
+                atomic_write_text(os.path.join(lane_dot, "ANSWER-lead-%s.md" % seq), body)
+        except OSError as e:
+            print("muse-lane: cannot write answer: %s" % e, file=sys.stderr)
+            return 1
+        if nl is not None and nl.get("kind") == "question":
+            new_nl = None
+        try:
+            step = int(state.get("step") or 1)
+        except (TypeError, ValueError):
+            step = 1
+        qprev = ""
+        if nl is not None:
+            qprev = redact_text(str(nl.get("detail") or "")[:CONSULT_QUESTION_PREVIEW], secrets)
+        consults.append({
+            "step": step,
+            "n": _consult_next_n(state, cwd),
+            "question_preview": qprev,
+            "answered": True,
+            "helper": "lead",
+            "by": "lead",
+            "escalated": False,
+            "answer_preview": redact_text(text[:CONSULT_ANSWER_PREVIEW], secrets),
+        })
+    if box_b is not None:
+        try:
+            move_own_box_tickets(lane_id, box_b)
+        except OSError as e:
+            print("muse-lane: cannot move box ticket: %s" % e, file=sys.stderr)
+            return 1
+        lane["box"] = box_b
+        try:
+            atomic_write_json(os.path.join(ldir, "lane.json"), lane)
+        except OSError as e:
+            print("muse-lane: cannot write lane: %s" % e, file=sys.stderr)
+            return 1
+        if isinstance(new_nl, dict) and new_nl.get("kind") == "box_wait_timeout":
+            new_nl = None
     state["needs_lead"] = new_nl
     state["consults"] = consults
     state["updated_at"] = now_iso()
@@ -2897,6 +3143,62 @@ def cmd_answer(args):
     except OSError as e:
         print("muse-lane: cannot write state: %s" % e, file=sys.stderr)
         return 1
+    return 0
+
+
+def cmd_boxes(args):
+    cfg, cfg_err = load_effective_config()
+    if cfg_err is not None:
+        print("muse-lane: %s" % cfg_err, file=sys.stderr)
+        return 1
+    tickets_by_box = {}
+    broot = boxes_root()
+    try:
+        box_names = os.listdir(broot)
+    except OSError:
+        box_names = []
+    for box in box_names:
+        if not os.path.isdir(os.path.join(broot, box)):
+            continue
+        tickets = list_box_tickets(box)
+        if tickets:
+            tickets_by_box[box] = tickets
+    lease_text = None
+    lease_file = (cfg or {}).get("lease_file")
+    if lease_file:
+        try:
+            with open(os.path.abspath(os.path.expanduser(lease_file)), "r",
+                      encoding="utf-8", errors="replace") as f:
+                lease_text = f.read()
+        except OSError:
+            lease_text = None
+    held, lease_boxes = parse_box_leases(
+        lease_text, (cfg or {}).get("lease_claim_re"),
+        (cfg or {}).get("lease_release_re"))
+    for box in lease_boxes:
+        tickets_by_box.setdefault(box, [])
+    out = []
+    for box in sorted(tickets_by_box):
+        holder, queue = box_holder_and_queue(box, tickets_by_box[box])
+        out.append({"box": box, "holder_lane": holder, "queue": queue,
+                    "lease": held.get(box)})
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(out, indent=2))
+        return 0
+    if not out:
+        print("(no boxes)")
+        return 0
+    for o in out:
+        lease = o["lease"] if isinstance(o["lease"], dict) else None
+        if lease is None:
+            lease_s = "-"
+        else:
+            lease_s = "%s:%s since %s" % (lease.get("who") or "?",
+                                          lease.get("what") or "?",
+                                          lease.get("since") or "?")
+        print("%s holder=%s queue=%s lease=%s" % (
+            o["box"], o["holder_lane"] or "-",
+            ",".join(o["queue"]) or "-", lease_s))
     return 0
 
 
@@ -3105,6 +3407,18 @@ def cmd_run(lane_id):
     if advisor_timeout_sec <= 0:
         advisor_timeout_sec = 1.0
     claude_bin = (eff.get("CLAUDE_BIN", "") or "").strip()
+    try:
+        box_wait_max_sec = float(lane_config_early.get("box_wait_max_min", 30)) * 60.0
+    except (TypeError, ValueError):
+        box_wait_max_sec = 30 * 60.0
+    try:
+        _bwo = eff.get("MUSE_LANE_BOX_WAIT_MAX_SEC")
+        if _bwo is not None and str(_bwo).strip() != "":
+            box_wait_max_sec = float(_bwo)
+    except (TypeError, ValueError):
+        pass
+    if box_wait_max_sec <= 0:
+        box_wait_max_sec = 1.0
 
     secrets = secrets_from_env_file(env_file)
     # In-memory snapshot (never on disk): redaction always uses the union
@@ -3279,10 +3593,34 @@ def cmd_run(lane_id):
             commits = 0
         return head, commits
 
+    def _adopt_external_needs_lead_clear():
+        """Drop our needs-lead event when the lead cleared it on disk.
+
+        Only when the event had already reached disk (disk seq covers it):
+        a raise that simply hasn't been written yet must never be dropped.
+        """
+        cur = needs_lead_holder["current"]
+        if not isinstance(cur, dict):
+            return
+        try:
+            disk = load_json(state_path, None)
+        except Exception:
+            return
+        if not isinstance(disk, dict) or disk.get("needs_lead") is not None:
+            return
+        try:
+            dseq = int(disk.get("needs_lead_seq") or 0)
+            cseq = int(cur.get("seq") or 0)
+        except (TypeError, ValueError):
+            return
+        if dseq >= cseq:
+            needs_lead_holder["current"] = None
+
     def write_state(status, step, attempt, muse_pid, last_activity_at,
                     last_event, head, commits, stderr_tail, accept_exit_v,
                     retry_at, reason, muse_started=None, accept_pid=None,
                     accept_started=None):
+        _adopt_external_needs_lead_clear()
         st = {
             "status": status,
             "step": int(step),
@@ -3342,6 +3680,7 @@ def cmd_run(lane_id):
         if status != "stopped" and (stop_requested["flag"] or _stop_marker_present()):
             status = "stopped"
             reason = "stopped"
+        _adopt_external_needs_lead_clear()
         secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
         head, commits = git_snapshot()
         ended = now_iso()
@@ -3582,10 +3921,12 @@ def cmd_run(lane_id):
         return ("failed", text or "")
 
     def run_advisor(k, n, question):
-        """One advisor call for ASK-n. Returns (status, text_or_paths).
+        """One advisor call for ASK-n. Returns (status, text_or_paths, advisor_error).
 
         status in {"ok", "timeout", "failed", "dirty"}; for "dirty" the
         second item is the sorted changed-paths list, else answer text.
+        advisor_error is None for "ok"/"dirty", else an exit-code-and-line
+        string for the consult log.
         """
         advisor_calls_holder["v"] = int(advisor_calls_holder.get("v") or 0) + 1
         ask_name = "ASK-%d.md" % n
@@ -3594,7 +3935,8 @@ def cmd_run(lane_id):
         try:
             atomic_write_text(prompt_path, redact_text(prompt, secrets))
         except OSError:
-            return ("failed", "")
+            return ("failed", "", format_advisor_error(
+                None, "cannot write advisor prompt", "", secrets))
         out_path = os.path.join(ldir, "advisor-%d.out" % n)
         err_path = os.path.join(ldir, "advisor-%d.err" % n)
         cfg_cmd = lane_config.get("advisor_cmd") if isinstance(lane_config, dict) else None
@@ -3623,7 +3965,8 @@ def cmd_run(lane_id):
                     locals()[_f].close()
                 except Exception:
                     pass
-            return ("failed", "")
+            return ("failed", "", format_advisor_error(
+                None, "cannot open advisor output files", "", secrets))
         try:
             proc = subprocess.Popen(cmd, cwd=cwd, env=muse_env,
                                     stdin=inf, stdout=outf, stderr=ef,
@@ -3642,7 +3985,8 @@ def cmd_run(lane_id):
             except Exception:
                 pass
             slog("advisor spawn failed: %s" % e)
-            return ("failed", "")
+            return ("failed", "", format_advisor_error(
+                None, "advisor spawn failed: %s" % e, "", secrets))
         start_m = time.monotonic()
         timed_out = False
         rc = None
@@ -3671,7 +4015,7 @@ def cmd_run(lane_id):
                     pass
                 redact_file_inplace(out_path, secrets)
                 redact_file_inplace(err_path, secrets)
-                return ("failed", "")
+                return ("failed", "", None)
             ret = proc.poll()
             now_m = time.monotonic()
             if ret is None and now_m - start_m >= advisor_timeout_sec:
@@ -3707,6 +4051,20 @@ def cmd_run(lane_id):
         _chmod_0600(err_path)
         redact_file_inplace(out_path, secrets)
         redact_file_inplace(err_path, secrets)
+
+        def _adv_err(rc):
+            try:
+                with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+                    err_txt = f.read()
+            except OSError:
+                err_txt = ""
+            try:
+                with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+                    out_txt = f.read()
+            except OSError:
+                out_txt = ""
+            return format_advisor_error(rc, err_txt, out_txt, secrets)
+
         try:
             head_after = get_git_head(cwd) if os.path.isdir(cwd) else None
         except Exception:
@@ -3719,17 +4077,17 @@ def cmd_run(lane_id):
             detail = "advisor session changed tracked files" + (
                 ": " + ", ".join(changed) if changed else "")
             slog(detail)
-            return ("dirty", changed)
+            return ("dirty", changed, None)
         if timed_out:
-            return ("timeout", "")
+            return ("timeout", "", _adv_err(rc))
         if rc is not None and rc != 0:
-            return ("failed", "")
+            return ("failed", "", _adv_err(rc))
         try:
             with open(out_path, "r", encoding="utf-8", errors="replace") as f:
                 text = f.read()
         except OSError:
             text = ""
-        return ("ok", (text or "")[:ADVISOR_ANSWER_CAP])
+        return ("ok", (text or "")[:ADVISOR_ANSWER_CAP], None)
 
     def maybe_handle_consult(k):
         """Answer one pending ASK.md for step k.
@@ -3772,9 +4130,10 @@ def cmd_run(lane_id):
             return True
         use_advisor = bool(advisor_enabled and
                            int(advisor_calls_holder.get("v") or 0) < advisor_max)
+        advisor_error = None
         if use_advisor:
             by = "claude-%s" % (advisor_model or ADVISOR_DEFAULT_MODEL)
-            status, payload = run_advisor(k, n, question)
+            status, payload, advisor_error = run_advisor(k, n, question)
             if status == "dirty":
                 paths = list(payload or [])
                 consults_done.append({"step": k, "n": n,
@@ -3784,7 +4143,18 @@ def cmd_run(lane_id):
                                       "by": by, "escalated": False,
                                       "answer_preview": ""})
                 return ("advisor_dirty", paths)
-            final_text = payload if status == "ok" else ""
+            if status in ("failed", "timeout") and not (
+                    stop_requested["flag"] or _stop_marker_present()):
+                # Non-dirty advisor failure: the Muse helper answers the same
+                # question in this same consult. The failed call already counts.
+                slog("consult step %d #%d advisor %s (%s); falling back to muse" % (
+                    k, n, status, advisor_error or "no detail"))
+                use_advisor = False
+                by = "muse"
+                status, final_text = run_consult_helper(k, n, question)
+            else:
+                final_text = payload if status == "ok" else ""
+                advisor_error = None
         else:
             by = "muse"
             status, final_text = run_consult_helper(k, n, question)
@@ -3821,13 +4191,16 @@ def cmd_run(lane_id):
                 atomic_write_text(os.path.join(lane_dot, "ANSWER.md"), answer + "\n")
             except OSError:
                 pass
-            consults_done.append({"step": k, "n": n,
-                                  "question_preview": redact_text(
-                                      question[:CONSULT_QUESTION_PREVIEW], secrets),
-                                  "answered": True, "helper": status,
-                                  "by": by, "escalated": True,
-                                  "answer_preview": redact_text(
-                                      (final_text or "")[:CONSULT_ANSWER_PREVIEW], secrets)})
+            _ce = {"step": k, "n": n,
+                     "question_preview": redact_text(
+                         question[:CONSULT_QUESTION_PREVIEW], secrets),
+                     "answered": True, "helper": status,
+                     "by": by, "escalated": True,
+                     "answer_preview": redact_text(
+                         (final_text or "")[:CONSULT_ANSWER_PREVIEW], secrets)}
+            if advisor_error:
+                _ce["advisor_error"] = advisor_error
+            consults_done.append(_ce)
             slog("consult step %d #%d %s by=%s escalated" % (k, n, status, by))
             return True
         if answered:
@@ -3852,13 +4225,16 @@ def cmd_run(lane_id):
                               answer if answer.endswith("\n") else answer + "\n")
         except OSError:
             pass
-        consults_done.append({"step": k, "n": n,
-                              "question_preview": redact_text(
-                                  question[:CONSULT_QUESTION_PREVIEW], secrets),
-                              "answered": answered, "helper": status,
-                              "by": by, "escalated": False,
-                              "answer_preview": redact_text(
-                                  answer[:CONSULT_ANSWER_PREVIEW], secrets)})
+        _ce = {"step": k, "n": n,
+                 "question_preview": redact_text(
+                     question[:CONSULT_QUESTION_PREVIEW], secrets),
+                 "answered": answered, "helper": status,
+                 "by": by, "escalated": False,
+                 "answer_preview": redact_text(
+                     answer[:CONSULT_ANSWER_PREVIEW], secrets)}
+        if advisor_error:
+            _ce["advisor_error"] = advisor_error
+        consults_done.append(_ce)
         if fail_reason:
             slog("consult step %d #%d %s by=%s: %s" % (k, n, status, by, fail_reason))
         else:
@@ -4291,6 +4667,154 @@ def cmd_run(lane_id):
                                        accept_exit, current_last_event, _tail)
         return ("ok",)
 
+    # ---- box queue (tickets order accepts on one box) ----
+    def fresh_lane_box():
+        """Lane's box, re-read so an answer --box move lands mid-wait."""
+        try:
+            fresh = load_json(lane_path, None)
+            if isinstance(fresh, dict):
+                b = fresh.get("box")
+                if isinstance(b, str) and b.strip():
+                    return b.strip()
+        except Exception:
+            pass
+        try:
+            b0 = lane.get("box")
+            if isinstance(b0, str) and b0.strip():
+                return b0.strip()
+        except Exception:
+            pass
+        return None
+
+    def take_box_ticket(box):
+        """Take a ticket in box. Returns (ticket_name, queued_iso).
+
+        Clears this lane's stale tickets first (a resume re-queues fresh).
+        (None, None) degrades to an unguarded accept; the gate script stays
+        the real guard.
+        """
+        for stale_box, stale_fn in find_own_box_tickets(lane_id):
+            remove_box_ticket(stale_box, stale_fn)
+        bdir = os.path.join(boxes_root(), box)
+        try:
+            os.makedirs(bdir, exist_ok=True)
+        except OSError as e:
+            slog("box %s: cannot create ticket dir: %s" % (box, e))
+            return (None, None)
+        name = None
+        body = ""
+        for _try in range(2):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            name = "%s-%s" % (box_ticket_stamp(now), lane_id)
+            body = json.dumps({"lane": lane_id, "box": box,
+                               "queued_at": now.isoformat(),
+                               "pid": os.getpid()}) + "\n"
+            try:
+                fd = os.open(os.path.join(bdir, name),
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                time.sleep(0.002)
+                continue
+            except OSError as e:
+                slog("box %s: cannot take ticket: %s" % (box, e))
+                return (None, None)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(body)
+            except OSError as e:
+                slog("box %s: cannot write ticket: %s" % (box, e))
+                remove_box_ticket(box, name)
+                return (None, None)
+            return (name, now.isoformat())
+        slog("box %s: ticket name collision; proceeding without a ticket" % box)
+        return (None, None)
+
+    def release_box_ticket(ticket_name):
+        """Remove own ticket from every box dir; clear box holders. Idempotent."""
+        if ticket_name:
+            broot = boxes_root()
+            try:
+                boxes = os.listdir(broot)
+            except OSError:
+                boxes = []
+            for box in boxes:
+                remove_box_ticket(box, ticket_name)
+        box_state_holder["v"] = None
+        box_queued_at_holder["v"] = None
+
+    def wait_for_box(box, ticket_name, last_att0):
+        """Wait until our ticket is first among live tickets.
+
+        Returns ("held", box) or ("finished", code) after a stop. Heartbeats
+        state so the wait never reads as a stall; past the budget raises
+        box_wait_timeout once and keeps waiting in place.
+        """
+        box_queued_at_holder["v"] = now_iso()
+        box_state_holder["v"] = "queued"
+        set_phase("box_wait")
+        slog("box %s: queued with ticket %s" % (box, ticket_name))
+        head_cur, commits_cur = git_snapshot()
+        write_state("accepting", steps, last_att0, None, now_iso(),
+                    current_last_event, head_cur, commits_cur, "",
+                    None, None, last_reason)
+        wait_start_m = time.monotonic()
+        timeout_raised = False
+        last_update_m = 0.0
+        cur_box = box
+        while True:
+            if stop_requested["flag"] or _stop_marker_present():
+                release_box_ticket(ticket_name)
+                return ("finished", finish_terminal("stopped", steps, last_att0,
+                                                    "stopped", None,
+                                                    current_last_event, ""))
+            fresh = fresh_lane_box()
+            if fresh:
+                cur_box = fresh
+            # A lead move (answer --box) renames our ticket; only re-take
+            # when it is gone from every box dir.
+            if not find_own_box_tickets(lane_id):
+                try:
+                    bdir = os.path.join(boxes_root(), cur_box)
+                    os.makedirs(bdir, exist_ok=True)
+                    fd = os.open(os.path.join(bdir, ticket_name),
+                                 os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                except (FileExistsError, OSError):
+                    pass
+                else:
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
+                            f.write(json.dumps(
+                                {"lane": lane_id, "box": cur_box,
+                                 "queued_at": box_queued_at_holder["v"],
+                                 "pid": os.getpid()}) + "\n")
+                    except OSError:
+                        pass
+            older = box_older_live_tickets(cur_box, ticket_name, lane_id)
+            if not older:
+                break
+            now_m = time.monotonic()
+            if not timeout_raised and now_m - wait_start_m >= box_wait_max_sec:
+                raise_needs_lead(
+                    "box_wait_timeout",
+                    "box %s: queued past %.0fs budget; still queued (%d ahead)" % (
+                        cur_box, box_wait_max_sec, len(older)),
+                    step=steps)
+                timeout_raised = True
+            if now_m - last_update_m >= poll_sec:
+                head_cur, commits_cur = git_snapshot()
+                write_state("accepting", steps, last_att0, None, now_iso(),
+                            current_last_event, head_cur, commits_cur, "",
+                            None, None, last_reason)
+                last_update_m = now_m
+            time.sleep(min(0.2, poll_sec))
+        box_state_holder["v"] = "held"
+        head_cur, commits_cur = git_snapshot()
+        write_state("accepting", steps, last_att0, None, now_iso(),
+                    current_last_event, head_cur, commits_cur, "",
+                    None, None, last_reason)
+        slog("box %s: holding with ticket %s" % (cur_box, ticket_name))
+        return ("held", cur_box)
+
     # ---- acceptance ----
     # Returns ("accept_done", rc_or_None, last_att, tail) when the accept
     # passed (or there is none), else ("finished", code) after writing a
@@ -4324,6 +4848,12 @@ def cmd_run(lane_id):
         shell = "/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/sh"
         accept_log = os.path.join(ldir, "accept.log")
         secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
+        box_now = fresh_lane_box()
+        ticket_name = None
+        if box_now:
+            ticket_name, _queued_iso = take_box_ticket(box_now)
+            if ticket_name is not None:
+                box_queued_at_holder["v"] = _queued_iso
         slog("accepting: %s -c %s" % (shell, accept_cmd))
         head_cur, commits_cur = git_snapshot()
         last_k_hist0 = history.get(str(steps)) or []
@@ -4331,6 +4861,15 @@ def cmd_run(lane_id):
             last_att0 = int(last_k_hist0[-1].get("attempt", 1)) if last_k_hist0 else 1
         except Exception:
             last_att0 = 1
+        if ticket_name is not None:
+            _wres = wait_for_box(box_now, ticket_name, last_att0)
+            if _wres[0] == "finished":
+                return _wres[1]
+            box_now = _wres[1]
+        if box_now:
+            accept_env["LANE_BOX"] = box_now
+        else:
+            accept_env.pop("LANE_BOX", None)
         set_phase("accept")
         write_state("accepting", steps, last_att0,
                     None, now_iso(), current_last_event, head_cur, commits_cur, "",
@@ -4352,6 +4891,7 @@ def cmd_run(lane_id):
             _m127 = _map.get("127", _map.get(127)) if isinstance(_map, dict) else None
             _k127 = _m127 if _m127 in ACCEPT_MAPPABLE_KINDS else "accept_failed_code"
             raise_needs_lead(_k127, reason, step=steps)
+            release_box_ticket(ticket_name)
             return ("finished", finish_terminal("failed", steps, last_att0, reason, 127,
                                                 current_last_event, ""))
         try:
@@ -4372,6 +4912,7 @@ def cmd_run(lane_id):
             _m127 = _map.get("127", _map.get(127)) if isinstance(_map, dict) else None
             _k127 = _m127 if _m127 in ACCEPT_MAPPABLE_KINDS else "accept_failed_code"
             raise_needs_lead(_k127, reason, step=steps)
+            release_box_ticket(ticket_name)
             return ("finished", finish_terminal("failed", steps, last_att0, reason, 127,
                                                 current_last_event, ""))
         try:
@@ -4408,6 +4949,7 @@ def cmd_run(lane_id):
                     last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
                 except Exception:
                     last_att = 1
+                release_box_ticket(ticket_name)
                 return ("finished", finish_terminal("stopped", steps, last_att, "stopped", None,
                                                     current_last_event, ""))
             ret = aproc.poll()
@@ -4479,6 +5021,7 @@ def cmd_run(lane_id):
                 tk = _m if _m in ACCEPT_MAPPABLE_KINDS else "accept_failed_code"
                 td = "accept timeout after 2h"
             raise_needs_lead(tk, td, step=steps)
+            release_box_ticket(ticket_name)
             return ("finished", finish_terminal("failed", steps, last_att,
                                                 "accept timeout after 2h", 124,
                                                 current_last_event, ""))
@@ -4491,6 +5034,7 @@ def cmd_run(lane_id):
                     full_text = ""
             ak, ad = accept_needs_lead_for_exit(accept_rc, full_text, lane_config)
             raise_needs_lead(ak, ad, step=steps)
+        release_box_ticket(ticket_name)
         return ("accept_done", accept_rc, last_att, "")
 
     def last_attempt_of_last_step():
@@ -4884,7 +5428,7 @@ def build_parser():
     ps.add_argument("--consult-timeout-min", type=float, default=15.0, help="Consult helper timeout in minutes (default: 15).")
     ps.add_argument("--scope", dest="scope", action="append", default=None,
                     help="Allowed path glob for changed files (repeatable; fnmatch, ** allowed).")
-    ps.add_argument("--box", default=None, help="Box name for the box queue (stored; queue lands in step C).")
+    ps.add_argument("--box", default=None, help="Box name: accepts on one box run strictly in ticket order.")
     ps.add_argument("--advisor-model", default=None, choices=["sonnet", "opus"],
                     help="Advisor model (default with --advisor-max: sonnet; no flag = no advisor).")
     ps.add_argument("--advisor-max", type=int, default=None,
@@ -4915,6 +5459,9 @@ def build_parser():
     pw.add_argument("id", help="Lane id.")
     pw.add_argument("--text", default=None, help="Reply text.")
     pw.add_argument("--text-file", default=None, help="File containing reply text.")
+    pw.add_argument("--box", default=None, help="Move the lane's box ticket to this box (keeps queued time).")
+    pb = sub.add_parser("boxes", help="Show box queues and lease holders.")
+    pb.add_argument("--json", action="store_true", help="Print JSON list.")
     return p
 
 
@@ -4944,6 +5491,8 @@ def main(argv=None):
         return cmd_ack(args)
     if args.cmd == "answer":
         return cmd_answer(args)
+    if args.cmd == "boxes":
+        return cmd_boxes(args)
     parser.print_help()
     return 2
 
