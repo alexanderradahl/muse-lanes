@@ -79,7 +79,7 @@ const TOOLS = [
   { name: 'lane_resume', description: 'Resume an orphaned lane (its supervisor died) from its recorded step.', inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
   {
     name: 'lane_answer',
-    description: "The lead's reply to a lane that needs it: `text` answers an escalated question (the lane reads it as .lane/ANSWER.md); `box` moves a lane waiting on a busy box to another box.",
+    description: "The lead's reply to a lane that needs it: `text` answers an escalated question (the lane reads it as .lane/ANSWER.md); `box` asks to move a lane waiting on a busy box to another box (applied while it waits; refused once it holds its box).",
     inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'string' }, text: { type: 'string' }, box: { type: 'string' } } },
   },
   { name: 'lane_boxes', description: 'Gate boxes: which lane holds each, the lanes queued for it, and the lease file holder.', inputSchema: { type: 'object', properties: {} } },

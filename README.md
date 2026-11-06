@@ -17,7 +17,7 @@ Claude stays the lead that plans and reviews, and Muse does the long, checkable 
   - `lane_summary` gives attempts, commits, acceptance output, pre-review rounds, consults, each step's final
     answer, and for a finished lane the ready-to-merge evidence.
   - `lane_answer` is the lead's reply to a lane that needs it: `text` answers an escalated question, `box` moves
-    a lane off a busy box.
+    a lane that is waiting on a busy box to another box (refused once the lane holds its box).
   - `lane_boxes` lists gate boxes: the lane holding each, the lanes queued for it, and the lease file's holder.
   - `lane_stop` stops a lane; `lane_resume` continues a lane whose supervisor died.
 - **Pane:** `/muse` opens a pane (it also opens on `lane_start` when the window is wide enough). A header counts
