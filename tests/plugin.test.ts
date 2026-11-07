@@ -31,6 +31,7 @@ type FakeLane = {
   leadAcked?: number[]
   box?: string | null
   evidence?: Record<string, unknown> | null
+  lastActivity?: string
 }
 
 type World = {
@@ -69,7 +70,7 @@ function rowJson(l: FakeLane) {
     steps: 1,
     attempt: 1,
     commits: 0,
-    last_activity_at: '2026-10-01T00:00:00+00:00',
+    last_activity_at: l.lastActivity ?? '2026-10-01T00:00:00+00:00',
     reason: null,
     owner_session: l.owner,
     announced: l.announced,
@@ -737,7 +738,11 @@ test('lane_answer passes text and box, and refuses an empty answer', async ($, o
   expect(world.runs).toContain('answer lane-q --text=keep PlayMode --box gpu-2')
 })
 
-test('the pane flags a lane needing the lead, shows boxes, and expands a row on press', async ($, on) => {
+const PANE_PROPS = { title: 'Muse lanes', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as const
+// The faked store does not invalidate drawings, so a test remounts to see a press's write.
+const mountPane = ($: Engine) => $.ui.mount({ plugin: 'muse', component: 'Pane', requestId: 'muse-lanes', surface: 'terminal', props: PANE_PROPS })
+
+test('the pane groups lanes, folds boxes, and expands a row on press', async ($, on) => {
   const { world, clock } = setup(on)
   await begin($, clock)
   world.lanes.push(
@@ -745,29 +750,60 @@ test('the pane flags a lane needing the lead, shows boxes, and expands a row on 
     { id: 'lane-s', label: 'sierra', status: 'running', owner: ME, announced: false, orphanAnnounced: false,
       needsLead: { seq: 1, kind: 'scope_violation', detail: 'ProjectSettings/x.asset' } },
   )
-  world.boxes = [{ box: 'gpu-3', holder_lane: 'lane-r', queue: ['lane-r'], lease: { who: 'lead', what: 'R16 gate', since: '2026-11-06T10:00:00Z' } }]
+  world.boxes = [
+    { box: 'gpu-3', holder_lane: 'lane-r', queue: ['lane-r'], lease: { who: 'lead', what: 'R16 gate', since: '2026-11-06T10:00:00Z' } },
+    { box: 'gpu-4', holder_lane: null, queue: [], lease: null },
+  ]
   await pollOnce($, clock)
 
   for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({
-      plugin: 'muse', component: 'Pane', requestId: 'muse-lanes', surface,
-      props: { title: 'Muse lanes', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
-    })
-    expect((await ui.find({ type: 'Text', text: /2 running · 1 need lead/ }))).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /gpu-3: romeo · lease lead: R16 gate/ }))).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /needs lead: scope_violation: ProjectSettings\/x.asset/ }))).toBeTruthy()
+    const ui = await $.ui.mount({ plugin: 'muse', component: 'Pane', requestId: 'muse-lanes', surface, props: PANE_PROPS })
+    expect((await ui.find({ type: 'Text', text: /1 needs you · 1 running/ }))).toBeTruthy()
+    expect((await ui.find({ type: 'Text', text: /touched files outside its scope/ }))).toBeTruthy()
+    expect((await ui.find({ type: 'Text', text: /ProjectSettings\/x.asset/ }))).toBeTruthy()
+    // Boxes start folded: the count shows, the lease does not.
+    expect((await ui.find({ type: 'Button', text: /Boxes · 1 busy, 1 free/ }))).toBeTruthy()
+    expect((await ui.find({ type: 'Text', text: /R16 gate/ }))).toBeFalsy()
     await ui.unmount()
   }
 
-  const ui = await $.ui.mount({
-    plugin: 'muse', component: 'Pane', requestId: 'muse-lanes', surface: 'terminal',
-    props: { title: 'Muse lanes', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
-  })
+  let ui = await mountPane($)
+  await ui.press({ key: 'sec-boxes' })
+  await clock.settle()
+  expect((world.store.get('muse/sections') as Record<string, boolean>).boxes).toBe(true)
+  await ui.unmount()
+  ui = await mountPane($)
+  expect((await ui.find({ type: 'Text', text: /lease lead: R16 gate/ }))).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /Free: gpu-4/ }))).toBeTruthy()
+
   await ui.press({ key: 'row-lane-r' })
   await clock.settle()
   expect(world.runs).toContain('status lane-r')
   expect((world.store.get('muse/expanded') as Record<string, boolean>)['lane-r']).toBe(true)
   expect((world.store.get('muse/details') as Record<string, string>)['lane-r']).toContain('status: running')
+  await ui.unmount()
+})
+
+test('an orphan quiet for over a day folds into Stale; a fresh one needs you', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+  world.lanes.push(
+    { id: 'lane-old', label: 'oldie', status: 'orphaned', owner: OTHER, announced: false, orphanAnnounced: true, lastActivity: '2026-10-01T00:00:00+00:00' },
+    { id: 'lane-new', label: 'fresh', status: 'orphaned', owner: OTHER, announced: false, orphanAnnounced: true, lastActivity: new Date().toISOString() },
+  )
+  await pollOnce($, clock)
+
+  let ui = await mountPane($)
+  expect((await ui.find({ type: 'Text', text: /^1 needs you$/ }))).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /supervisor died · \d+s ago/ }))).toBeTruthy()
+  expect((await ui.find({ type: 'Button', text: /Stale · 1/ }))).toBeTruthy()
+  expect((await ui.find({ key: 'row-lane-old' }))).toBeFalsy()
+  await ui.press({ key: 'sec-stale' })
+  await clock.settle()
+  await ui.unmount()
+  ui = await mountPane($)
+  expect((await ui.find({ key: 'row-lane-old' }))).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /died \d+d ago/ }))).toBeTruthy()
   await ui.unmount()
 })
 

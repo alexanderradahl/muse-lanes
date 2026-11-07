@@ -20,13 +20,14 @@ Claude stays the lead that plans and reviews, and Muse does the long, checkable 
     a lane that is waiting on a busy box to another box (refused once the lane holds its box).
   - `lane_boxes` lists gate boxes: the lane holding each, the lanes queued for it, and the lease file's holder.
   - `lane_stop` stops a lane; `lane_resume` continues a lane whose supervisor died.
-- **Pane:** `/muse` opens a pane (it also opens on `lane_start` when the window is wide enough). A header counts
-  running lanes, lanes that need the lead, and lanes ready to merge. A Boxes section shows each box's holder,
-  queue and lease. Each lane gets a row: a needs-lead flag, label, status, phase and its elapsed time, box,
-  total time, idle minutes, pre-review verdict, then commits with the last subject and branch, then the
-  needs-lead detail or failed accept tail. Lanes that need the lead come first, then this session's working
-  lanes. The `▸` toggle expands a row with its summary (or live status), the merge evidence, and `stop`,
-  `resume` and `refresh` buttons.
+- **Pane:** `/muse` opens a pane (it also opens on `lane_start` when the window is wide enough). The header
+  counts lanes that need you, running lanes and lanes ready to merge. **Needs you** and **Running** always
+  show; **Ready to merge**, **Ended**, **Stale** (orphans quiet for over a day) and **Boxes** fold until
+  pressed. Each lane is one line: a mark (`!` needs you, `✕` failed, `●` running, `✓` done, `○` stopped or
+  stale), its label, and where it stands in words ("checking: domain · 1h 24m", "died 32d ago"). A second
+  line appears only when it adds something: what to act on, or a running lane's box, commits, review and
+  quiet time. Pressing a label expands the row with its summary (or live status), the merge evidence, and
+  `stop`, `resume` and `refresh` buttons.
 - **Wake-ups:** the session is woken when one of its lanes ends or needs the lead, never for routine progress.
   Several events in one poll arrive as one digest prompt. See [Needs-lead events](#needs-lead-events).
 - **Status line:** `muse: <label> <phase>` with one working lane, else `muse: N running · M need lead`.

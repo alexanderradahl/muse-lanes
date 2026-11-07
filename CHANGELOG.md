@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 — 2026-11-07
+
+- Pane grouped into sections: Needs you and Running always show; Ready to merge, Ended, Stale and Boxes
+  fold, closed until pressed (`muse/sections` remembers what is open).
+- Orphans quiet for over a day move to Stale instead of flagging the lead; the wake-ups are unchanged.
+- One line per lane with a coloured mark and plain words for the phase; a second line only for what to act
+  on or a running lane's progress. Durations past a day read in days.
+- Boxes fold to a count of busy and free; free boxes without a lease share one line.
+
 ## 0.3.0 — 2026-11-06
 
 One lead runs a fleet of lanes directly. Design: [docs/v0.3-plan.md](docs/v0.3-plan.md).

@@ -6,7 +6,7 @@
 // resolves only when the turn starts); a dropped one goes back to the outbox, retried after a growing pause.
 // Routine progress never wakes.
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { Color, Register } from 'claude-code'
 
 import type { MuseBox as BoxRow, MuseLane as Lane, MuseWake as Wake } from '../types'
 
@@ -18,12 +18,23 @@ const expandedRef = atom({ plugin: 'muse', key: 'expanded' } as const, {} as Rec
 const detailsRef = atom({ plugin: 'muse', key: 'details' } as const, {} as Record<string, string>)
 const outboxRef = atom({ plugin: 'muse', key: 'outbox' } as const, [] as Wake[])
 const triesRef = atom({ plugin: 'muse', key: 'summaryTries' } as const, {} as Record<string, number>)
+const sectionsRef = atom({ plugin: 'muse', key: 'sections' } as const, {} as Record<string, boolean>)
 const TERMINAL = new Set(['done', 'failed', 'gave_up', 'stopped', 'review_failed'])
 const WORK = new Set(['running', 'retry_wait', 'accepting'])
 const LIVE = new Set(['queued', ...WORK])
 const POLL_MS = 20_000
 const SUMMARY_TRIES = 3
 const DETAIL_LINES = 40
+const SECTION_ROWS = 10
+const STALE_SEC = 24 * 3600
+const NEEDS_WORDS: Record<string, string> = {
+  question: 'has a question',
+  review_failed: 'review failed',
+  accept_failed_code: 'acceptance check failed',
+  accept_failed_harness: 'acceptance harness broke',
+  box_wait_timeout: 'waited too long for its box',
+  scope_violation: 'touched files outside its scope',
+}
 let pollInFlight = false
 let submitting = false
 let drops = 0
@@ -387,6 +398,7 @@ export const register: Register = (on, options) => {
     const boxes = ((await read($, boxesRef)) as BoxRow[] | undefined) ?? []
     const expanded = ((await read($, expandedRef)) as Record<string, boolean> | undefined) ?? {}
     const details = ((await read($, detailsRef)) as Record<string, string> | undefined) ?? {}
+    const opened = ((await read($, sectionsRef)) as Record<string, boolean> | undefined) ?? {}
     const me = await sessionId($)
     const now = Date.now() / 1000
     const ts = (t?: number | string | null) => {
@@ -398,127 +410,190 @@ export const register: Register = (on, options) => {
       if (!Number.isFinite(sec) || sec < 0) return ''
       if (sec < 120) return `${Math.round(sec)}s`
       if (sec < 3600) return `${Math.round(sec / 60)}m`
-      return `${Math.floor(sec / 3600)}h ${Math.round((sec % 3600) / 60)}m`
+      if (sec < 86400) return `${Math.floor(sec / 3600)}h ${Math.round((sec % 3600) / 60)}m`
+      return `${Math.floor(sec / 86400)}d`
     }
-    // Flagged until the lead has been woken for it; an ended lane drops to the bottom once announced.
-    const isHot = (l: Lane) => wantsLead(l) && !(TERMINAL.has(l.status) && l.announced)
-    const rank = (l: Lane) => (isHot(l) ? 0 : isLive(l) ? (l.owner_session === me ? 1 : 2) : l.status === 'done' ? 3 : 4)
-    const ordered = [...list].sort((a, b) => rank(a) - rank(b))
-    const running = list.filter(isLive).length
-    const need = list.filter(isHot).length
-    const ready = list.filter(l => l.status === 'done' && l.evidence).length
+    const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
+    const commits = (l: Lane) => `${l.commits ?? 0} commit${l.commits === 1 ? '' : 's'}`
+    const total = (l: Lane) => dur((TERMINAL.has(l.status) ? ts(l.updated_at) : now) - ts(l.started_at))
+    const quiet = (l: Lane) => now - ts(l.last_activity_at ?? l.updated_at)
+    // An orphan nobody resumed within STALE_SEC is history, not a call to action.
+    const isStale = (l: Lane) => l.status === 'orphaned' && quiet(l) > STALE_SEC
+    // Flagged until the lead has been woken for it; an ended lane drops to its group once announced.
+    const isHot = (l: Lane) => wantsLead(l) && !(TERMINAL.has(l.status) && l.announced) && !isStale(l)
+    const group = (l: Lane) =>
+      isHot(l) ? 'needs' : isStale(l) ? 'stale' : !TERMINAL.has(l.status) ? 'running' : l.status === 'done' && l.evidence ? 'ready' : 'ended'
+    const of = (g: string) => list.filter(l => group(l) === g).sort((a, b) => (ts(b.updated_at) || 0) - (ts(a.updated_at) || 0))
+    const needs = of('needs')
+    const running = of('running').sort((a, b) => Number(b.owner_session === me) - Number(a.owner_session === me))
+    const ready = of('ready')
+    const ended = of('ended')
+    const stale = of('stale')
 
-    const review = (l: Lane) => {
-      const rounds = l.review_rounds ?? []
-      if (l.review_error) return 'review error'
-      if (rounds.length === 0) return ''
-      const last = rounds[rounds.length - 1]!
-      return `review ${last.verdict ?? '?'} r${last.round ?? rounds.length}`
+    const mark = (l: Lane): [string, Color | undefined] => {
+      if (isStale(l) || l.status === 'stopped') return ['○', 'inactive']
+      if (l.status === 'failed' || l.status === 'review_failed' || l.status === 'gave_up') return ['✕', 'error']
+      if (isHot(l)) return ['!', 'warning']
+      if (l.status === 'done') return ['✓', 'success']
+      if (l.status === 'queued' || l.box_state === 'queued') return ['○', undefined]
+      return ['●', 'suggestion']
     }
-    // Row: the toggle names the lane (the Desktop app draws only a Button's label), then where it is now.
-    const now1 = (l: Lane) => {
-      const done = TERMINAL.has(l.status)
-      const bits = [l.status]
-      if (l.phase) {
-        const el = dur((done ? ts(l.updated_at) : now) - ts(l.phase_started))
-        bits.push(`${l.phase}${el ? ` ${el}` : ''}`)
-      }
-      if (!done) {
-        const idleSec = now - ts(l.last_activity_at)
-        if (Number.isFinite(idleSec) && idleSec >= 60) {
-          const nearStall = l.stall_sec ? idleSec > 0.75 * l.stall_sec : false
-          bits.push(`idle ${Math.round(idleSec / 60)}m${nearStall ? ' (near stall)' : ''}`)
-        }
-      }
-      return bits.join(' · ')
+    // What a live lane is doing, in words: the runner's phases are step:N, box_wait, accept, an accept check's name, review:N.
+    const doing = (l: Lane) => {
+      const p = l.phase ?? ''
+      if (l.status === 'queued') return 'queued'
+      if (l.status === 'retry_wait') return 'retrying soon'
+      if (p === 'box_wait' || l.box_state === 'queued') return `waiting for ${l.box ?? 'a box'}`
+      if (p.startsWith('step:')) return (l.steps ?? 1) > 1 ? `writing, step ${p.slice(5)} of ${l.steps}` : 'writing'
+      if (p.startsWith('review:')) return `in review, round ${p.slice(7)}`
+      if (l.status === 'accepting' || p === 'accept') return p && p !== 'accept' ? `checking: ${p}` : 'checking'
+      return l.status.replace('_', ' ')
     }
-    // Second line: box, total time, pre-review, commits.
-    const line2 = (l: Lane) => {
+    // First line, after the name: where the lane stands.
+    const first = (l: Lane) => {
+      const g = group(l)
+      if (g === 'stale') return `died ${dur(quiet(l))} ago · ${commits(l)}`
+      if (g === 'running') return `${doing(l)} · ${total(l)}`
+      if (g === 'needs') {
+        const why = l.needs_lead && l.status !== 'done' ? NEEDS_WORDS[l.needs_lead.kind] ?? l.needs_lead.kind
+          : l.status === 'orphaned' ? 'supervisor died' : l.status.replace('_', ' ')
+        return `${why} · ${dur(now - ts(l.status === 'orphaned' ? l.last_activity_at : l.updated_at))} ago`
+      }
+      return [l.status === 'done' ? '' : l.status.replace('_', ' '), total(l), commits(l)].filter(Boolean).join(' · ')
+    }
+    // Second line, only where it adds something: what to act on, or a live lane's progress.
+    const second = (l: Lane): { text: string; color?: Color } | null => {
+      const g = group(l)
+      if (g === 'needs') {
+        if (l.needs_lead && l.status !== 'done') return { text: clip(l.needs_lead.detail, 160) }
+        if (l.status === 'orphaned') return { text: `resume continues from the recorded step · ${commits(l)}` }
+        const tail = (l.accept_tail ?? '').split('\n').filter(s => s.trim()).pop()
+        if (tail) return { text: clip(tail, 160), color: 'error' }
+        return l.reason ? { text: clip(l.reason, 160) } : null
+      }
+      if (g !== 'running') return null
       const bits: string[] = []
-      if (l.box) bits.push(`box ${l.box}${l.box_state === 'queued' ? ' (queued)' : ''}`)
-      const total = dur((TERMINAL.has(l.status) ? ts(l.updated_at) : now) - ts(l.started_at))
-      if (total) bits.push(`total ${total}`)
-      const rv = review(l)
-      if (rv) bits.push(rv)
-      let c = `${l.commits ?? 0} commits`
-      if ((l.commits ?? 0) > 0 && l.last_subject) c += `: ${l.last_subject}`
-      if (l.branch) c += ` (${l.branch})`
-      bits.push(c)
-      return bits.join(' · ')
-    }
-    const alert = (l: Lane): string | null => {
-      if (l.needs_lead && l.status !== 'done') return `needs lead: ${l.needs_lead.kind}: ${l.needs_lead.detail}`
-      if (l.status === 'orphaned') return 'supervisor died: resume continues from the recorded step'
-      if ((l.status === 'failed' || l.status === 'review_failed') && l.accept_tail) {
-        const tail = l.accept_tail.split('\n').filter(s => s.trim()).slice(-3).map(s => (s.length > 120 ? s.slice(0, 117) + '...' : s))
-        if (tail.length > 0) return `accept: ${tail.join(' | ')}`
-      }
-      if (TERMINAL.has(l.status) && l.reason && l.status !== 'done') return l.reason
-      return null
+      if (l.box && !doing(l).includes(l.box)) bits.push(l.box)
+      if ((l.commits ?? 0) > 0) bits.push(l.last_subject ? `${commits(l)} · "${clip(l.last_subject, 50)}"` : commits(l))
+      const last = (l.review_rounds ?? []).at(-1)
+      const verdict = { PASS: 'passed', FAIL: 'failed' }[last?.verdict?.toUpperCase() ?? ''] ?? last?.verdict?.toLowerCase()
+      if (l.review_error) bits.push('review error')
+      else if (verdict) bits.push(`review ${verdict}, round ${last!.round ?? l.review_rounds!.length}`)
+      const idle = quiet(l)
+      const near = !!l.stall_sec && idle > 0.75 * l.stall_sec
+      if (Number.isFinite(idle) && idle >= 300) bits.push(`no output for ${dur(idle)}`)
+      return bits.length ? { text: bits.join(' · '), color: near ? 'warning' : undefined } : null
     }
     const toggle = (l: Lane) => {
-      let opened = false
+      let isOpen = false
       void update($, expandedRef, x => {
-        opened = !x[l.id]
-        return { ...x, [l.id]: opened }
-      }).then(() => (opened ? loadDetail($, l) : undefined)).catch(() => undefined)
+        isOpen = !x[l.id]
+        return { ...x, [l.id]: isOpen }
+      }).then(() => (isOpen ? loadDetail($, l) : undefined)).catch(() => undefined)
     }
+    const flip = (id: string) => void update($, sectionsRef, x => ({ ...x, [id]: !x[id] })).catch(() => undefined)
     const act = (args: string[]) => void lane($, args).then(() => kick($)).catch(() => undefined)
+
+    // A lane: its mark, its name (the toggle: the Desktop app draws only a Button's label), where it stands.
+    const row = (l: Lane) => {
+      const [glyph, color] = mark(l)
+      const done = TERMINAL.has(l.status)
+      const sub = second(l)
+      const isOpen = !!expanded[l.id]
+      return (
+        <Box key={l.id} flexDirection="column" marginBottom={isOpen ? 1 : 0}>
+          <Box flexDirection="row" gap={1}>
+            <Text color={color} dimColor={!color}>{glyph}</Text>
+            <Button key={`row-${l.id}`} plain dimColor={isStale(l)} label={name(l)} onPress={() => toggle(l)} />
+            <Text dimColor>{first(l)}</Text>
+          </Box>
+          {sub && (
+            <Box marginLeft={2}>
+              <Text color={sub.color} dimColor={!sub.color}>{sub.text}</Text>
+            </Box>
+          )}
+          {isOpen && (
+            <Box flexDirection="column" marginLeft={2}>
+              {evidenceLines(l).map((s, i) => <Text key={`ev-${l.id}-${i}`} color="success">{s}</Text>)}
+              <Text dimColor>{details[l.id] ?? 'loading...'}</Text>
+              <Box flexDirection="row" gap={1}>
+                {!done && l.status !== 'orphaned' && <Button key={`stop-${l.id}`} label="stop" onPress={() => act(['stop', l.id])} />}
+                {l.status === 'orphaned' && <Button key={`resume-${l.id}`} label="resume" onPress={() => act(['resume', l.id])} />}
+                <Button key={`refresh-${l.id}`} label="refresh" onPress={() => void loadDetail($, l).catch(() => undefined)} />
+              </Box>
+            </Box>
+          )}
+        </Box>
+      )
+    }
+    const rows = (ls: Lane[]) => (
+      <Box flexDirection="column">
+        {ls.slice(0, SECTION_ROWS).map(row)}
+        {ls.length > SECTION_ROWS && <Text dimColor>+ {ls.length - SECTION_ROWS} more · lane_status lists them all</Text>}
+      </Box>
+    )
+    // Needs you and Running always show; the rest fold, closed until pressed.
+    const fold = (id: string, title: string, hint: string, body: () => any) => (
+      <Box key={`sec-${id}`} flexDirection="column" marginTop={1}>
+        <Box flexDirection="row" gap={1}>
+          <Button key={`sec-${id}`} plain label={`${opened[id] ? '▾' : '▸'} ${title}`} onPress={() => flip(id)} />
+          {hint && <Text dimColor>{hint}</Text>}
+        </Box>
+        {opened[id] && <Box marginLeft={2}>{body()}</Box>}
+      </Box>
+    )
+
+    const label = (id: string | null) => (id ? list.find(l => l.id === id)?.label || id : null)
+    const busy = boxes.filter(b => b.holder_lane || b.queue.length)
+    const freeLeased = boxes.filter(b => !busy.includes(b) && b.lease)
+    const free = boxes.filter(b => !busy.includes(b) && !b.lease)
+    const boxBody = () => (
+      <Box flexDirection="column">
+        {busy.map(b => {
+          const waiting = b.queue.filter(id => id !== b.holder_lane).map(id => label(id)!)
+          return (
+            <Box key={`box-${b.box}`} flexDirection="column">
+              <Text>
+                {b.box} · {label(b.holder_lane) ?? 'free'}{waiting.length ? ` · then ${waiting.join(', ')}` : ''}
+              </Text>
+              {b.lease && <Text dimColor>  lease {b.lease.who}: {clip(b.lease.what, 100)}</Text>}
+            </Box>
+          )
+        })}
+        {freeLeased.map(b => (
+          <Text key={`box-${b.box}`} dimColor>
+            {b.box} · free · lease {b.lease!.who}: {clip(b.lease!.what, 100)}
+          </Text>
+        ))}
+        {free.length > 0 && <Text dimColor>Free: {free.map(b => b.box).join(', ')}</Text>}
+      </Box>
+    )
+
+    const counts = [
+      needs.length ? `${needs.length} need${needs.length === 1 ? 's' : ''} you` : '',
+      running.length ? `${running.length} running` : '',
+      ready.length ? `${ready.length} ready to merge` : '',
+    ].filter(Boolean)
 
     return (
       <Box flexDirection="column">
-        <Text bold>
-          {running} running · {need} need lead · {ready} ready
-        </Text>
-        {boxes.length > 0 && (
+        <Text bold>{list.length === 0 ? 'No Muse lanes.' : counts.join(' · ') || 'Nothing running'}</Text>
+        {needs.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
-            <Text dimColor>Boxes</Text>
-            {boxes.map(b => {
-              const holder = b.holder_lane ? (list.find(l => l.id === b.holder_lane)?.label || b.holder_lane) : 'free'
-              const queue = b.queue.filter(id => id !== b.holder_lane).map(id => list.find(l => l.id === id)?.label || id)
-              const lease = b.lease ? ` · lease ${b.lease.who}: ${b.lease.what}` : ''
-              return (
-                <Text key={`box-${b.box}`}>
-                  {b.box}: {holder}{queue.length ? ` · queue ${queue.join(', ')}` : ''}{lease}
-                </Text>
-              )
-            })}
+            <Text bold color="warning">Needs you · {needs.length}</Text>
+            {rows(needs)}
           </Box>
         )}
-        <Box flexDirection="column" marginTop={1}>
-          {ordered.length === 0 && <Text dimColor>No Muse lanes.</Text>}
-          {ordered.slice(0, 30).map(l => {
-            const done = TERMINAL.has(l.status)
-            const hot = isHot(l)
-            const warn = alert(l)
-            const open = !!expanded[l.id]
-            return (
-              <Box key={l.id} flexDirection="column" marginBottom={open ? 1 : 0}>
-                <Box flexDirection="row" gap={1}>
-                  <Button key={`row-${l.id}`} plain label={`${open ? '▾' : '▸'} ${hot ? '! ' : ''}${name(l)}`} onPress={() => toggle(l)} />
-                  <Text bold={!done} dimColor={done && !hot} color={hot ? 'warning' : undefined}>
-                    {now1(l)}
-                  </Text>
-                </Box>
-                <Box flexDirection="column" marginLeft={2}>
-                  <Text dimColor>{line2(l)}</Text>
-                  {warn && <Text color="warning">{warn}</Text>}
-                </Box>
-                {open && (
-                  <Box flexDirection="column" marginLeft={2}>
-                    {evidenceLines(l).map((s, i) => <Text key={`ev-${l.id}-${i}`} color="success">{s}</Text>)}
-                    <Text dimColor>{details[l.id] ?? 'loading...'}</Text>
-                    <Box flexDirection="row" gap={1}>
-                      {!done && l.status !== 'orphaned' && <Button key={`stop-${l.id}`} label="stop" onPress={() => act(['stop', l.id])} />}
-                      {l.status === 'orphaned' && <Button key={`resume-${l.id}`} label="resume" onPress={() => act(['resume', l.id])} />}
-                      <Button key={`refresh-${l.id}`} label="refresh" onPress={() => void loadDetail($, l).catch(() => undefined)} />
-                    </Box>
-                  </Box>
-                )}
-              </Box>
-            )
-          })}
-        </Box>
+        {running.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>Running · {running.length}</Text>
+            {rows(running)}
+          </Box>
+        )}
+        {ready.length > 0 && fold('ready', `Ready to merge · ${ready.length}`, `newest: ${name(ready[0]!)}`, () => rows(ready))}
+        {ended.length > 0 && fold('ended', `Ended · ${ended.length}`, '', () => rows(ended))}
+        {stale.length > 0 && fold('stale', `Stale · ${stale.length}`, 'supervisor died over a day ago', () => rows(stale))}
+        {boxes.length > 0 && fold('boxes', `Boxes · ${busy.length} busy, ${boxes.length - busy.length} free`, busy.map(b => b.box).join(', '), boxBody)}
       </Box>
     )
   })

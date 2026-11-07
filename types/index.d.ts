@@ -75,6 +75,8 @@ declare module 'claude-code' {
       details: Record<string, string>
       outbox: MuseWake[]
       summaryTries: Record<string, number>
+      // Folded pane sections the person has opened, by id.
+      sections: Record<string, boolean>
     }
   }
 }
