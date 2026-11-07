@@ -27,6 +27,10 @@ type FakeLane = {
   summary?: string
   phase?: string
   updatedAt?: string
+  needsLead?: { seq: number; kind: string; detail: string } | null
+  leadAcked?: number[]
+  box?: string | null
+  evidence?: Record<string, unknown> | null
 }
 
 type World = {
@@ -43,6 +47,12 @@ type World = {
   store: Map<string, unknown>
   sets: Array<{ plugin: unknown; key: unknown; value: unknown }>
   gate: Promise<void> | null
+  notifies: string[]
+  opens: number
+  placed: boolean
+  dropNext: number
+  boxes: unknown[]
+  outboxAtAck: string[]
 }
 
 // One row the way `muse-lane status --json` serves it. Stamps a fresh
@@ -73,6 +83,15 @@ function rowJson(l: FakeLane) {
     accept_tail: '',
     review_rounds: [],
     review_error: null,
+    needs_lead: l.needsLead ? { ...l.needsLead, at: '2026-11-06T00:00:00Z' } : null,
+    needs_lead_announced: !!l.needsLead && (l.leadAcked ?? []).includes(l.needsLead.seq),
+    box: l.box ?? null,
+    box_state: null,
+    box_queued_at: null,
+    branch: null,
+    head: null,
+    evidence: l.evidence ?? null,
+    advisor_calls: 0,
   }
 }
 
@@ -102,6 +121,12 @@ function setup(on: On): { world: World; clock: MockClock } {
     store: new Map(),
     sets: [],
     gate: null,
+    notifies: [],
+    opens: 0,
+    placed: true,
+    dropNext: 0,
+    boxes: [],
+    outboxAtAck: [],
   }
 
   const runOk = (stdout: string) => ({
@@ -152,8 +177,18 @@ function setup(on: On): { world: World; clock: MockClock } {
     }
     if (cmd === 'ack') {
       world.ackCalls.push(rest.join(' '))
+      world.outboxAtAck.push(JSON.stringify(world.store.get('muse/outbox') ?? []))
       const l = world.lanes.find(l => l.id === a)
       if (!l) return runFail(1, `muse-lane: unknown lane: ${a}`)
+      if (b === '--lead') {
+        const seq = Number(rest[3])
+        if (TERMINAL.has(l.status)) return runFail(2, `muse-lane: lane is ${l.status}`)
+        if (!l.needsLead || l.needsLead.seq !== seq) return runFail(2, 'muse-lane: no such needs-lead seq')
+        l.leadAcked = l.leadAcked ?? []
+        if (l.leadAcked.includes(seq)) return runFail(3, '')
+        l.leadAcked.push(seq)
+        return runOk('')
+      }
       if (b === '--orphan') {
         if (l.status !== 'orphaned') return runFail(2, `muse-lane: lane is ${l.status}, not orphaned`)
         if (l.orphanAnnounced) return runFail(3, '')
@@ -166,6 +201,13 @@ function setup(on: On): { world: World; clock: MockClock } {
       return runOk('')
     }
     if (cmd === 'root') return runOk('/tmp/fake-lanes-root')
+    if (cmd === 'boxes') return runOk(JSON.stringify(world.boxes))
+    if (cmd === 'answer') {
+      const l = world.lanes.find(l => l.id === a)
+      if (!l) return runFail(1, `muse-lane: unknown lane: ${a}`)
+      if (TERMINAL.has(l.status)) return runFail(2, `muse-lane: lane is ${l.status}`)
+      return runOk('answered')
+    }
     if (cmd === 'start') {
       world.startArgs.push([...rest])
       return runOk(`lane-new-${world.startArgs.length}`)
@@ -182,8 +224,20 @@ function setup(on: On): { world: World; clock: MockClock } {
   on('session.id', () => ({ value: ME }))
   on('session.start', (_h, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_h, e) => {
+    if (world.dropNext > 0) {
+      world.dropNext -= 1
+      return { drop: 'the prompt was removed from the queue before it ran' }
+    }
     world.submits.push(e.text)
     return { text: e.text }
+  })
+  on('ui.open', () => {
+    world.opens += 1
+    return { value: world.placed ? { isPlaced: true as const } : { isPlaced: false as const, reason: 'narrow' } }
+  })
+  on('ui.notify', (_h, e) => {
+    world.notifies.push(e.text)
+    return { value: { isSent: true as const, channel: 'terminal_bell' as const } }
   })
   on('tool.register', (_h, e) => ({ value: { tool: e.name } }))
   on('command.register', (_h, e) => ({ value: { command: e.name } }))
@@ -318,7 +372,7 @@ test('orphaned lane is announced once, then its real end after resume', async ($
   expectStateShape(world)
 })
 
-test('owned lane end toasts alongside the wake-up', async ($, on) => {
+test('a failed lane toasts alongside the wake-up; a done lane wakes quietly', async ($, on) => {
   const { world, clock } = setup(on)
   await begin($, clock)
 
@@ -329,12 +383,21 @@ test('owned lane end toasts alongside the wake-up', async ($, on) => {
   })
   await pollOnce($, clock)
   expect(world.submits).toHaveLength(1)
+  expect(world.toasts).toHaveLength(0)
+
+  world.lanes.push({
+    id: 'lane-18', label: 'india', status: 'failed',
+    owner: ME, announced: false, orphanAnnounced: false,
+    summary: 'india summary',
+  })
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(2)
   expect(world.toasts).toHaveLength(1)
-  expect(world.toasts[0]).toContain('hotel')
-  expect(world.toasts[0]).toContain('done')
+  expect(world.toasts[0]).toContain('india')
+  expect(world.toasts[0]).toContain('failed')
   expect(world.toasts[0]).not.toContain('\n')
   await pollOnce($, clock)
-  expect(world.submits).toHaveLength(1)
+  expect(world.submits).toHaveLength(2)
   expect(world.toasts).toHaveLength(1)
   expectStateShape(world)
 })
@@ -554,4 +617,172 @@ test('stacked polls behind a slow status issue one fetch', async ($, on) => {
   await pollOnce($, clock)
   expect(world.submits).toHaveLength(1)
   expectStateShape(world)
+})
+
+test('lanes ending in one poll wake once with a digest', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  world.lanes.push(
+    { id: 'lane-a', label: 'alpha', status: 'done', owner: ME, announced: false, orphanAnnounced: false, summary: 'alpha full',
+      evidence: { branch: 'lane/alpha', head: 'abcdef1234567', head_start: '0123456789ab', commits: 2, accept_log: '/l/a/accept.log', review_files: [], summary_path: '/l/a/summary.md' } },
+    { id: 'lane-b', label: 'bravo', status: 'failed', owner: ME, announced: false, orphanAnnounced: false, summary: 'bravo full',
+      needsLead: { seq: 1, kind: 'accept_failed_harness', detail: 'exit 5: NOT STARTED' } },
+  )
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(1)
+  const d = world.submits[0]!
+  expect(d).toContain('Muse: 2 lane events.')
+  expect(d).toContain('lane-a')
+  expect(d).toContain('READY TO MERGE: lane/alpha')
+  expect(d).toContain('lane-b')
+  expect(d).toContain('accept_failed_harness: exit 5: NOT STARTED')
+  expect(d).not.toContain('alpha full')
+  expect(world.toasts).toEqual(['Muse lane bravo: failed'])
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(1)
+  expect(world.store.get('muse/outbox')).toEqual([])
+})
+
+test('a live lane that needs the lead wakes once per needs-lead seq', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  world.lanes.push({ id: 'lane-q', label: 'quebec', status: 'running', owner: ME, announced: false, orphanAnnounced: false })
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(0)
+
+  world.lanes[0]!.needsLead = { seq: 1, kind: 'question', detail: 'change the accept to skip PlayMode?' }
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(1)
+  expect(world.submits[0]).toContain('needs the lead: question: change the accept to skip PlayMode?')
+  expect(world.submits[0]).toContain('lane_answer')
+  expect(world.toasts).toHaveLength(1)
+  expect(world.notifies).toHaveLength(1)
+  expect(world.statuses.at(-1)).toBe('muse: 1 running · 1 need lead')
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(1)
+  expect(world.ackCalls.filter(c => c === 'ack lane-q --lead 1')).toHaveLength(1)
+
+  world.lanes[0]!.needsLead = { seq: 2, kind: 'box_wait_timeout', detail: 'gpu-6 queued 31m' }
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(2)
+  expect(world.submits[1]).toContain('box_wait_timeout')
+  expect(world.submits[1]).toContain('box}')
+  await pollOnce($, clock)
+  expectStateShape(world)
+})
+
+test('a dropped wake stays in the outbox and goes out on the next poll', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  world.dropNext = 1
+  world.lanes.push({ id: 'lane-d', label: 'delta', status: 'done', owner: ME, announced: false, orphanAnnounced: false, summary: 'delta summary' })
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(0)
+  expect((world.store.get('muse/outbox') as unknown[]).length).toBe(1)
+
+  // No retry before the pause is over.
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(0)
+  await clock.advance(21_000)
+  await pollOnce($, clock)
+  expect(world.submits).toHaveLength(1)
+  expect(world.submits[0]).toContain('delta summary')
+  expect(world.store.get('muse/outbox')).toEqual([])
+  expect(world.ackCalls.filter(c => c === 'ack lane-d')).toHaveLength(1)
+})
+
+test('lane_start passes scope, box and advisor, and says how to open the pane when it is not placed', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  world.placed = false
+  const r = await callMcp($, {
+    tool: 'mcp__muse__lane_start',
+    cwd: '/tmp/work',
+    steps: [{ prompt: 'do it' }],
+    scope: ['Assets/Scripts/**', 'docs/*.md'],
+    box: 'simgoodie-gpu-3',
+    advisor: { model: 'opus', max: 2 },
+  })
+  await clock.settle()
+  expect(r.isError).toBeFalsy()
+  expect(r.result).toContain('/muse')
+  const a = world.startArgs[0]!
+  expect(a.join(' ')).toContain('--scope Assets/Scripts/** --scope docs/*.md')
+  expect(a.join(' ')).toContain('--box simgoodie-gpu-3')
+  expect(a.join(' ')).toContain('--advisor-model opus --advisor-max 2')
+  expect(world.opens).toBe(1)
+
+  world.placed = true
+  const r2 = await callMcp($, { tool: 'mcp__muse__lane_start', cwd: '/tmp/work', steps: [{ prompt: 'x' }], advisor: {} })
+  await clock.settle()
+  expect(r2.result).not.toContain('/muse')
+  expect(world.startArgs[1]!.join(' ')).toContain('--advisor-model sonnet')
+  expect(world.startArgs[1]!).not.toContain('--advisor-max')
+})
+
+test('lane_answer passes text and box, and refuses an empty answer', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+  world.lanes.push({ id: 'lane-q', label: 'quebec', status: 'running', owner: ME, announced: false, orphanAnnounced: false })
+
+  const empty = await callMcp($, { tool: 'mcp__muse__lane_answer', id: 'lane-q' })
+  expect(empty.isError).toBe(true)
+  const r = await callMcp($, { tool: 'mcp__muse__lane_answer', id: 'lane-q', text: 'keep PlayMode', box: 'gpu-2' })
+  await clock.settle()
+  expect(r.isError).toBeFalsy()
+  expect(world.runs).toContain('answer lane-q --text=keep PlayMode --box gpu-2')
+})
+
+test('the pane flags a lane needing the lead, shows boxes, and expands a row on press', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+  world.lanes.push(
+    { id: 'lane-r', label: 'romeo', status: 'running', owner: ME, announced: false, orphanAnnounced: false, box: 'gpu-3' },
+    { id: 'lane-s', label: 'sierra', status: 'running', owner: ME, announced: false, orphanAnnounced: false,
+      needsLead: { seq: 1, kind: 'scope_violation', detail: 'ProjectSettings/x.asset' } },
+  )
+  world.boxes = [{ box: 'gpu-3', holder_lane: 'lane-r', queue: ['lane-r'], lease: { who: 'lead', what: 'R16 gate', since: '2026-11-06T10:00:00Z' } }]
+  await pollOnce($, clock)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'muse', component: 'Pane', requestId: 'muse-lanes', surface,
+      props: { title: 'Muse lanes', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+    })
+    expect((await ui.find({ type: 'Text', text: /2 running · 1 need lead/ }))).toBeTruthy()
+    expect((await ui.find({ type: 'Text', text: /gpu-3: romeo · lease lead: R16 gate/ }))).toBeTruthy()
+    expect((await ui.find({ type: 'Text', text: /needs lead: scope_violation: ProjectSettings\/x.asset/ }))).toBeTruthy()
+    await ui.unmount()
+  }
+
+  const ui = await $.ui.mount({
+    plugin: 'muse', component: 'Pane', requestId: 'muse-lanes', surface: 'terminal',
+    props: { title: 'Muse lanes', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+  })
+  await ui.press({ key: 'row-lane-r' })
+  await clock.settle()
+  expect(world.runs).toContain('status lane-r')
+  expect((world.store.get('muse/expanded') as Record<string, boolean>)['lane-r']).toBe(true)
+  expect((world.store.get('muse/details') as Record<string, string>)['lane-r']).toContain('status: running')
+  await ui.unmount()
+})
+
+test('an event is queued in the outbox before the runner ack claims it', async ($, on) => {
+  const { world, clock } = setup(on)
+  await begin($, clock)
+
+  world.lanes.push(
+    { id: 'lane-o', label: 'oscar', status: 'done', owner: ME, announced: false, orphanAnnounced: false, summary: 'oscar summary' },
+    { id: 'lane-p', label: 'papa', status: 'running', owner: ME, announced: false, orphanAnnounced: false,
+      needsLead: { seq: 4, kind: 'question', detail: 'which box?' } },
+  )
+  await pollOnce($, clock)
+  expect(world.ackCalls).toEqual(['ack lane-o', 'ack lane-p --lead 4'])
+  expect(world.outboxAtAck[0]).toContain('lane-o:end:0')
+  expect(world.outboxAtAck[1]).toContain('lane-p:lead:4')
+  expect(world.submits).toHaveLength(1)
 })

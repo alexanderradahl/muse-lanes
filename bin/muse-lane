@@ -9,6 +9,7 @@ import argparse
 import datetime
 import errno
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -43,11 +44,38 @@ LOCK_NAME = "supervisor.lock"
 STOP_MARKER = "stop.requested"
 ANNOUNCE_MARKER = "announced"
 ORPHAN_MARKER_PREFIX = "announced-orphan-"
+LEAD_MARKER_PREFIX = "announced-lead-"
 MIN_SECRET_LEN = 12
 QUEUED_ORPHAN_AFTER_SEC = 30.0
 LOCK_RETRY_SEC = 2.0
 ACK_EXISTS_EXIT = 3
 CLASSIFY_TAIL_LINES = 40
+NEEDS_LEAD_KINDS = {"question", "review_failed", "accept_failed_code",
+                    "accept_failed_harness", "box_wait_timeout",
+                    "scope_violation"}
+ACCEPT_MAPPABLE_KINDS = {"accept_failed_code", "accept_failed_harness",
+                         "box_wait_timeout"}
+CONFIG_KEYS = ("accept_exit_kinds", "box_wait_max_min", "lease_file",
+               "lease_claim_re", "lease_release_re", "advisor_cmd",
+               "advisor_timeout_min")
+DEFAULT_ADVISOR_CMD = ["claude", "-p", "--model", "{model}",
+                       "--tools", "Read,Grep,Glob",
+                       "--permission-mode", "dontAsk",
+                       "--no-session-persistence",
+                       "--settings", '{"disableAllHooks":true}']
+NEEDS_LEAD_RE = r"^LANE-NEEDS-LEAD: (\S+) ?(.*)$"
+SCOPE_DETAIL_CAP = 2000
+NEEDS_LEAD_DETAIL_CAP = 2000
+ADVISOR_ANSWER_CAP = 8000
+ADVISOR_DEFAULT_MODEL = "sonnet"
+ADVISOR_DEFAULT_MAX = 3
+ADVISOR_MODELS = ("sonnet", "opus")
+ADVISOR_ERROR_CAP = 300
+ADVISOR_FORBIDDEN_TOOLS = ("Bash", "Edit", "Write", "NotebookEdit")
+BOXES_DIR = "_boxes"
+LEAD_SIDECAR_PREFIX = "lead-"
+LEAD_SIDECAR_SUFFIX = ".json"
+LEAD_SIDECAR_MERGED_SUFFIX = ".merged"
 
 
 def lanes_root():
@@ -57,6 +85,542 @@ def lanes_root():
 
 def lane_dir(lane_id):
     return os.path.join(lanes_root(), lane_id)
+
+
+def default_config():
+    return {
+        "accept_exit_kinds": {},
+        "box_wait_max_min": 30,
+        "lease_file": None,
+        "lease_claim_re": None,
+        "lease_release_re": None,
+        "advisor_cmd": list(DEFAULT_ADVISOR_CMD),
+        "advisor_timeout_min": 15,
+    }
+
+
+def config_file_path():
+    """Configured file, or None for defaults. Env wins over the root file."""
+    env = os.environ.get("MUSE_LANES_CONFIG")
+    if env and str(env).strip():
+        return os.path.abspath(os.path.expanduser(str(env).strip())), True
+    root_p = os.path.join(lanes_root(), "config.json")
+    if os.path.isfile(root_p):
+        return root_p, False
+    return None, False
+
+
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _validate_config_key(key, val):
+    """(ok, normalized_or_reason)."""
+    if key == "accept_exit_kinds":
+        if not isinstance(val, dict):
+            return False, "must be an object mapping exit codes to kinds"
+        norm = {}
+        for k, v in val.items():
+            try:
+                code = int(str(k).strip())
+            except (TypeError, ValueError):
+                return False, "key %r is not an exit code" % (k,)
+            if code < 0 or code > 255:
+                return False, "exit code %r out of range 0-255" % (k,)
+            if not isinstance(v, str) or v not in ACCEPT_MAPPABLE_KINDS:
+                return False, "value %r must be one of %s" % (
+                    v, sorted(ACCEPT_MAPPABLE_KINDS))
+            norm[str(code)] = v
+        return True, norm
+    if key == "box_wait_max_min":
+        if not _is_num(val) or val <= 0:
+            return False, "must be a number > 0"
+        return True, val
+    if key == "lease_file":
+        if val is not None and not isinstance(val, str):
+            return False, "must be a string or null"
+        return True, val
+    if key in ("lease_claim_re", "lease_release_re"):
+        if val is not None:
+            if not isinstance(val, str):
+                return False, "must be a string or null"
+            try:
+                re.compile(val)
+            except re.error as e:
+                return False, "invalid regex: %s" % e
+        return True, val
+    if key == "advisor_cmd":
+        if (not isinstance(val, list) or not val or
+                not all(isinstance(x, str) for x in val)):
+            return False, "must be a non-empty list of strings"
+        return True, list(val)
+    if key == "advisor_timeout_min":
+        if not _is_num(val) or val <= 0:
+            return False, "must be a number > 0"
+        return True, val
+    return True, val
+
+
+def load_effective_config():
+    """(config, error). Unknown keys ignored; malformed names the key."""
+    cfg = default_config()
+    path, from_env = config_file_path()
+    if path is None:
+        return cfg, None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        if from_env:
+            return None, "config file not found: %s" % path
+        return cfg, None
+    except (OSError, ValueError) as e:
+        return None, "malformed config file %s: %s" % (path, e)
+    if not isinstance(raw, dict):
+        return None, "malformed config file %s: must be a JSON object" % path
+    for key in CONFIG_KEYS:
+        if key not in raw:
+            continue
+        ok, norm = _validate_config_key(key, raw[key])
+        if not ok:
+            return None, "invalid config key %r in %s: %s" % (key, path, norm)
+        cfg[key] = norm
+    return cfg, None
+
+
+def lead_marker_name(seq):
+    return "%s%s" % (LEAD_MARKER_PREFIX, seq)
+
+
+def is_lead_announced(ldir, seq):
+    if seq is None:
+        return False
+    try:
+        return os.path.exists(os.path.join(ldir, lead_marker_name(seq)))
+    except OSError:
+        return False
+
+
+def parse_needs_lead_last(log_text):
+    """Last LANE-NEEDS-LEAD line: (kind, detail, raw) or None."""
+    if not log_text:
+        return None
+    last = None
+    for line in str(log_text).splitlines():
+        m = re.match(NEEDS_LEAD_RE, line)
+        if m:
+            last = (m.group(1), m.group(2) or "", line.strip())
+    return last
+
+
+def accept_needs_lead_for_exit(exit_code, log_text, config):
+    """(kind, detail) for a nonzero accept exit; the last line wins."""
+    last = parse_needs_lead_last(log_text or "")
+    if last is not None:
+        kind_raw, detail_raw, raw_line = last
+        if kind_raw in NEEDS_LEAD_KINDS:
+            return kind_raw, (detail_raw or "").strip()[:NEEDS_LEAD_DETAIL_CAP]
+        return "accept_failed_code", raw_line[:NEEDS_LEAD_DETAIL_CAP]
+    mapping = {}
+    try:
+        mapping = (config or {}).get("accept_exit_kinds") or {}
+    except Exception:
+        mapping = {}
+    mapped = None
+    if isinstance(mapping, dict):
+        mapped = mapping.get(str(exit_code))
+        if mapped is None:
+            try:
+                mapped = mapping.get(int(str(exit_code)))
+            except (TypeError, ValueError):
+                mapped = None
+    if isinstance(mapped, str) and mapped in ACCEPT_MAPPABLE_KINDS:
+        return mapped, "accept exit %s" % exit_code
+    return "accept_failed_code", "accept exit %s" % exit_code
+
+
+def parse_escalate_reason(text):
+    """Reason after ESCALATE:, or None. First non-blank line wins.
+
+    Leading markdown/quote chars (backticks, asterisks, underscores, >)
+    and whitespace are stripped before matching the case-sensitive word.
+    """
+    if not text:
+        return None
+    for line in str(text).splitlines():
+        if not line.strip():
+            continue
+        s = re.sub(r"^[\s`*>_]+", "", line)
+        if s.startswith("ESCALATE:"):
+            return s[len("ESCALATE:"):].strip()
+        return None
+    return None
+
+
+def build_advisor_cmd(advisor_cmd, model, claude_bin=None):
+    """Advisor argv with {model} filled; $CLAUDE_BIN overrides argv[0]."""
+    base = list(advisor_cmd) if isinstance(advisor_cmd, list) and advisor_cmd else list(DEFAULT_ADVISOR_CMD)
+    filled = [str(p).replace("{model}", str(model)) for p in base]
+    override = (claude_bin or "").strip() if isinstance(claude_bin, str) else ""
+    if override:
+        filled[0] = override
+    return filled
+
+
+def build_advisor_prompt(question, ask_name, accept_cmd, scope_globs, step, n):
+    """Stdin prompt for the advisor: question, paths, accept, scope, rules."""
+    q = (question or "(empty)").strip() or "(empty)"
+    scope_txt = ", ".join(scope_globs) if scope_globs else "(none)"
+    L = []
+    L.append("You are the advisor for a Muse lane. Answer one mid-step question.")
+    L.append("Read-only: do not modify, create, or delete any files. Do not run long commands.")
+    L.append("")
+    L.append("Question from step %d (saved as .lane/%s):" % (step, ask_name))
+    L.append("")
+    L.append(q)
+    L.append("")
+    L.append("Acceptance command (you may not change it): %s" % (accept_cmd or "(none)"))
+    L.append("Scope (allowed globs, you may not change it): %s" % scope_txt)
+    L.append("Read the .lane/%s file and any paths the question names." % ask_name)
+    L.append("")
+    L.append("If this needs a lead decision (different acceptance, scope, or a product choice),")
+    L.append("answer with the first line ESCALATE: <one line> and nothing else.")
+    L.append("Keep the answer short and concrete; cite file:line paths you read.")
+    return "\n".join(L) + "\n"
+
+
+def advisor_cmd_forbidden_tool(advisor_cmd):
+    """First forbidden tool named in any --tools value, or None.
+
+    The advisor is read-only; only start() calls this, on the configured
+    command. Tokens compare whole (NotebookEdit is not Edit).
+    """
+    if not isinstance(advisor_cmd, list):
+        return None
+    vals = []
+    for i, arg in enumerate(advisor_cmd):
+        if not isinstance(arg, str):
+            continue
+        if arg == "--tools":
+            if i + 1 < len(advisor_cmd) and isinstance(advisor_cmd[i + 1], str):
+                vals.append(advisor_cmd[i + 1])
+        elif arg.startswith("--tools="):
+            vals.append(arg[len("--tools="):])
+    for v in vals:
+        for tok in str(v).split(","):
+            if tok.strip() in ADVISOR_FORBIDDEN_TOOLS:
+                return tok.strip()
+    return None
+
+
+def box_name_error(name):
+    """None when name is a usable box name, else a reason string."""
+    if not isinstance(name, str) or not name:
+        return "must be non-empty"
+    if name in (".", ".."):
+        return "must not be '.' or '..'"
+    if "/" in name:
+        return "must not contain '/'"
+    if "\0" in name:
+        return "must not contain NUL"
+    return None
+
+
+def boxes_root(root=None):
+    return os.path.join(root or lanes_root(), BOXES_DIR)
+
+
+def box_ticket_stamp(dt=None):
+    """UTC stamp for a ticket name. Fixed width, no dashes, sorts in time order."""
+    if dt is None:
+        dt = datetime.datetime.now(datetime.timezone.utc)
+    return dt.strftime("%Y%m%dT%H%M%S.%f")
+
+
+def parse_box_ticket_name(fn):
+    """(queued_key, lane_id) for `<queued>-<lane id>`, else None.
+
+    Lenient on purpose: anything with a non-empty head and tail around the
+    first dash parses, so hand-made tickets still list. Unparseable names
+    are ignored by the queue, never blockers.
+    """
+    if not isinstance(fn, str) or "-" not in fn:
+        return None
+    q, lid = fn.split("-", 1)
+    if not q or not lid:
+        return None
+    if "/" in q or "/" in lid or lid in (".", ".."):
+        return None
+    return (q, lid)
+
+
+def list_box_tickets(box, root=None):
+    """Sorted [(ticket_name, lane_id)] of parseable tickets for a box."""
+    bdir = os.path.join(boxes_root(root), box)
+    try:
+        fns = os.listdir(bdir)
+    except OSError:
+        return []
+    out = []
+    for fn in fns:
+        p = parse_box_ticket_name(fn)
+        if p is None:
+            continue
+        if not os.path.isfile(os.path.join(bdir, fn)):
+            continue
+        out.append((fn, p[1]))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def box_ticket_owner_alive(lane_id):
+    """True when the ticket owner's supervisor currently holds its lock.
+
+    Flock probe only (see supervisor_alive): no process-name matching.
+    """
+    try:
+        return supervisor_alive(lane_dir(lane_id))
+    except Exception:
+        return False
+
+
+def box_older_live_tickets(box, my_name, my_lane_id, root=None):
+    """Names of older tickets whose lane supervisor is alive. Own lane skipped."""
+    older = []
+    for fn, lid in list_box_tickets(box, root):
+        if fn >= my_name:
+            break
+        if lid == my_lane_id:
+            continue
+        if box_ticket_owner_alive(lid):
+            older.append(fn)
+    return older
+
+
+def find_own_box_tickets(lane_id, root=None):
+    """[(box, ticket_name)] of this lane's tickets across all boxes."""
+    found = []
+    broot = boxes_root(root)
+    try:
+        boxes = os.listdir(broot)
+    except OSError:
+        return found
+    for box in boxes:
+        bdir = os.path.join(broot, box)
+        if not os.path.isdir(bdir):
+            continue
+        try:
+            fns = os.listdir(bdir)
+        except OSError:
+            continue
+        for fn in fns:
+            p = parse_box_ticket_name(fn)
+            if p is not None and p[1] == lane_id:
+                found.append((box, fn))
+    return found
+
+
+def remove_box_ticket(box, ticket_name, root=None):
+    try:
+        os.remove(os.path.join(boxes_root(root), box, ticket_name))
+        return True
+    except OSError:
+        return False
+
+
+def move_own_box_tickets(lane_id, new_box, root=None):
+    """Move this lane's tickets into box new_box. Returns [new names].
+
+    Each moved ticket gets a fresh stamp (now): it joins the BACK of the
+    target queue. Keeping the old stamp would let it jump ahead of the
+    lane already holding the target box.
+    """
+    broot = boxes_root(root)
+    target = os.path.join(broot, new_box)
+    os.makedirs(target, exist_ok=True)
+    moved = []
+    for box, fn in find_own_box_tickets(lane_id, root):
+        src = os.path.join(broot, box, fn)
+        try:
+            with open(src, "r", encoding="utf-8", errors="replace") as f:
+                old_body = json.load(f)
+            old_pid = old_body.get("pid") if isinstance(old_body, dict) else None
+        except (OSError, ValueError):
+            old_pid = None
+        for _try in range(5):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            cand = "%s-%s" % (box_ticket_stamp(now), lane_id)
+            dst = os.path.join(target, cand)
+            body = json.dumps({"lane": lane_id, "box": new_box,
+                               "queued_at": now.isoformat(),
+                               "moved_from": box,
+                               "moved_at": now.isoformat(),
+                               "pid": old_pid}) + "\n"
+            try:
+                fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                time.sleep(0.002)
+                continue
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(body)
+            except OSError:
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                raise
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+            moved.append(cand)
+            break
+    return moved
+
+
+def box_holder_and_queue(box, tickets=None, root=None):
+    """(holder_lane, queue) for a box from its tickets.
+
+    Dead lanes' tickets are skipped, not removed. The holder is the oldest
+    live ticket whose lane state shows box_state held; every other live
+    ticket lane queues oldest-first.
+    """
+    if tickets is None:
+        tickets = list_box_tickets(box, root)
+    holder = None
+    queue = []
+    for _fn, lid in sorted(tickets, key=lambda t: t[0]):
+        if not box_ticket_owner_alive(lid):
+            continue
+        held = False
+        try:
+            st = load_json(os.path.join(lane_dir(lid), "state.json"), None)
+            held = isinstance(st, dict) and st.get("box_state") == "held"
+        except Exception:
+            held = False
+        if held and holder is None:
+            holder = lid
+        else:
+            queue.append(lid)
+    return (holder, queue)
+
+
+def parse_box_leases(text, claim_re_s, release_re_s):
+    """({box: {who, what, since}}, {boxes seen}) from a lease file.
+
+    A box is held when its last CLAIM line has no later RELEASE line.
+    Missing groups read as None; unusable regexes or text parse nothing.
+    """
+    held = {}
+    seen = set()
+    if not text or not claim_re_s or not release_re_s:
+        return (held, seen)
+    try:
+        claim_re = re.compile(claim_re_s)
+    except re.error:
+        return (held, seen)
+    try:
+        release_re = re.compile(release_re_s)
+    except re.error:
+        return (held, seen)
+    last_claim = {}
+    last_release = {}
+    for i, line in enumerate(str(text).splitlines()):
+        m = claim_re.search(line)
+        if m is not None:
+            gd = m.groupdict()
+            b = gd.get("box")
+            if b:
+                seen.add(b)
+                last_claim[b] = (i, {"who": gd.get("who"),
+                                     "what": gd.get("what"),
+                                     "since": gd.get("at")})
+        m2 = release_re.search(line)
+        if m2 is not None:
+            b2 = m2.groupdict().get("box")
+            if b2:
+                seen.add(b2)
+                last_release[b2] = i
+    for b, (i, lease) in last_claim.items():
+        if last_release.get(b, -1) < i:
+            held[b] = lease
+    return (held, seen)
+
+
+def should_apply_lead_clear(current, kind, seq):
+    """True when a lead clear sidecar matches the open needs-lead event.
+
+    The seq guard keeps a stale clear from wiping a newer event raised
+    after the lead read state.
+    """
+    if not isinstance(current, dict):
+        return False
+    try:
+        if int(current.get("seq")) != int(seq):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if kind is not None and current.get("kind") != kind:
+        return False
+    return True
+
+
+def write_lead_sidecar(ldir, kind, payload):
+    """Write lead-<utcstamp>-<n>.json via O_EXCL. Returns the path."""
+    stamp = box_ticket_stamp()
+    try:
+        existing = os.listdir(ldir)
+    except OSError:
+        existing = []
+    n = sum(1 for fn in existing if fn.startswith(LEAD_SIDECAR_PREFIX)) + 1
+    body = json.dumps({"kind": kind, "at": now_iso(),
+                       "payload": payload if isinstance(payload, dict) else {}}) + "\n"
+    for _ in range(100):
+        path = os.path.join(ldir, "%s%s-%d%s" % (
+            LEAD_SIDECAR_PREFIX, stamp, n, LEAD_SIDECAR_SUFFIX))
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            n += 1
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+        except OSError:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
+        _chmod_0600(path)
+        return path
+    raise OSError("cannot allocate lead sidecar name in %s" % ldir)
+
+
+def _last_nonblank_line(text):
+    for ln in reversed(str(text or "").splitlines()):
+        if ln.strip():
+            return ln.strip()
+    return ""
+
+
+def format_advisor_error(rc, err_text, out_text, secrets=None):
+    """'exit <rc>: <last line>' for a failed advisor call.
+
+    Prefers the last stderr line, falls back to stdout; redacted and
+    capped at ADVISOR_ERROR_CAP chars.
+    """
+    line = _last_nonblank_line(err_text) or _last_nonblank_line(out_text)
+    if rc is None:
+        base = "exit ?"
+    else:
+        try:
+            base = "exit %d" % int(rc)
+        except (TypeError, ValueError):
+            base = "exit %s" % rc
+    s = base if not line else "%s: %s" % (base, line)
+    return redact_text(s, secrets or [])[:ADVISOR_ERROR_CAP]
 
 
 def now_iso():
@@ -582,6 +1146,54 @@ def get_git_status_output(cwd):
     return r.stdout or ""
 
 
+def _git_fields_z(args, cwd, timeout=10):
+    """Run git with -z output; NUL-split str fields, or None on failure.
+
+    Bytes decoded as UTF-8 (-z disables the C-style quoting that would
+    mangle non-ASCII names in text mode).
+    """
+    try:
+        r = subprocess.run(
+            ["git", "--no-optional-locks"] + list(args),
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        out = (r.stdout or b"").decode("utf-8", "surrogateescape")
+    except Exception:
+        return None
+    return [f for f in out.split("\0") if f != ""]
+
+
+def _parse_porcelain_z_fields(fields):
+    """Paths from `git status --porcelain -z -uall` fields.
+
+    Renames/copies yield BOTH paths (the entry's new path plus the
+    orig-path field that follows it).
+    """
+    paths = []
+    items = list(fields or [])
+    i = 0
+    while i < len(items):
+        f = items[i]
+        i += 1
+        if not isinstance(f, str) or len(f) < 4 or f[2] != " ":
+            continue
+        if f[3:]:
+            paths.append(f[3:])
+        if f[0] in ("R", "C") and i < len(items):
+            if items[i]:
+                paths.append(items[i])
+            i += 1
+    return paths
+
+
 def get_git_status_hash(cwd):
     out = get_git_status_output(cwd)
     if out is None:
@@ -623,6 +1235,103 @@ def get_last_subject(cwd):
         return None
     s = (r.stdout or "").strip()
     return s or None
+
+
+def get_git_branch(cwd):
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    r = _git(["branch", "--show-current"], cwd)
+    if r is not None and r.returncode == 0:
+        b = (r.stdout or "").strip()
+        if b:
+            return b
+    r2 = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    if r2 is not None and r2.returncode == 0:
+        b2 = (r2.stdout or "").strip()
+        if b2 and b2 != "HEAD":
+            return b2
+    return None
+
+
+def _is_lane_internal_path(p):
+    """True for the supervisor's own .lane/ files (ASK/ANSWER), never violations."""
+    return p == ".lane" or p.startswith(".lane/")
+
+
+def scope_violating_paths(cwd, head_start, scope_globs):
+    """Sorted changed paths matching no scope glob. Empty scope skips."""
+    if not scope_globs:
+        return []
+    if not cwd or not os.path.isdir(cwd):
+        return []
+    changed = set()
+    if head_start:
+        try:
+            head_now = get_git_head(cwd)
+        except Exception:
+            head_now = None
+        if head_now and head_start != head_now:
+            fields = _git_fields_z(["diff", "--name-only", "-z",
+                                    "%s..%s" % (head_start, head_now)], cwd)
+            if fields is not None:
+                for p in fields:
+                    changed.add(p)
+    try:
+        zfields = _git_fields_z(["status", "--porcelain", "-z", "-uall"], cwd)
+    except Exception:
+        zfields = None
+    if zfields is None:
+        # Not a git repo (or git failed): nothing checkable.
+        if not changed:
+            return []
+    else:
+        for p in _parse_porcelain_z_fields(zfields):
+            changed.add(p)
+    if not changed:
+        return []
+    bad = []
+    for p in changed:
+        if _is_lane_internal_path(p):
+            continue
+        hit = False
+        for pat in scope_globs:
+            try:
+                if fnmatch.fnmatch(p, pat):
+                    hit = True
+                    break
+            except Exception:
+                continue
+        if not hit:
+            bad.append(p)
+    return sorted(bad)
+
+
+def build_evidence(ldir, lane, state, head, commits, branch=None):
+    """Evidence dict for a done lane."""
+    cwd = (lane or {}).get("cwd") or ""
+    if branch is None:
+        try:
+            branch = get_git_branch(cwd) if cwd else None
+        except Exception:
+            branch = None
+    accept_log_p = os.path.join(ldir, "accept.log")
+    accept_log = accept_log_p if os.path.exists(accept_log_p) else ""
+    review_files = []
+    try:
+        for fn in sorted(os.listdir(ldir)):
+            if fn.startswith("REVIEW-") and fn.endswith(".md"):
+                review_files.append(os.path.join(ldir, fn))
+    except OSError:
+        pass
+    return {
+        "branch": branch,
+        "head": head,
+        "head_start": (state or {}).get("head_start"),
+        "commits": int(commits or 0),
+        "accept_log": accept_log,
+        "review_files": review_files,
+        "summary_path": os.path.join(ldir, "summary.md"),
+    }
 
 
 def get_commit_log(cwd, head_start, head, max_lines=40):
@@ -1228,6 +1937,41 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
     lines.append("Wall time: %s" % wall_str)
     lines.append("Cwd: %s" % cwd)
     lines.append("")
+    nl = state.get("needs_lead") if isinstance(state.get("needs_lead"), dict) else None
+    ev = state.get("evidence") if isinstance(state.get("evidence"), dict) else None
+    if nl is not None:
+        lines.append("## NEEDS LEAD")
+        lines.append("kind: %s" % (nl.get("kind") or "?"))
+        lines.append("detail: %s" % (nl.get("detail") or "(none)"))
+        lines.append("seq: %s" % (nl.get("seq") if nl.get("seq") is not None else "?"))
+        if nl.get("step") is not None:
+            lines.append("step: %s" % nl.get("step"))
+        if nl.get("at"):
+            lines.append("at: %s" % nl.get("at"))
+        lines.append("")
+    if final_status == "done":
+        lines.append("## READY TO MERGE")
+        if ev is not None:
+            lines.append("branch: %s" % (ev.get("branch") or "(none)"))
+            lines.append("head: %s" % (ev.get("head") or "(none)"))
+            lines.append("head_start: %s" % (ev.get("head_start") or "(none)"))
+            lines.append("commits: %s" % ev.get("commits", 0))
+            lines.append("accept_log: %s" % (ev.get("accept_log") or "(none)"))
+            rf = ev.get("review_files") or []
+            if rf:
+                lines.append("review_files: %s" % ", ".join(rf))
+            else:
+                lines.append("review_files: (none)")
+            lines.append("summary_path: %s" % (ev.get("summary_path") or "(none)"))
+        else:
+            lines.append("branch: (none)")
+            lines.append("head: %s" % (head or "(none)"))
+            lines.append("head_start: %s" % (head_start or "(none)"))
+            lines.append("commits: %s" % commits)
+            lines.append("accept_log: (none)")
+            lines.append("review_files: (none)")
+            lines.append("summary_path: %s" % os.path.join(ldir, "summary.md"))
+        lines.append("")
     lines.append("## Attempts")
     if steps <= 0:
         lines.append("(no steps)")
@@ -1331,6 +2075,12 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
     else:
         lines.append("(none)")
     lines.append("")
+    box_notes = state.get("box_move_refusals") or []
+    if box_notes:
+        lines.append("## Box moves")
+        for _bn in box_notes:
+            lines.append("- %s" % _bn)
+        lines.append("")
     rcfg = lane.get("review") or {}
     rrounds = state.get("review_rounds") or []
     rerr = state.get("review_error")
@@ -1388,9 +2138,15 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
             except Exception:
                 en = "?"
             helper = e.get("helper") or ("answered" if e.get("answered") else "?")
+            by = e.get("by") or ("lead" if helper == "lead" else "muse")
+            esc = bool(e.get("escalated"))
+            adv_err = e.get("advisor_error") or ""
+            tags = "[%s by=%s escalated=%s%s]" % (
+                helper, by, esc,
+                (" advisor_error=%s" % adv_err) if adv_err else "")
             q = (e.get("question_preview") or "").strip().splitlines()
             q1 = q[0][:160] if q and q[0] else "(empty)"
-            lines.append("- Step %s #%s [%s]: %s" % (ek, en, helper, q1))
+            lines.append("- Step %s #%s %s: %s" % (ek, en, tags, q1))
         lines.append("")
     for k in range(1, steps + 1):
         lines.append("## Step %d final" % k)
@@ -1668,6 +2424,29 @@ def cmd_start(args):
             print("muse-lane: --env-file not readable: %s" % args.env_file, file=sys.stderr)
             return 1
     label = args.label or ""
+    cfg, cfg_err = load_effective_config()
+    if cfg_err is not None:
+        print("muse-lane: %s" % cfg_err, file=sys.stderr)
+        return 1
+    scope_globs = list(getattr(args, "scope", None) or [])
+    for g in scope_globs:
+        if not isinstance(g, str) or not g.strip():
+            print("muse-lane: invalid --scope (must be a non-empty glob)", file=sys.stderr)
+            return 1
+    bad_tool = advisor_cmd_forbidden_tool((cfg or {}).get("advisor_cmd"))
+    if bad_tool is not None:
+        print("muse-lane: advisor_cmd --tools must not include %s (advisor is read-only)" % bad_tool,
+              file=sys.stderr)
+        return 1
+    box_name = getattr(args, "box", None)
+    if box_name is not None:
+        box_name = str(box_name).strip()
+        box_err = box_name_error(box_name)
+        if box_err is not None:
+            print("muse-lane: invalid --box %r: %s" % (box_name, box_err), file=sys.stderr)
+            return 1
+    else:
+        box_name = None
     root = lanes_root()
     try:
         os.makedirs(root, exist_ok=True)
@@ -1754,11 +2533,32 @@ def cmd_start(args):
     if consult_timeout_min <= 0:
         print("muse-lane: --consult-timeout-min must be > 0", file=sys.stderr)
         return 1
+    advisor_model_raw = getattr(args, "advisor_model", None)
+    advisor_max_raw = getattr(args, "advisor_max", None)
+    advisor_cfg = None
+    if advisor_model_raw is not None or advisor_max_raw is not None:
+        _am = advisor_model_raw or ADVISOR_DEFAULT_MODEL
+        if _am not in ADVISOR_MODELS:
+            print("muse-lane: invalid --advisor-model (sonnet|opus)", file=sys.stderr)
+            return 1
+        try:
+            _ax = ADVISOR_DEFAULT_MAX if advisor_max_raw is None else int(advisor_max_raw)
+        except (TypeError, ValueError):
+            print("muse-lane: invalid --advisor-max", file=sys.stderr)
+            return 1
+        if _ax < 0:
+            print("muse-lane: --advisor-max must be >= 0", file=sys.stderr)
+            return 1
+        advisor_cfg = {"model": _am, "max": _ax}
     exec_env = {}
     try:
         exec_env["MUSE_BIN"] = os.environ.get("MUSE_BIN", "") or ""
     except Exception:
         exec_env["MUSE_BIN"] = ""
+    try:
+        exec_env["CLAUDE_BIN"] = os.environ.get("CLAUDE_BIN", "") or ""
+    except Exception:
+        exec_env["CLAUDE_BIN"] = ""
     try:
         exec_env["PATH"] = os.environ.get("PATH", "") or ""
     except Exception:
@@ -1796,6 +2596,10 @@ def cmd_start(args):
         "review": review_cfg,
         "consult_max": consult_max,
         "consult_timeout_sec": consult_timeout_min * 60.0,
+        "scope": scope_globs,
+        "box": box_name,
+        "config": cfg,
+        "advisor": advisor_cfg,
     }
     atomic_write_json(os.path.join(ldir, "lane.json"), lane)
     # Write queued state before spawning so stop/status never see a gap.
@@ -1831,6 +2635,13 @@ def cmd_start(args):
         "review_rounds": [],
         "review_error": None,
         "consults": [],
+        "needs_lead": None,
+        "needs_lead_seq": 0,
+        "box_state": None,
+        "box_queued_at": None,
+        "box_move_refusals": [],
+        "evidence": None,
+        "advisor_calls": 0,
     }
     atomic_write_json(os.path.join(ldir, "state.json"), queued_state)
     pid = spawn_supervisor(lane_id)
@@ -1868,6 +2679,13 @@ def _default_queued_state(lane):
         "review_rounds": [],
         "review_error": None,
         "consults": [],
+        "needs_lead": None,
+        "needs_lead_seq": 0,
+        "box_state": None,
+        "box_queued_at": None,
+        "box_move_refusals": [],
+        "evidence": None,
+        "advisor_calls": 0,
     }
 
 
@@ -1904,6 +2722,17 @@ def _build_status_obj(lid, lane, state, disp):
     obj.setdefault("review_rounds", [])
     obj.setdefault("review_error", None)
     obj.setdefault("consults", [])
+    obj.setdefault("needs_lead", None)
+    obj.setdefault("needs_lead_seq", 0)
+    obj.setdefault("box_state", None)
+    obj.setdefault("box_queued_at", None)
+    obj.setdefault("box_move_refusals", [])
+    obj.setdefault("evidence", None)
+    obj.setdefault("advisor_calls", 0)
+    try:
+        obj["advisor_calls"] = int(obj.get("advisor_calls") or 0)
+    except (TypeError, ValueError):
+        obj["advisor_calls"] = 0
     obj["id"] = lid
     obj["label"] = lane.get("label") or ""
     obj["cwd"] = lane.get("cwd") or ""
@@ -1912,14 +2741,29 @@ def _build_status_obj(lid, lane, state, disp):
     obj["announced"] = is_announced(ldir)
     obj["orphan_announced"] = is_orphan_announced(ldir, state)
     obj["stall_sec"] = lane.get("stall_sec")
-    # One git subprocess per lane; ended lanes keep a null subject so a
-    # full listing never shells out for lanes nobody is watching.
+    nl = obj.get("needs_lead")
+    seq = nl.get("seq") if isinstance(nl, dict) else None
+    obj["needs_lead_announced"] = is_lead_announced(ldir, seq)
+    obj["box"] = lane.get("box")
+    # Branch/head live-only: ended lanes run no git at all.
     if _is_live_display_status(disp):
+        cwd = lane.get("cwd") or ""
         try:
-            obj["last_subject"] = get_last_subject(lane.get("cwd") or "")
+            obj["branch"] = get_git_branch(cwd)
+        except Exception:
+            obj["branch"] = None
+        try:
+            fresh_head = get_git_head(cwd)
+        except Exception:
+            fresh_head = None
+        obj["head"] = fresh_head if fresh_head is not None else state.get("head")
+        try:
+            obj["last_subject"] = get_last_subject(cwd)
         except Exception:
             obj["last_subject"] = None
     else:
+        obj["branch"] = None
+        obj["head"] = state.get("head")
         obj["last_subject"] = None
     try:
         with open(os.path.join(ldir, "accept.log"), "r", encoding="utf-8", errors="replace") as f:
@@ -2079,6 +2923,14 @@ def _build_stopped_state(lane, state):
     except Exception:
         commits = int(state.get("commits") or 0)
     ended = now_iso()
+    try:
+        _seq = int(state.get("needs_lead_seq") or 0)
+    except (TypeError, ValueError):
+        _seq = 0
+    try:
+        _ac = int(state.get("advisor_calls") or 0)
+    except (TypeError, ValueError):
+        _ac = 0
     new_state = {
         "status": "stopped",
         "step": int(state.get("step") or 1),
@@ -2106,6 +2958,13 @@ def _build_stopped_state(lane, state):
         "review_rounds": state.get("review_rounds") or [],
         "review_error": state.get("review_error"),
         "consults": state.get("consults") or [],
+        "needs_lead": state.get("needs_lead"),
+        "needs_lead_seq": _seq,
+        "box_state": state.get("box_state"),
+        "box_queued_at": state.get("box_queued_at"),
+        "box_move_refusals": state.get("box_move_refusals") or [],
+        "evidence": None,
+        "advisor_calls": _ac,
     }
     for k, v in list(new_state.items()):
         if isinstance(v, str):
@@ -2303,7 +3162,28 @@ def cmd_ack(args):
         print("muse-lane: lane has no state: %s" % lane_id, file=sys.stderr)
         return 1
     want_orphan = bool(getattr(args, "orphan", False))
-    if want_orphan:
+    want_lead = getattr(args, "lead", None)
+    if want_orphan and want_lead is not None:
+        print("muse-lane: cannot combine --orphan and --lead", file=sys.stderr)
+        return 1
+    if want_lead is not None:
+        try:
+            want_seq = int(want_lead)
+        except (TypeError, ValueError):
+            print("muse-lane: invalid --lead seq: %r" % (want_lead,), file=sys.stderr)
+            return 1
+        nl = state.get("needs_lead") if isinstance(state.get("needs_lead"), dict) else None
+        cur = None
+        if nl is not None:
+            try:
+                cur = int(nl.get("seq"))
+            except (TypeError, ValueError):
+                cur = None
+        if nl is None or cur != want_seq:
+            print("muse-lane: lane has no needs-lead seq %s" % want_seq, file=sys.stderr)
+            return 2
+        marker = lead_marker_name(want_seq)
+    elif want_orphan:
         disp = display_status(state.get("status"), state.get("supervisor_pid"),
                               lane_id=lane_id, state=state, lane=lane)
         if disp != "orphaned":
@@ -2330,6 +3210,246 @@ def cmd_ack(args):
     except OSError:
         pass
     _chmod_0600(path)
+    return 0
+
+
+def _max_consult_n(entries):
+    m = 0
+    for e in entries or []:
+        try:
+            m = max(m, int(e.get("n") or 0))
+        except (TypeError, ValueError):
+            pass
+    return m
+
+
+def _consult_next_n(state, cwd):
+    m = 0
+    for e in (state or {}).get("consults") or []:
+        try:
+            m = max(m, int(e.get("n") or 0))
+        except (TypeError, ValueError):
+            pass
+    try:
+        for fn in os.listdir(os.path.join(cwd, ".lane")):
+            if fn.startswith("ASK-") and fn.endswith(".md"):
+                try:
+                    m = max(m, int(fn[4:-3]))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return m + 1
+
+
+def cmd_answer(args):
+    lane_id = args.id
+    ldir = lane_dir(lane_id)
+    lane = load_lane(lane_id)
+    if lane is None:
+        print("muse-lane: unknown lane: %s" % lane_id, file=sys.stderr)
+        return 1
+    state = load_state(lane_id)
+    if state is None:
+        print("muse-lane: lane has no state: %s" % lane_id, file=sys.stderr)
+        return 1
+    if state.get("status") in TERMINAL:
+        print("muse-lane: lane is %s, cannot answer an ended lane" % state.get("status"),
+              file=sys.stderr)
+        return 1
+    text = getattr(args, "text", None)
+    text_file = getattr(args, "text_file", None)
+    if text is not None and text_file is not None:
+        print("muse-lane: cannot combine --text and --text-file", file=sys.stderr)
+        return 1
+    if text_file is not None:
+        try:
+            with open(os.path.abspath(os.path.expanduser(text_file)), "r",
+                      encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            print("muse-lane: --text-file not readable: %s" % e, file=sys.stderr)
+            return 1
+    box_b = getattr(args, "box", None)
+    if box_b is not None:
+        box_b = str(box_b).strip()
+        box_err = box_name_error(box_b)
+        if box_err is not None:
+            print("muse-lane: invalid --box %r: %s" % (box_b, box_err), file=sys.stderr)
+            return 1
+    if text is None and box_b is None:
+        print("muse-lane: answer requires --text/--text-file and/or --box",
+              file=sys.stderr)
+        return 1
+    if box_b is not None and state.get("box_state") == "held":
+        print("muse-lane: cannot move box while the lane holds its box "
+              "(box_state is held; wait for the accept to release it)",
+              file=sys.stderr)
+        return 2
+    cwd = lane.get("cwd") or ""
+    lane_dot = os.path.join(cwd, ".lane")
+    nl = state.get("needs_lead") if isinstance(state.get("needs_lead"), dict) else None
+    seq = nl.get("seq") if nl is not None else None
+    secrets = secrets_from_env_file(lane.get("env_file"))
+    lead_entry = None
+    clear_question = False
+    if text is not None:
+        try:
+            os.makedirs(lane_dot, exist_ok=True)
+        except OSError as e:
+            print("muse-lane: cannot create .lane dir: %s" % e, file=sys.stderr)
+            return 1
+        body = text if text.endswith("\n") else text + "\n"
+        try:
+            atomic_write_text(os.path.join(lane_dot, "ANSWER.md"), body)
+            if seq is not None:
+                atomic_write_text(os.path.join(lane_dot, "ANSWER-lead-%s.md" % seq), body)
+        except OSError as e:
+            print("muse-lane: cannot write answer: %s" % e, file=sys.stderr)
+            return 1
+        if nl is not None and nl.get("kind") == "question":
+            clear_question = True
+        try:
+            step = int(state.get("step") or 1)
+        except (TypeError, ValueError):
+            step = 1
+        qprev = ""
+        if nl is not None:
+            qprev = redact_text(str(nl.get("detail") or "")[:CONSULT_QUESTION_PREVIEW], secrets)
+        lead_entry = {
+            "step": step,
+            "n": _consult_next_n(state, cwd),
+            "question_preview": qprev,
+            "answered": True,
+            "helper": "lead",
+            "by": "lead",
+            "escalated": False,
+            "answer_preview": redact_text(text[:CONSULT_ANSWER_PREVIEW], secrets),
+        }
+    # Liveness first: under a live supervisor answer never touches
+    # lane.json or tickets itself. A check-then-move here races the
+    # supervisor's hold decision (it can switch to held between our
+    # state.json read and our ticket move, freeing the old box while
+    # our waiter still counts as queued on it). The live path writes a
+    # box sidecar only; the supervisor applies it inside its wait loop
+    # in the same poll iteration that decides whether to hold.
+    try:
+        live = supervisor_alive(ldir)
+    except Exception:
+        live = False
+    if box_b is not None and live:
+        try:
+            if lead_entry is not None:
+                write_lead_sidecar(ldir, "consult", {"entry": lead_entry})
+                if clear_question:
+                    write_lead_sidecar(ldir, "clear", {"kind": "question", "seq": seq})
+            write_lead_sidecar(ldir, "box", {"box": box_b})
+        except OSError as e:
+            print("muse-lane: cannot write lead sidecar: %s" % e, file=sys.stderr)
+            return 1
+        print("box move requested")
+        return 0
+    if box_b is not None:
+        # Orphaned direct path (a live supervisor returned above):
+        # lane.json first, then the ticket move, so a waiter that
+        # wakes mid-move derives the new box before adopting the
+        # ticket below it.
+        lane["box"] = box_b
+        try:
+            atomic_write_json(os.path.join(ldir, "lane.json"), lane)
+        except OSError as e:
+            print("muse-lane: cannot write lane: %s" % e, file=sys.stderr)
+            return 1
+        try:
+            move_own_box_tickets(lane_id, box_b)
+        except OSError as e:
+            print("muse-lane: cannot move box ticket: %s" % e, file=sys.stderr)
+            return 1
+    if live:
+        # Never rewrite state.json under a live supervisor: it merges
+        # these sidecars into its in-memory state on its next poll.
+        # (A live box move returned above; this is the text-only path.)
+        try:
+            if lead_entry is not None:
+                write_lead_sidecar(ldir, "consult", {"entry": lead_entry})
+                if clear_question:
+                    write_lead_sidecar(ldir, "clear", {"kind": "question", "seq": seq})
+        except OSError as e:
+            print("muse-lane: cannot write lead sidecar: %s" % e, file=sys.stderr)
+            return 1
+        return 0
+    new_nl = nl
+    consults = list(state.get("consults") or [])
+    if lead_entry is not None:
+        consults.append(lead_entry)
+        if clear_question:
+            new_nl = None
+    if box_b is not None and isinstance(new_nl, dict) and new_nl.get("kind") == "box_wait_timeout":
+        new_nl = None
+    state["needs_lead"] = new_nl
+    state["consults"] = consults
+    state["updated_at"] = now_iso()
+    try:
+        atomic_write_json(os.path.join(ldir, "state.json"), state)
+    except OSError as e:
+        print("muse-lane: cannot write state: %s" % e, file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_boxes(args):
+    cfg, cfg_err = load_effective_config()
+    if cfg_err is not None:
+        print("muse-lane: %s; leases unavailable" % cfg_err, file=sys.stderr)
+        cfg = None
+    tickets_by_box = {}
+    broot = boxes_root()
+    try:
+        box_names = os.listdir(broot)
+    except OSError:
+        box_names = []
+    for box in box_names:
+        if not os.path.isdir(os.path.join(broot, box)):
+            continue
+        tickets = list_box_tickets(box)
+        if tickets:
+            tickets_by_box[box] = tickets
+    lease_text = None
+    lease_file = (cfg or {}).get("lease_file")
+    if lease_file:
+        try:
+            with open(os.path.abspath(os.path.expanduser(lease_file)), "r",
+                      encoding="utf-8", errors="replace") as f:
+                lease_text = f.read()
+        except OSError:
+            lease_text = None
+    held, lease_boxes = parse_box_leases(
+        lease_text, (cfg or {}).get("lease_claim_re"),
+        (cfg or {}).get("lease_release_re"))
+    for box in lease_boxes:
+        tickets_by_box.setdefault(box, [])
+    out = []
+    for box in sorted(tickets_by_box):
+        holder, queue = box_holder_and_queue(box, tickets_by_box[box])
+        out.append({"box": box, "holder_lane": holder, "queue": queue,
+                    "lease": held.get(box)})
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(out, indent=2))
+        return 0
+    if not out:
+        print("(no boxes)")
+        return 0
+    for o in out:
+        lease = o["lease"] if isinstance(o["lease"], dict) else None
+        if lease is None:
+            lease_s = "-"
+        else:
+            lease_s = "%s:%s since %s" % (lease.get("who") or "?",
+                                          lease.get("what") or "?",
+                                          lease.get("since") or "?")
+        print("%s holder=%s queue=%s lease=%s" % (
+            o["box"], o["holder_lane"] or "-",
+            ",".join(o["queue"]) or "-", lease_s))
     return 0
 
 
@@ -2412,6 +3532,13 @@ def cmd_run(lane_id):
     except OSError as e:
         print("muse-lane _run: cannot take supervisor lock: %s" % e, file=sys.stderr)
         return 1
+    # Fresh start or resume: drop our own stale tickets in every box
+    # before anything else, so a dead incarnation never blocks a queue.
+    try:
+        for _sbox, _sfn in find_own_box_tickets(lane_id):
+            remove_box_ticket(_sbox, _sfn)
+    except Exception:
+        pass
     # A stop that landed before we started: exit stopped without
     # overwriting the marker or a terminal state stop already wrote.
     if os.path.exists(os.path.join(ldir, STOP_MARKER)):
@@ -2462,7 +3589,7 @@ def cmd_run(lane_id):
     exec_env = lane.get("exec_env") if isinstance(lane.get("exec_env"), dict) else {}
     eff = dict(os.environ)
     for k, v in exec_env.items():
-        if k == "MUSE_BIN" or k == "PATH" or k.startswith("MUSE_LANE_"):
+        if k in ("MUSE_BIN", "CLAUDE_BIN") or k == "PATH" or k.startswith("MUSE_LANE_"):
             eff[k] = v
     poll_sec = _parse_poll_sec(eff)
     backoff = _parse_backoff(eff)
@@ -2511,6 +3638,45 @@ def cmd_run(lane_id):
     if consult_timeout_sec <= 0:
         consult_timeout_sec = 1.0
     muse_bin = (eff.get("MUSE_BIN", "") or "muse") or "muse"
+    lane_advisor = lane.get("advisor") if isinstance(lane.get("advisor"), dict) else None
+    advisor_model = None
+    advisor_max = 0
+    if lane_advisor is not None:
+        _am = lane_advisor.get("model") or ADVISOR_DEFAULT_MODEL
+        advisor_model = _am if _am in ADVISOR_MODELS else ADVISOR_DEFAULT_MODEL
+        try:
+            advisor_max = int(lane_advisor.get("max", ADVISOR_DEFAULT_MAX))
+        except (TypeError, ValueError):
+            advisor_max = ADVISOR_DEFAULT_MAX
+        if advisor_max < 0:
+            advisor_max = 0
+    advisor_enabled = bool(lane_advisor is not None and advisor_max > 0)
+    lane_config_early = lane.get("config") if isinstance(lane.get("config"), dict) else {}
+    try:
+        advisor_timeout_sec = float(lane_config_early.get("advisor_timeout_min", 15)) * 60.0
+    except (TypeError, ValueError):
+        advisor_timeout_sec = 15 * 60.0
+    try:
+        _ato = eff.get("MUSE_LANE_ADVISOR_TIMEOUT_SEC")
+        if _ato is not None and str(_ato).strip() != "":
+            advisor_timeout_sec = float(_ato)
+    except (TypeError, ValueError):
+        pass
+    if advisor_timeout_sec <= 0:
+        advisor_timeout_sec = 1.0
+    claude_bin = (eff.get("CLAUDE_BIN", "") or "").strip()
+    try:
+        box_wait_max_sec = float(lane_config_early.get("box_wait_max_min", 30)) * 60.0
+    except (TypeError, ValueError):
+        box_wait_max_sec = 30 * 60.0
+    try:
+        _bwo = eff.get("MUSE_LANE_BOX_WAIT_MAX_SEC")
+        if _bwo is not None and str(_bwo).strip() != "":
+            box_wait_max_sec = float(_bwo)
+    except (TypeError, ValueError):
+        pass
+    if box_wait_max_sec <= 0:
+        box_wait_max_sec = 1.0
 
     secrets = secrets_from_env_file(env_file)
     # In-memory snapshot (never on disk): redaction always uses the union
@@ -2609,7 +3775,156 @@ def cmd_run(lane_id):
     review_rounds_done = list((prev_state or {}).get("review_rounds") or [])
     review_error_holder = {"v": (prev_state or {}).get("review_error")}
     consults_done = list((prev_state or {}).get("consults") or [])
+    try:
+        _nl_seq = int((prev_state or {}).get("needs_lead_seq") or 0)
+    except (TypeError, ValueError):
+        _nl_seq = 0
+    _nl_cur = (prev_state or {}).get("needs_lead")
+    if isinstance(_nl_cur, dict):
+        try:
+            _nl_cur_seq = int(_nl_cur.get("seq") or 0)
+        except (TypeError, ValueError):
+            _nl_cur_seq = 0
+        if _nl_cur_seq > _nl_seq:
+            _nl_seq = _nl_cur_seq
+    else:
+        _nl_cur = None
+    needs_lead_holder = {"current": _nl_cur, "seq": _nl_seq}
+    box_state_holder = {"v": (prev_state or {}).get("box_state")}
+    box_queued_at_holder = {"v": (prev_state or {}).get("box_queued_at")}
+    in_box_wait_holder = {"v": False}
+    _br0 = (prev_state or {}).get("box_move_refusals")
+    box_refusals_holder = {"v": list(_br0) if isinstance(_br0, list) else []}
+    pending_box_moves = []
+    try:
+        _ac = int((prev_state or {}).get("advisor_calls") or 0)
+    except (TypeError, ValueError):
+        _ac = 0
+    advisor_calls_holder = {"v": _ac}
+    evidence_holder = {"v": (prev_state or {}).get("evidence")}
+    lane_scope = list(lane.get("scope") or []) if isinstance(lane.get("scope"), list) else []
+    lane_config = lane.get("config") if isinstance(lane.get("config"), dict) else {}
     current_last_event = (prev_state or {}).get("last_event")
+
+    def raise_needs_lead(kind, detail, step=None):
+        """Record a needs-lead event; each raise bumps seq. Returns the event."""
+        try:
+            seq = int(needs_lead_holder.get("seq") or 0) + 1
+        except (TypeError, ValueError):
+            seq = 1
+        needs_lead_holder["seq"] = seq
+        det = redact_text((detail or "")[:NEEDS_LEAD_DETAIL_CAP], secrets)
+        ev = {"seq": seq, "kind": kind, "detail": det, "at": now_iso()}
+        if step is not None:
+            try:
+                ev["step"] = int(step)
+            except (TypeError, ValueError):
+                pass
+        needs_lead_holder["current"] = ev
+        slog("needs-lead %s seq=%d step=%s: %s" % (
+            kind, seq, ev.get("step"), det[:160]))
+        return ev
+
+    def merge_lead_sidecars():
+        """Apply lead-*.json sidecars to in-memory state; rename to .merged.
+
+        clear drops a matching open needs-lead event, consult appends the
+        lead's consult entry (n reassigned past in-memory entries), box
+        queues a move for the box waiter when the lane is inside its wait
+        loop and queued, and is rejected otherwise (invalid, held, or not
+        waiting): the merged file gains a `rejected` reason and the refusal
+        is noted for the summary. Unparseable files are still marked merged
+        so one bad file cannot wedge every poll.
+        """
+        try:
+            names = sorted(os.listdir(ldir))
+        except OSError:
+            return
+        for fn in names:
+            if not fn.startswith(LEAD_SIDECAR_PREFIX):
+                continue
+            if not fn.endswith(LEAD_SIDECAR_SUFFIX):
+                continue
+            path = os.path.join(ldir, fn)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    sc = json.load(f)
+            except (OSError, ValueError):
+                sc = None
+            rejected_reason = None
+            try:
+                if isinstance(sc, dict):
+                    kind = sc.get("kind")
+                    payload = sc.get("payload")
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    if kind == "clear":
+                        if should_apply_lead_clear(needs_lead_holder["current"],
+                                                   payload.get("kind"), payload.get("seq")):
+                            needs_lead_holder["current"] = None
+                            slog("merged lead clear %s seq=%s" % (
+                                payload.get("kind"), payload.get("seq")))
+                    elif kind == "consult":
+                        entry = payload.get("entry")
+                        if isinstance(entry, dict):
+                            entry = dict(entry)
+                            # Module helper, not the consult_next_n
+                            # closure: merge also runs on resume paths
+                            # reached before that closure is defined.
+                            entry["n"] = _max_consult_n(consults_done) + 1
+                            consults_done.append(entry)
+                            slog("merged lead consult n=%s" % entry.get("n"))
+                    elif kind == "box":
+                        _target = payload.get("box")
+                        _berr = (box_name_error(_target)
+                                 if isinstance(_target, str) else "must be non-empty")
+                        if _berr is not None:
+                            rejected_reason = "invalid box %r: %s" % (_target, _berr)
+                            slog("rejected lead box move to %r: %s" % (_target, _berr))
+                            box_refusals_holder["v"].append(
+                                "box move to %s refused: %s" % (_target, rejected_reason))
+                        elif (in_box_wait_holder.get("v") and
+                                box_state_holder.get("v") == "queued"):
+                            pending_box_moves.append({
+                                "box": _target,
+                                "ticket": payload.get("ticket"),
+                            })
+                            slog("merged lead box move to %s" % _target)
+                        else:
+                            if box_state_holder.get("v") == "held":
+                                _held_box = None
+                                try:
+                                    _fresh = load_json(os.path.join(ldir, "lane.json"), None)
+                                    if isinstance(_fresh, dict):
+                                        _held_box = _fresh.get("box")
+                                except Exception:
+                                    _held_box = None
+                                if not _held_box:
+                                    try:
+                                        _held_box = lane.get("box")
+                                    except Exception:
+                                        _held_box = None
+                                rejected_reason = "lane held %s" % (_held_box or "?")
+                            else:
+                                rejected_reason = "lane not waiting"
+                            slog("rejected lead box move to %s: %s" % (
+                                _target, rejected_reason))
+                            box_refusals_holder["v"].append(
+                                "box move to %s refused: %s" % (_target, rejected_reason))
+            finally:
+                try:
+                    os.rename(path, path + LEAD_SIDECAR_MERGED_SUFFIX)
+                except OSError:
+                    pass
+                else:
+                    if rejected_reason is not None and isinstance(sc, dict):
+                        try:
+                            _m = dict(sc)
+                            _m["rejected"] = rejected_reason
+                            _m["rejected_at"] = now_iso()
+                            atomic_write_json(path + LEAD_SIDECAR_MERGED_SUFFIX, _m)
+                        except OSError:
+                            pass
     # Resume past a passed accept goes straight to review: all step finals are
     # present (start_step > steps) and the accept already passed (accept_exit 0).
     skip_accept = bool(review_enabled and start_step > steps and accept_exit == 0)
@@ -2645,6 +3960,7 @@ def cmd_run(lane_id):
                     last_event, head, commits, stderr_tail, accept_exit_v,
                     retry_at, reason, muse_started=None, accept_pid=None,
                     accept_started=None):
+        merge_lead_sidecars()
         st = {
             "status": status,
             "step": int(step),
@@ -2672,6 +3988,13 @@ def cmd_run(lane_id):
             "review_rounds": review_rounds_done,
             "review_error": review_error_holder["v"],
             "consults": consults_done,
+            "needs_lead": needs_lead_holder["current"],
+            "needs_lead_seq": needs_lead_holder["seq"],
+            "box_state": box_state_holder["v"],
+            "box_queued_at": box_queued_at_holder["v"],
+            "box_move_refusals": list(box_refusals_holder["v"]),
+            "evidence": evidence_holder["v"],
+            "advisor_calls": advisor_calls_holder["v"],
         }
         for k, v in list(st.items()):
             if isinstance(v, str):
@@ -2698,10 +4021,24 @@ def cmd_run(lane_id):
         if status != "stopped" and (stop_requested["flag"] or _stop_marker_present()):
             status = "stopped"
             reason = "stopped"
+        merge_lead_sidecars()
         secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
         head, commits = git_snapshot()
         ended = now_iso()
         prev = load_json(state_path, {}) or {}
+        if status == "done":
+            try:
+                _br = get_git_branch(cwd) if cwd and os.path.isdir(cwd) else None
+            except Exception:
+                _br = None
+            try:
+                ev = build_evidence(ldir, lane, {"head_start": head_start},
+                                    head, commits, branch=_br)
+            except Exception:
+                ev = None
+            evidence_holder["v"] = ev
+        else:
+            evidence_holder["v"] = None
         final = {
             "status": status,
             "step": int(step),
@@ -2729,6 +4066,13 @@ def cmd_run(lane_id):
             "review_rounds": review_rounds_done,
             "review_error": review_error_holder["v"],
             "consults": consults_done,
+            "needs_lead": needs_lead_holder["current"],
+            "needs_lead_seq": needs_lead_holder["seq"],
+            "box_state": box_state_holder["v"],
+            "box_queued_at": box_queued_at_holder["v"],
+            "box_move_refusals": list(box_refusals_holder["v"]),
+            "evidence": evidence_holder["v"],
+            "advisor_calls": advisor_calls_holder["v"],
         }
         # Summary BEFORE terminal state on every exit path.
         try:
@@ -2774,12 +4118,7 @@ def cmd_run(lane_id):
         return sum(1 for e in consults_done if e.get("step") == k)
 
     def consult_next_n():
-        m = 0
-        for e in consults_done:
-            try:
-                m = max(m, int(e.get("n") or 0))
-            except (TypeError, ValueError):
-                pass
+        m = _max_consult_n(consults_done)
         try:
             for fn in os.listdir(os.path.join(cwd, ".lane")):
                 if fn.startswith("ASK-") and fn.endswith(".md"):
@@ -2796,6 +4135,7 @@ def cmd_run(lane_id):
         status in {"ok", "timeout", "failed"}."""
         brief = ("You are answering one mid-step question from a Muse agent working in this directory.\n"
                  "Read-only: this session cannot write files. Do not modify, create, or delete anything. Do not run long commands.\n"
+                 "If this needs a lead decision (different acceptance, scope, or a product choice), answer with the first line ESCALATE: <one line>.\n"
                  "\n"
                  "Question from step %d (saved as .lane/ASK-%d.md):\n"
                  "\n%s\n"
@@ -2917,8 +4257,163 @@ def cmd_run(lane_id):
             return ("ok", text or "")
         return ("failed", text or "")
 
+    def run_advisor(k, n, question):
+        """One advisor call for ASK-n. Returns (status, text, advisor_error).
+
+        status in {"ok", "timeout", "failed"}; advisor_error is None for
+        "ok", else an exit-code-and-line string for the consult log. No
+        git before/after guard: Muse keeps working while a consult runs,
+        so its own edits would trip it. The read-only rail is the tool
+        list (--tools Read,Grep,Glob), enforced at start.
+        """
+        advisor_calls_holder["v"] = int(advisor_calls_holder.get("v") or 0) + 1
+        ask_name = "ASK-%d.md" % n
+        prompt = build_advisor_prompt(question, ask_name, accept_cmd, lane_scope, k, n)
+        prompt_path = os.path.join(ldir, "advisor-prompt-%d.md" % n)
+        try:
+            atomic_write_text(prompt_path, redact_text(prompt, secrets))
+        except OSError:
+            return ("failed", "", format_advisor_error(
+                None, "cannot write advisor prompt", "", secrets))
+        out_path = os.path.join(ldir, "advisor-%d.out" % n)
+        err_path = os.path.join(ldir, "advisor-%d.err" % n)
+        cfg_cmd = lane_config.get("advisor_cmd") if isinstance(lane_config, dict) else None
+        cmd = build_advisor_cmd(cfg_cmd, advisor_model, claude_bin)
+        slog("consult step %d #%d advisor (%s): %s" % (k, n, advisor_model, " ".join(cmd)))
+        try:
+            inf = open(prompt_path, "r", encoding="utf-8", errors="replace")
+            outf = open(out_path, "w", encoding="utf-8", errors="replace")
+            try:
+                os.fchmod(outf.fileno(), 0o600)
+            except OSError:
+                pass
+            ef = open(err_path, "w", encoding="utf-8", errors="replace")
+            try:
+                os.fchmod(ef.fileno(), 0o600)
+            except OSError:
+                pass
+        except OSError:
+            for _f in ("inf", "outf", "ef"):
+                try:
+                    locals()[_f].close()
+                except Exception:
+                    pass
+            return ("failed", "", format_advisor_error(
+                None, "cannot open advisor output files", "", secrets))
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, env=muse_env,
+                                    stdin=inf, stdout=outf, stderr=ef,
+                                    start_new_session=True)
+        except Exception as e:
+            try:
+                inf.close()
+            except Exception:
+                pass
+            try:
+                outf.close()
+            except Exception:
+                pass
+            try:
+                ef.close()
+            except Exception:
+                pass
+            slog("advisor spawn failed: %s" % e)
+            return ("failed", "", format_advisor_error(
+                None, "advisor spawn failed: %s" % e, "", secrets))
+        start_m = time.monotonic()
+        timed_out = False
+        rc = None
+        while True:
+            if stop_requested["flag"] or _stop_marker_present():
+                _kill_process_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    _kill_process_group(proc, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                try:
+                    inf.close()
+                except Exception:
+                    pass
+                try:
+                    outf.close()
+                except Exception:
+                    pass
+                try:
+                    ef.close()
+                except Exception:
+                    pass
+                redact_file_inplace(out_path, secrets)
+                redact_file_inplace(err_path, secrets)
+                return ("failed", "", None)
+            ret = proc.poll()
+            now_m = time.monotonic()
+            if ret is None and now_m - start_m >= advisor_timeout_sec:
+                timed_out = True
+                slog("consult step %d #%d advisor timed out after %.0fs" % (k, n, now_m - start_m))
+                _kill_process_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    _kill_process_group(proc, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                ret = proc.returncode
+            if ret is not None:
+                rc = ret
+                break
+            time.sleep(min(0.2, poll_sec))
+        try:
+            inf.close()
+        except Exception:
+            pass
+        try:
+            outf.close()
+        except Exception:
+            pass
+        try:
+            ef.close()
+        except Exception:
+            pass
+        _chmod_0600(out_path)
+        _chmod_0600(err_path)
+        redact_file_inplace(out_path, secrets)
+        redact_file_inplace(err_path, secrets)
+
+        def _adv_err(rc):
+            try:
+                with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+                    err_txt = f.read()
+            except OSError:
+                err_txt = ""
+            try:
+                with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+                    out_txt = f.read()
+            except OSError:
+                out_txt = ""
+            return format_advisor_error(rc, err_txt, out_txt, secrets)
+
+        if timed_out:
+            return ("timeout", "", _adv_err(rc))
+        if rc is not None and rc != 0:
+            return ("failed", "", _adv_err(rc))
+        try:
+            with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        return ("ok", (text or "")[:ADVISOR_ANSWER_CAP], None)
+
     def maybe_handle_consult(k):
-        """Answer one pending ASK.md for step k. True when one was handled."""
+        """Answer one pending ASK.md for step k.
+
+        True when one was handled, False when none was pending.
+        """
         lane_dot = os.path.join(cwd, ".lane")
         ask_path = os.path.join(lane_dot, "ASK.md")
         try:
@@ -2948,16 +4443,38 @@ def cmd_run(lane_id):
                                   "question_preview": redact_text(
                                       question[:CONSULT_QUESTION_PREVIEW], secrets),
                                   "answered": False, "helper": "limited",
+                                  "by": "muse", "escalated": False,
                                   "answer_preview": ""})
             slog("consult step %d #%d limited (max %d)" % (k, n, consult_max))
             return True
-        status, final_text = run_consult_helper(k, n, question)
+        use_advisor = bool(advisor_enabled and
+                           int(advisor_calls_holder.get("v") or 0) < advisor_max)
+        advisor_error = None
+        if use_advisor:
+            by = "claude-%s" % (advisor_model or ADVISOR_DEFAULT_MODEL)
+            status, payload, advisor_error = run_advisor(k, n, question)
+            if status in ("failed", "timeout") and not (
+                    stop_requested["flag"] or _stop_marker_present()):
+                # Advisor failure: the Muse helper answers the same
+                # question in this same consult. The failed call already counts.
+                slog("consult step %d #%d advisor %s (%s); falling back to muse" % (
+                    k, n, status, advisor_error or "no detail"))
+                use_advisor = False
+                by = "muse"
+                status, final_text = run_consult_helper(k, n, question)
+            else:
+                final_text = payload if status == "ok" else ""
+                advisor_error = None
+        else:
+            by = "muse"
+            status, final_text = run_consult_helper(k, n, question)
         ans_n = os.path.join(lane_dot, "ANSWER-%d.md" % n)
-        # The helper cannot write (--disable-write); its final answer text is
-        # the answer and the supervisor writes both files itself.
+        # Neither backend can write; its final answer text is the answer and
+        # the supervisor writes both files itself.
         answer = (final_text or "") if status == "ok" else ""
         answered = bool(answer.strip())
         fail_reason = ""
+        escalated = False
         if status == "ok" and not answered:
             # Completed but produced no answer text: the answer below falls
             # back to the failure text, so never report this as ok.
@@ -2965,18 +4482,50 @@ def cmd_run(lane_id):
             fail_reason = "completed with no answer text"
         elif status == "failed":
             fail_reason = "helper did not complete"
+        esc_reason = parse_escalate_reason(answer) if answered else None
+        if answered and esc_reason is not None:
+            escalated = True
+            reason_txt = (esc_reason or "").strip()
+            raise_needs_lead("question", reason_txt, step=k)
+            if reason_txt:
+                answer = ("The lead was asked about this question (ESCALATE: %s). "
+                          "Keep working on other parts or wait for a later ANSWER.md." % reason_txt)
+            else:
+                answer = ("The lead was asked about this question. "
+                          "Keep working on other parts or wait for a later ANSWER.md.")
+            try:
+                atomic_write_text(ans_n, answer + "\n")
+            except OSError:
+                pass
+            try:
+                atomic_write_text(os.path.join(lane_dot, "ANSWER.md"), answer + "\n")
+            except OSError:
+                pass
+            _ce = {"step": k, "n": n,
+                     "question_preview": redact_text(
+                         question[:CONSULT_QUESTION_PREVIEW], secrets),
+                     "answered": True, "helper": status,
+                     "by": by, "escalated": True,
+                     "answer_preview": redact_text(
+                         (final_text or "")[:CONSULT_ANSWER_PREVIEW], secrets)}
+            if advisor_error:
+                _ce["advisor_error"] = advisor_error
+            consults_done.append(_ce)
+            slog("consult step %d #%d %s by=%s escalated" % (k, n, status, by))
+            return True
         if answered:
             try:
                 atomic_write_text(ans_n, answer if answer.endswith("\n") else answer + "\n")
             except OSError:
                 pass
         if not answered:
+            who = "advisor" if use_advisor else "consult helper"
             if status == "timeout":
-                answer = ("The consult helper timed out; no answer is coming. "
-                          "Keep working without it.")
+                answer = ("The %s timed out; no answer is coming. "
+                          "Keep working without it." % who)
             else:
-                answer = ("The consult helper failed; no answer is coming. "
-                          "Keep working without it.")
+                answer = ("The %s failed; no answer is coming. "
+                          "Keep working without it." % who)
             try:
                 atomic_write_text(ans_n, answer + "\n")
             except OSError:
@@ -2986,16 +4535,20 @@ def cmd_run(lane_id):
                               answer if answer.endswith("\n") else answer + "\n")
         except OSError:
             pass
-        consults_done.append({"step": k, "n": n,
-                              "question_preview": redact_text(
-                                  question[:CONSULT_QUESTION_PREVIEW], secrets),
-                              "answered": answered, "helper": status,
-                              "answer_preview": redact_text(
-                                  answer[:CONSULT_ANSWER_PREVIEW], secrets)})
+        _ce = {"step": k, "n": n,
+                 "question_preview": redact_text(
+                     question[:CONSULT_QUESTION_PREVIEW], secrets),
+                 "answered": answered, "helper": status,
+                 "by": by, "escalated": False,
+                 "answer_preview": redact_text(
+                     answer[:CONSULT_ANSWER_PREVIEW], secrets)}
+        if advisor_error:
+            _ce["advisor_error"] = advisor_error
+        consults_done.append(_ce)
         if fail_reason:
-            slog("consult step %d #%d %s: %s" % (k, n, status, fail_reason))
+            slog("consult step %d #%d %s by=%s: %s" % (k, n, status, by, fail_reason))
         else:
-            slog("consult step %d #%d %s" % (k, n, status))
+            slog("consult step %d #%d %s by=%s" % (k, n, status, by))
         return True
 
     # ---- step execution (also used for post-review re-runs of the last step) ----
@@ -3188,6 +4741,12 @@ def cmd_run(lane_id):
                         try:
                             if maybe_handle_consult(k):
                                 activity = True
+                                # A consult blocks this loop, so now_m
+                                # predates it: restart the stall clock
+                                # from now, or a long consult eats the
+                                # stall budget.
+                                now_m = time.monotonic()
+                                last_activity_iso = now_iso()
                         except Exception as e:
                             slog("consult handling failed: %s" % e)
                     if activity:
@@ -3371,7 +4930,254 @@ def cmd_run(lane_id):
             # Should be unreachable (gave_up returns), but guard anyway.
             return finish_terminal("gave_up", k, MAX_ATTEMPTS, last_reason or "out of attempts",
                                    accept_exit, current_last_event, "")
+        if lane_scope:
+            try:
+                violating = scope_violating_paths(cwd, head_start, lane_scope)
+            except Exception as e:
+                slog("scope check failed: %s" % e)
+                violating = []
+            if violating:
+                detail = ", ".join(violating)[:SCOPE_DETAIL_CAP]
+                raise_needs_lead("scope_violation", detail, step=k)
+                reason = "scope violation: %s" % detail
+                last_reason = redact_text(reason, secrets)
+                try:
+                    _tail = tail_final
+                except NameError:
+                    _tail = ""
+                return finish_terminal("failed", k, n, last_reason,
+                                       accept_exit, current_last_event, _tail)
         return ("ok",)
+
+    # ---- box queue (tickets order accepts on one box) ----
+    def fresh_lane_box():
+        """Lane's box, re-read so an answer --box move lands mid-wait."""
+        try:
+            fresh = load_json(lane_path, None)
+            if isinstance(fresh, dict):
+                b = fresh.get("box")
+                if isinstance(b, str) and b.strip():
+                    return b.strip()
+        except Exception:
+            pass
+        try:
+            b0 = lane.get("box")
+            if isinstance(b0, str) and b0.strip():
+                return b0.strip()
+        except Exception:
+            pass
+        return None
+
+    def take_box_ticket(box):
+        """Take a ticket in box. Returns (ticket_name, queued_iso).
+
+        Clears this lane's stale tickets first (a resume re-queues fresh).
+        (None, None) degrades to an unguarded accept; the gate script stays
+        the real guard.
+        """
+        del pending_box_moves[:]
+        for stale_box, stale_fn in find_own_box_tickets(lane_id):
+            remove_box_ticket(stale_box, stale_fn)
+        bdir = os.path.join(boxes_root(), box)
+        try:
+            os.makedirs(bdir, exist_ok=True)
+        except OSError as e:
+            slog("box %s: cannot create ticket dir: %s" % (box, e))
+            return (None, None)
+        name = None
+        body = ""
+        for _try in range(2):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            name = "%s-%s" % (box_ticket_stamp(now), lane_id)
+            body = json.dumps({"lane": lane_id, "box": box,
+                               "queued_at": now.isoformat(),
+                               "pid": os.getpid()}) + "\n"
+            try:
+                fd = os.open(os.path.join(bdir, name),
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                time.sleep(0.002)
+                continue
+            except OSError as e:
+                slog("box %s: cannot take ticket: %s" % (box, e))
+                return (None, None)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(body)
+            except OSError as e:
+                slog("box %s: cannot write ticket: %s" % (box, e))
+                remove_box_ticket(box, name)
+                return (None, None)
+            return (name, now.isoformat())
+        slog("box %s: ticket name collision; proceeding without a ticket" % box)
+        return (None, None)
+
+    def release_box_ticket(ticket_name):
+        """Remove own tickets from every box dir; clear box holders. Idempotent.
+
+        Removes the named ticket plus any other own ticket: a lead move
+        may have renamed ours after we last looked.
+        """
+        if ticket_name:
+            broot = boxes_root()
+            try:
+                boxes = os.listdir(broot)
+            except OSError:
+                boxes = []
+            for box in boxes:
+                remove_box_ticket(box, ticket_name)
+        for _box, _fn in find_own_box_tickets(lane_id):
+            remove_box_ticket(_box, _fn)
+        box_state_holder["v"] = None
+        box_queued_at_holder["v"] = None
+
+    def wait_for_box(box, ticket_name, last_att0):
+        """Wait until our ticket is first among live tickets.
+
+        Returns ("held", box) or ("finished", code) after a stop. Heartbeats
+        state so the wait never reads as a stall; past the budget raises
+        box_wait_timeout once and keeps waiting in place. Lead box moves
+        (answer --box sidecars) are applied here, in the same poll
+        iteration that decides whether to hold: the move lands, the wait
+        clock resets, an open box_wait_timeout clears, then the hold is
+        decided. The box still comes from lane.json each poll and the
+        ticket is adopted from the box dir, so an orphaned direct move
+        also lands mid-wait.
+        """
+        box_queued_at_holder["v"] = now_iso()
+        box_state_holder["v"] = "queued"
+        set_phase("box_wait")
+        slog("box %s: queued with ticket %s" % (box, ticket_name))
+        # Inside the wait before the entry heartbeat: a sidecar already
+        # present merges as queued, not as "lane not waiting".
+        in_box_wait_holder["v"] = True
+        cur_box = box
+        head_cur, commits_cur = git_snapshot()
+        write_state("accepting", steps, last_att0, None, now_iso(),
+                    current_last_event, head_cur, commits_cur, "",
+                    None, None, last_reason)
+        wait_start_m = time.monotonic()
+        timeout_raised = False
+        last_update_m = 0.0
+        while True:
+            if stop_requested["flag"] or _stop_marker_present():
+                in_box_wait_holder["v"] = False
+                release_box_ticket(ticket_name)
+                return ("finished", finish_terminal("stopped", steps, last_att0,
+                                                    "stopped", None,
+                                                    current_last_event, ""))
+            merge_lead_sidecars()
+            if pending_box_moves:
+                # Supervisor-applied lead moves: lane.json and the ticket
+                # move here, before the hold decision below, so no
+                # check-then-move race can free the old box under us.
+                # Each move re-queues us at the back of the new box and
+                # restarts the wait timer and the once-per-wait flag.
+                while pending_box_moves:
+                    _mv = pending_box_moves.pop(0)
+                    _nb = _mv.get("box")
+                    if not isinstance(_nb, str) or box_name_error(_nb) is not None:
+                        slog("box move to %r ignored: invalid box name" % (_nb,))
+                        continue
+                    _nb = _nb.strip()
+                    try:
+                        _fresh_lane = load_json(lane_path, None)
+                        if isinstance(_fresh_lane, dict):
+                            _fresh_lane["box"] = _nb
+                            atomic_write_json(lane_path, _fresh_lane)
+                        try:
+                            lane["box"] = _nb
+                        except Exception:
+                            pass
+                    except OSError as e:
+                        slog("box move to %s failed: cannot write lane: %s" % (_nb, e))
+                        continue
+                    try:
+                        _moved = move_own_box_tickets(lane_id, _nb)
+                    except OSError as e:
+                        slog("box move to %s failed: cannot move ticket: %s" % (_nb, e))
+                        continue
+                    cur_box = _nb
+                    if _moved:
+                        ticket_name = _moved[-1]
+                    wait_start_m = time.monotonic()
+                    timeout_raised = False
+                    box_queued_at_holder["v"] = now_iso()
+                    _open = needs_lead_holder.get("current")
+                    if isinstance(_open, dict) and _open.get("kind") == "box_wait_timeout":
+                        needs_lead_holder["current"] = None
+                        slog("box %s: cleared open box_wait_timeout on lead move" % _nb)
+                    slog("box move to %s applied; re-queued with ticket %s" % (
+                        _nb, ticket_name))
+            fresh = fresh_lane_box()
+            if fresh:
+                cur_box = fresh
+            own = find_own_box_tickets(lane_id)
+            if not own:
+                # Ticket gone from every box dir: re-take our name here.
+                try:
+                    bdir = os.path.join(boxes_root(), cur_box)
+                    os.makedirs(bdir, exist_ok=True)
+                    fd = os.open(os.path.join(bdir, ticket_name),
+                                 os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                except (FileExistsError, OSError):
+                    pass
+                else:
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
+                            f.write(json.dumps(
+                                {"lane": lane_id, "box": cur_box,
+                                 "queued_at": box_queued_at_holder["v"],
+                                 "pid": os.getpid()}) + "\n")
+                    except OSError:
+                        pass
+                own = [(cur_box, ticket_name)]
+            own_here = sorted(fn for (b, fn) in own if b == cur_box)
+            if not own_here:
+                # Our ticket lives in another box dir: an external move is
+                # in flight. Wait for it; never read this as first place.
+                older = None
+            else:
+                if ticket_name not in own_here:
+                    # Adopted the moved ticket (fresh stamp, back of the
+                    # queue): the wait timer restarts with it.
+                    ticket_name = own_here[-1]
+                    wait_start_m = time.monotonic()
+                    timeout_raised = False
+                    box_queued_at_holder["v"] = now_iso()
+                    slog("box %s: adopted moved ticket %s" % (cur_box, ticket_name))
+                older = box_older_live_tickets(cur_box, ticket_name, lane_id)
+            if older is not None and not older:
+                break
+            now_m = time.monotonic()
+            if older and not timeout_raised and now_m - wait_start_m >= box_wait_max_sec:
+                raise_needs_lead(
+                    "box_wait_timeout",
+                    "box %s: queued past %.0fs budget; still queued (%d ahead)" % (
+                        cur_box, box_wait_max_sec, len(older)),
+                    step=steps)
+                timeout_raised = True
+            if now_m - last_update_m >= poll_sec:
+                head_cur, commits_cur = git_snapshot()
+                write_state("accepting", steps, last_att0, None, now_iso(),
+                            current_last_event, head_cur, commits_cur, "",
+                            None, None, last_reason)
+                last_update_m = now_m
+            time.sleep(min(0.2, poll_sec))
+        in_box_wait_holder["v"] = False
+        box_state_holder["v"] = "held"
+        cur_nl = needs_lead_holder["current"]
+        if isinstance(cur_nl, dict) and cur_nl.get("kind") == "box_wait_timeout":
+            # Got the box: an open wait timeout clears at once, so no
+            # stale timeout invites a move while the box is held.
+            needs_lead_holder["current"] = None
+            slog("box %s: holding; cleared open box_wait_timeout" % cur_box)
+        head_cur, commits_cur = git_snapshot()
+        write_state("accepting", steps, last_att0, None, now_iso(),
+                    current_last_event, head_cur, commits_cur, "",
+                    None, None, last_reason)
+        slog("box %s: holding with ticket %s" % (cur_box, ticket_name))
+        return ("held", cur_box)
 
     # ---- acceptance ----
     # Returns ("accept_done", rc_or_None, last_att, tail) when the accept
@@ -3406,6 +5212,12 @@ def cmd_run(lane_id):
         shell = "/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/sh"
         accept_log = os.path.join(ldir, "accept.log")
         secrets = union_secrets(secret_snapshot, secrets_from_env_file(env_file))
+        box_now = fresh_lane_box()
+        ticket_name = None
+        if box_now:
+            ticket_name, _queued_iso = take_box_ticket(box_now)
+            if ticket_name is not None:
+                box_queued_at_holder["v"] = _queued_iso
         slog("accepting: %s -c %s" % (shell, accept_cmd))
         head_cur, commits_cur = git_snapshot()
         last_k_hist0 = history.get(str(steps)) or []
@@ -3413,6 +5225,15 @@ def cmd_run(lane_id):
             last_att0 = int(last_k_hist0[-1].get("attempt", 1)) if last_k_hist0 else 1
         except Exception:
             last_att0 = 1
+        if ticket_name is not None:
+            _wres = wait_for_box(box_now, ticket_name, last_att0)
+            if _wres[0] == "finished":
+                return _wres[1]
+            box_now = _wres[1]
+        if box_now:
+            accept_env["LANE_BOX"] = box_now
+        else:
+            accept_env.pop("LANE_BOX", None)
         set_phase("accept")
         write_state("accepting", steps, last_att0,
                     None, now_iso(), current_last_event, head_cur, commits_cur, "",
@@ -3430,6 +5251,11 @@ def cmd_run(lane_id):
                 atomic_write_text(accept_log, reason + "\n")
             except OSError:
                 pass
+            _map = lane_config.get("accept_exit_kinds") or {}
+            _m127 = _map.get("127", _map.get(127)) if isinstance(_map, dict) else None
+            _k127 = _m127 if _m127 in ACCEPT_MAPPABLE_KINDS else "accept_failed_code"
+            raise_needs_lead(_k127, reason, step=steps)
+            release_box_ticket(ticket_name)
             return ("finished", finish_terminal("failed", steps, last_att0, reason, 127,
                                                 current_last_event, ""))
         try:
@@ -3446,6 +5272,11 @@ def cmd_run(lane_id):
                 atomic_write_text(accept_log, reason + "\n")
             except OSError:
                 pass
+            _map = lane_config.get("accept_exit_kinds") or {}
+            _m127 = _map.get("127", _map.get(127)) if isinstance(_map, dict) else None
+            _k127 = _m127 if _m127 in ACCEPT_MAPPABLE_KINDS else "accept_failed_code"
+            raise_needs_lead(_k127, reason, step=steps)
+            release_box_ticket(ticket_name)
             return ("finished", finish_terminal("failed", steps, last_att0, reason, 127,
                                                 current_last_event, ""))
         try:
@@ -3482,6 +5313,7 @@ def cmd_run(lane_id):
                     last_att = int(last_k_hist[-1].get("attempt", 1)) if last_k_hist else 1
                 except Exception:
                     last_att = 1
+                release_box_ticket(ticket_name)
                 return ("finished", finish_terminal("stopped", steps, last_att, "stopped", None,
                                                     current_last_event, ""))
             ret = aproc.poll()
@@ -3529,9 +5361,11 @@ def cmd_run(lane_id):
             alog_f.close()
         except Exception:
             pass
+        full_text = ""
         try:
             with open(accept_log, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.read().splitlines()
+            full_text = "\n".join(lines)
             atomic_write_text(accept_log, redact_text("\n".join(lines[-60:]) + ("\n" if lines else ""), secrets))
         except OSError:
             pass
@@ -3542,9 +5376,29 @@ def cmd_run(lane_id):
         except Exception:
             last_att = 1
         if timed_out:
+            last = parse_needs_lead_last(full_text)
+            if last is not None:
+                tk, td = accept_needs_lead_for_exit(124, full_text, lane_config)
+            else:
+                _map = lane_config.get("accept_exit_kinds") or {}
+                _m = _map.get("124", _map.get(124)) if isinstance(_map, dict) else None
+                tk = _m if _m in ACCEPT_MAPPABLE_KINDS else "accept_failed_code"
+                td = "accept timeout after 2h"
+            raise_needs_lead(tk, td, step=steps)
+            release_box_ticket(ticket_name)
             return ("finished", finish_terminal("failed", steps, last_att,
                                                 "accept timeout after 2h", 124,
                                                 current_last_event, ""))
+        if accept_rc is not None and accept_rc != 0:
+            if not full_text:
+                try:
+                    with open(accept_log, "r", encoding="utf-8", errors="replace") as f:
+                        full_text = f.read()
+                except (FileNotFoundError, OSError):
+                    full_text = ""
+            ak, ad = accept_needs_lead_for_exit(accept_rc, full_text, lane_config)
+            raise_needs_lead(ak, ad, step=steps)
+        release_box_ticket(ticket_name)
         return ("accept_done", accept_rc, last_att, "")
 
     def last_attempt_of_last_step():
@@ -3894,6 +5748,9 @@ def cmd_run(lane_id):
             return finish_terminal("done", steps, last_attempt_of_last_step(),
                                    last_reason, accept_exit, current_last_event, "")
         if rnd >= review_total:
+            _find = (rres[1] or "").strip()[:NEEDS_LEAD_DETAIL_CAP]
+            _det = _find or "pre-review FAILed with no fix re-runs left"
+            raise_needs_lead("review_failed", _det, step=steps)
             return finish_terminal("review_failed", steps, last_attempt_of_last_step(),
                                    "pre-review FAILed with no fix re-runs left",
                                    accept_exit, current_last_event, "")
@@ -3933,6 +5790,13 @@ def build_parser():
     ps.add_argument("--review-rounds", type=int, default=1, help="Max fix re-runs after a FAIL review (default: 1; 0 reviews once with no fix).")
     ps.add_argument("--consult-max", type=int, default=3, help="Max consult answers per step, 0 disables (default: 3).")
     ps.add_argument("--consult-timeout-min", type=float, default=15.0, help="Consult helper timeout in minutes (default: 15).")
+    ps.add_argument("--scope", dest="scope", action="append", default=None,
+                    help="Allowed path glob for changed files (repeatable; fnmatch, ** allowed).")
+    ps.add_argument("--box", default=None, help="Box name: accepts on one box run strictly in ticket order.")
+    ps.add_argument("--advisor-model", default=None, choices=["sonnet", "opus"],
+                    help="Advisor model (default with --advisor-max: sonnet; no flag = no advisor).")
+    ps.add_argument("--advisor-max", type=int, default=None,
+                    help="Advisor calls per lane (default with --advisor-model: 3).")
     pr = sub.add_parser("_run", help="Run the supervisor (internal).")
     pr.add_argument("id", help="Lane id.")
     pt = sub.add_parser("status", help="Show lane status.")
@@ -3953,6 +5817,15 @@ def build_parser():
     pa.add_argument("id", help="Lane id.")
     pa.add_argument("--orphan", action="store_true",
                     help="Claim the orphan announcement for the current incarnation.")
+    pa.add_argument("--lead", default=None,
+                    help="Claim the needs-lead announcement for this seq.")
+    pw = sub.add_parser("answer", help="Reply to a lane (writes .lane/ANSWER.md).")
+    pw.add_argument("id", help="Lane id.")
+    pw.add_argument("--text", default=None, help="Reply text.")
+    pw.add_argument("--text-file", default=None, help="File containing reply text.")
+    pw.add_argument("--box", default=None, help="Move the lane's box ticket to this box (back of its queue).")
+    pb = sub.add_parser("boxes", help="Show box queues and lease holders.")
+    pb.add_argument("--json", action="store_true", help="Print JSON list.")
     return p
 
 
@@ -3980,6 +5853,10 @@ def main(argv=None):
         return cmd_root(args)
     if args.cmd == "ack":
         return cmd_ack(args)
+    if args.cmd == "answer":
+        return cmd_answer(args)
+    if args.cmd == "boxes":
+        return cmd_boxes(args)
     parser.print_help()
     return 2
 
