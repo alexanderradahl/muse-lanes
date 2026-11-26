@@ -4661,7 +4661,12 @@ class TestQuotaUnits(LaneBase):
                                "--output-format", "stream-json", "--verbose",
                                "--permission-mode", "acceptEdits",
                                "--allowedTools",
-                               "Bash,Read,Edit,Write,Glob,Grep"])
+                               "Bash,Read,Edit,Write,Glob,Grep",
+                               "--append-system-prompt",
+                               "You are the executor for this lane. Do the brief yourself in this "
+                               "working directory. Do not run muse, muse exec or muse-lane, do not "
+                               "start or delegate to other agents or lanes, and do not hand work to "
+                               "another model."])
         over = mod.build_fallback_cmd("haiku", "/tmp/fake-claude")
         self.assertEqual(over[0], "/tmp/fake-claude")
         self.assertEqual(over[1:], cmd[1:])
@@ -4810,6 +4815,8 @@ class TestQuotaFallbackLane(LaneBase):
         self.assertTrue(fb_argvs, "fallback claude was never invoked")
         mod = _load_lane_module()
         self.assertEqual(fb_argvs[0], mod.build_fallback_cmd("haiku", fb))
+        self.assertEqual(fb_argvs[0][-2:], ["--append-system-prompt",
+                                            mod.QUOTA_FALLBACK_EXECUTOR_PROMPT])
         self.assertNotIn("QUOTA-BRIEF-MARKER-77", " ".join(fb_argvs[0]))
         # The fallback made the commit.
         r = subprocess.run(["git", "log", "--oneline"], cwd=self.cwd,

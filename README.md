@@ -178,8 +178,10 @@ attempt cap, stall detection, accept, pre-review and box handling are unchanged.
 without the quota words keeps today's retry behavior, and auth failures never switch.
 
 The fallback runs `claude -p` with the brief on stdin, in the same directory and environment as the Muse
-attempt. An attempt counts only when the last stream-json `result` event reports success. History,
-`state.json` and the summary record which executor ran each attempt (`muse` or `claude-<model>`).
+attempt. It appends a system instruction to do the brief itself instead of delegating, because the user's
+global instructions route code work to Muse, which is out of quota at that moment. An attempt counts only
+when the last stream-json `result` event reports success. History, `state.json` and the summary record
+which executor ran each attempt (`muse` or `claude-<model>`).
 
 - `MUSE_LANE_QUOTA_FALLBACK_MODEL` picks the model (default `haiku`); `CLAUDE_BIN` picks the binary.
 - `MUSE_LANE_QUOTA_FALLBACK=off` disables the feature. Both are stored with the lane, so resumes keep them.

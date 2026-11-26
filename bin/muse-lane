@@ -1709,7 +1709,12 @@ def _mentions_network(text):
 
 _QUOTA_RE = re.compile(r"quota exhausted|usage window resets", re.IGNORECASE)
 QUOTA_FALLBACK_DEFAULT_MODEL = "haiku"
-QUOTA_FALLBACK_QUOTA_WORDS = ("quota exhausted", "usage window resets")
+QUOTA_FALLBACK_EXECUTOR_PROMPT = (
+    "You are the executor for this lane. Do the brief yourself in this "
+    "working directory. Do not run muse, muse exec or muse-lane, do not "
+    "start or delegate to other agents or lanes, and do not hand work to "
+    "another model."
+)
 
 
 def _mentions_quota_exhausted(text):
@@ -1749,7 +1754,8 @@ def build_fallback_cmd(model, claude_bin=None):
     cmd = ["claude", "-p", "--model", str(model),
            "--output-format", "stream-json", "--verbose",
            "--permission-mode", "acceptEdits",
-           "--allowedTools", "Bash,Read,Edit,Write,Glob,Grep"]
+           "--allowedTools", "Bash,Read,Edit,Write,Glob,Grep",
+           "--append-system-prompt", QUOTA_FALLBACK_EXECUTOR_PROMPT]
     override = (claude_bin or "").strip() if isinstance(claude_bin, str) else ""
     if override:
         cmd[0] = override
