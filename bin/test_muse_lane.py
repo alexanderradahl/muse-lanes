@@ -259,6 +259,16 @@ elif mode == "writescope":
     time.sleep(float(os.environ.get("FAKE_SLEEP", "0.2")))
     emit(os.environ.get("FAKE_TEXT", "scope files written"))
     sys.exit(0)
+elif mode == "quota":
+    sys.stderr.write("API error 429: Subscription quota exhausted. Your usage window resets at 2026-11-26T00:00:00Z\n")
+    sys.stderr.flush()
+    time.sleep(0.1)
+    sys.exit(1)
+elif mode == "plain429":
+    sys.stderr.write("Error: 429 Too Many Requests\n")
+    sys.stderr.flush()
+    time.sleep(0.1)
+    sys.exit(1)
 else:
     emit("default final")
     sys.exit(0)
@@ -302,6 +312,60 @@ else:
 sys.stdout.write(_ans)
 sys.stdout.flush()
 sys.exit(int(os.environ.get("FAKE_CLAUDE_EXIT", "0") or "0"))
+"""
+
+FAKE_CLAUDE_FALLBACK = r"""#!/usr/bin/env python3
+import json, os, sys, time, subprocess
+try:
+    _brief = sys.stdin.read()
+except Exception:
+    _brief = ""
+_argv_file = os.environ.get("FAKE_ARGV_FILE", "")
+if _argv_file:
+    try:
+        with open(_argv_file, "a") as _af:
+            _af.write(json.dumps(sys.argv) + "\n")
+    except Exception:
+        pass
+_stdin_file = os.environ.get("FAKE_FALLBACK_STDIN_FILE", "")
+if _stdin_file:
+    try:
+        with open(_stdin_file, "w") as _sf:
+            _sf.write(_brief)
+    except Exception:
+        pass
+if os.environ.get("FAKE_FALLBACK_COMMIT", "") == "1":
+    try:
+        with open("fallback-made.txt", "a") as _f:
+            _f.write("fallback work %s\n" % time.time())
+        subprocess.run(["git", "add", "fallback-made.txt"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        subprocess.run(["git", "commit", "-m", "fallback work %s" % time.time()],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except Exception as _e:
+        sys.stderr.write("commit failed: %s\n" % _e)
+        sys.stderr.flush()
+sys.stdout.write(json.dumps({"type": "assistant", "message": "working"}) + "\n")
+sys.stdout.flush()
+time.sleep(float(os.environ.get("FAKE_SLEEP", "0.2")))
+mode = os.environ.get("FAKE_FALLBACK_MODE", "success")
+if mode == "success":
+    sys.stdout.write(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                 "result": os.environ.get("FAKE_FALLBACK_TEXT", "fallback final")}) + "\n")
+    sys.stdout.flush()
+    sys.exit(0)
+elif mode == "is_error":
+    sys.stdout.write(json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                                 "errors": [os.environ.get("FAKE_FALLBACK_ERROR", "claude blew up")]}) + "\n")
+    sys.stdout.flush()
+    sys.exit(1)
+elif mode == "no_result":
+    sys.exit(1)
+else:
+    sys.stdout.write(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                 "result": "default fallback final"}) + "\n")
+    sys.stdout.flush()
+    sys.exit(0)
 """
 
 
@@ -4575,6 +4639,319 @@ class TestBoxOrphanOrder(LaneBase):
         self.assertLessEqual(lane_mtime, ticket_mtime)
         self.assertEqual([fn for fn in os.listdir(self.lane_path(lid))
                           if fn.startswith("lead-")], [])
+
+
+class TestQuotaUnits(LaneBase):
+    def test_mentions_quota_exhausted(self):
+        mod = _load_lane_module()
+        m = mod._mentions_quota_exhausted
+        self.assertTrue(m("API error 429: Subscription quota exhausted. "
+                           "Your usage window resets at 2026-11-26T00:00:00Z"))
+        self.assertTrue(m("QUOTA EXHAUSTED"))
+        self.assertTrue(m("your Usage Window Resets soon"))
+        self.assertFalse(m("429 Too Many Requests"))
+        self.assertFalse(m("HTTP 503 Service Unavailable"))
+        self.assertFalse(m(""))
+        self.assertFalse(m(None))
+
+    def test_build_fallback_cmd(self):
+        mod = _load_lane_module()
+        cmd = mod.build_fallback_cmd("haiku", None)
+        self.assertEqual(cmd, ["claude", "-p", "--model", "haiku",
+                               "--output-format", "stream-json", "--verbose",
+                               "--permission-mode", "acceptEdits",
+                               "--allowedTools",
+                               "Bash,Read,Edit,Write,Glob,Grep"])
+        over = mod.build_fallback_cmd("haiku", "/tmp/fake-claude")
+        self.assertEqual(over[0], "/tmp/fake-claude")
+        self.assertEqual(over[1:], cmd[1:])
+        blank = mod.build_fallback_cmd("sonnet", "  ")
+        self.assertEqual(blank[0], "claude")
+        self.assertIn("sonnet", blank)
+
+    def test_fallback_model_and_toggle_env(self):
+        mod = _load_lane_module()
+        self.assertEqual(mod.quota_fallback_model({}), "haiku")
+        self.assertEqual(
+            mod.quota_fallback_model({"MUSE_LANE_QUOTA_FALLBACK_MODEL": "sonnet"}),
+            "sonnet")
+        self.assertEqual(
+            mod.quota_fallback_model({"MUSE_LANE_QUOTA_FALLBACK_MODEL": "  "}),
+            "haiku")
+        self.assertTrue(mod.quota_fallback_enabled({}))
+        self.assertTrue(mod.quota_fallback_enabled({"MUSE_LANE_QUOTA_FALLBACK": ""}))
+        self.assertTrue(mod.quota_fallback_enabled({"MUSE_LANE_QUOTA_FALLBACK": "on"}))
+        self.assertFalse(mod.quota_fallback_enabled({"MUSE_LANE_QUOTA_FALLBACK": "off"}))
+        self.assertFalse(mod.quota_fallback_enabled({"MUSE_LANE_QUOTA_FALLBACK": "OFF"}))
+
+    def test_history_executor_defaults_muse(self):
+        mod = _load_lane_module()
+        self.assertEqual(mod.history_executor({}), "muse")
+        self.assertEqual(mod.history_executor({"executor": None}), "muse")
+        self.assertEqual(mod.history_executor({"executor": "claude-haiku"}),
+                         "claude-haiku")
+
+    def _write_jsonl(self, name, objs):
+        p = os.path.join(self.state_dir, name)
+        with open(p, "w") as f:
+            for o in objs:
+                f.write(json.dumps(o) + "\n")
+        return p
+
+    def test_check_claude_completion(self):
+        mod = _load_lane_module()
+        ok_p = self._write_jsonl("c-ok.jsonl", [
+            {"type": "assistant", "message": "working"},
+            {"type": "result", "subtype": "success", "is_error": False,
+             "result": "CLAUDE-FINAL-1"},
+        ])
+        ok, text = mod.check_claude_completion(ok_p)
+        self.assertTrue(ok)
+        self.assertEqual(text, "CLAUDE-FINAL-1")
+        err_p = self._write_jsonl("c-err.jsonl", [
+            {"type": "result", "subtype": "error_during_execution",
+             "is_error": True, "errors": ["boom"]},
+        ])
+        self.assertEqual(mod.check_claude_completion(err_p), (False, None))
+        wrong_p = self._write_jsonl("c-wrong.jsonl", [
+            {"type": "result", "subtype": "error_max_turns", "is_error": False,
+             "result": "partial"},
+        ])
+        self.assertEqual(mod.check_claude_completion(wrong_p), (False, None))
+        missing_p = self._write_jsonl("c-missing.jsonl", [
+            {"type": "assistant", "message": "working"},
+        ])
+        self.assertEqual(mod.check_claude_completion(missing_p), (False, None))
+        # Last result event wins.
+        last_err = self._write_jsonl("c-last-err.jsonl", [
+            {"type": "result", "subtype": "success", "is_error": False,
+             "result": "first"},
+            {"type": "result", "subtype": "error_during_execution",
+             "is_error": True},
+        ])
+        self.assertEqual(mod.check_claude_completion(last_err), (False, None))
+        last_ok = self._write_jsonl("c-last-ok.jsonl", [
+            {"type": "result", "subtype": "error_during_execution",
+             "is_error": True},
+            {"type": "result", "subtype": "success", "is_error": False,
+             "result": "second"},
+        ])
+        ok2, text2 = mod.check_claude_completion(last_ok)
+        self.assertTrue(ok2)
+        self.assertEqual(text2, "second")
+
+    def test_claude_failure_reason(self):
+        mod = _load_lane_module()
+        p = self._write_jsonl("c-reason.jsonl", [
+            {"type": "result", "subtype": "error_during_execution",
+             "is_error": True, "errors": ["429 overloaded"]},
+        ])
+        rsn = mod.claude_failure_reason(p)
+        self.assertIn("error_during_execution", rsn)
+        self.assertIn("429 overloaded", rsn)
+        missing = self._write_jsonl("c-reason-missing.jsonl", [
+            {"type": "assistant", "message": "working"},
+        ])
+        self.assertEqual(mod.claude_failure_reason(missing), "")
+        # A Claude 429 classifies retryable through the existing rules.
+        cls, _ = mod.classify_failure("failed", rsn, "", 1)
+        self.assertEqual(cls, "retryable")
+        cls2, _ = mod.classify_failure("failed", "claude blew up", "", 1)
+        self.assertEqual(cls2, "once")
+        cls3, _ = mod.classify_failure("failed", "401 Unauthorized", "", 1)
+        self.assertEqual(cls3, "fatal")
+
+
+class TestQuotaFallbackLane(LaneBase):
+    def _write_fallback_claude(self, name="claude-fb"):
+        p = os.path.join(self.fakebin, name)
+        with open(p, "w") as f:
+            f.write(FAKE_CLAUDE_FALLBACK)
+        os.chmod(p, 0o755)
+        return p
+
+    def test_quota_switches_to_claude_and_completes(self):
+        self.init_git_repo()
+        fb = self._write_fallback_claude()
+        argv_file = os.path.join(self.state_dir, "argv-fb.log")
+        stdin_file = os.path.join(self.state_dir, "fb-stdin.txt")
+        b = self.write_brief("b1.md", "QUOTA-BRIEF-MARKER-77 do the thing")
+        lid = self.start_lane([b], env_extra={
+            "FAKE_MODE": "quota",
+            "CLAUDE_BIN": fb,
+            "FAKE_ARGV_FILE": argv_file,
+            "FAKE_FALLBACK_STDIN_FILE": stdin_file,
+            "FAKE_FALLBACK_COMMIT": "1",
+            "FAKE_FALLBACK_TEXT": "FALLBACK-FINAL-88",
+        })
+        self.wait_status(lid, "done", timeout=25)
+        self.wait_file(self.lane_path(lid, "summary.md"), timeout=10)
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        h = hist["1"]
+        self.assertEqual(len(h), 2)
+        self.assertEqual(h[0].get("executor"), "muse")
+        self.assertFalse(h[0].get("ok"))
+        self.assertEqual(h[1].get("executor"), "claude-haiku")
+        self.assertTrue(h[1].get("ok"))
+        with open(self.lane_path(lid, "step1-final.md")) as f:
+            self.assertIn("FALLBACK-FINAL-88", f.read())
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("claude-haiku", summ)
+        self.assertIn("Muse quota exhausted", summ)
+        self.assertIn("Quota fallback", summ)
+        # The brief went over stdin, never argv.
+        with open(stdin_file) as f:
+            self.assertIn("QUOTA-BRIEF-MARKER-77", f.read())
+        with open(argv_file) as f:
+            argvs = [json.loads(ln) for ln in f.read().splitlines() if ln.strip()]
+        fb_argvs = [a for a in argvs if a and a[0] == fb]
+        self.assertTrue(fb_argvs, "fallback claude was never invoked")
+        mod = _load_lane_module()
+        self.assertEqual(fb_argvs[0], mod.build_fallback_cmd("haiku", fb))
+        self.assertNotIn("QUOTA-BRIEF-MARKER-77", " ".join(fb_argvs[0]))
+        # The fallback made the commit.
+        r = subprocess.run(["git", "log", "--oneline"], cwd=self.cwd,
+                           capture_output=True, text=True, timeout=15)
+        self.assertIn("fallback work", r.stdout)
+        st = self.read_state(lid)
+        self.assertEqual(st.get("executor"), "claude-haiku")
+        lane = self.read_lane(lid)
+        self.assertIn("MUSE_LANE_QUOTA_FALLBACK", lane.get("exec_env") or {})
+        self.assertIn("MUSE_LANE_QUOTA_FALLBACK_MODEL", lane.get("exec_env") or {})
+
+    def test_next_step_tries_muse_first(self):
+        fb = self._write_fallback_claude()
+        b1 = self.write_brief("b1.md", "step one work")
+        b2 = self.write_brief("b2.md", "step two work")
+        lid = self.start_lane([b1, b2], env_extra={
+            "FAKE_MODE": "quota",
+            "CLAUDE_BIN": fb,
+            "FAKE_FALLBACK_TEXT": "STEP-FINAL",
+        })
+        self.wait_status(lid, "done", timeout=30)
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        for step in ("1", "2"):
+            h = hist[step]
+            self.assertEqual(len(h), 2, "step %s: %r" % (step, h))
+            self.assertEqual(h[0].get("executor"), "muse")
+            self.assertFalse(h[0].get("ok"))
+            self.assertEqual(h[1].get("executor"), "claude-haiku")
+            self.assertTrue(h[1].get("ok"))
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertIn("Step 1 attempt(s) 2 ran on claude-haiku", summ)
+        self.assertIn("Step 2 attempt(s) 2 ran on claude-haiku", summ)
+
+    def test_fallback_model_env(self):
+        fb = self._write_fallback_claude()
+        argv_file = os.path.join(self.state_dir, "argv-model.log")
+        b = self.write_brief("b1.md", "model env work")
+        lid = self.start_lane([b], env_extra={
+            "FAKE_MODE": "quota",
+            "CLAUDE_BIN": fb,
+            "FAKE_ARGV_FILE": argv_file,
+            "MUSE_LANE_QUOTA_FALLBACK_MODEL": "sonnet",
+            "FAKE_FALLBACK_TEXT": "SONNET-FINAL",
+        })
+        self.wait_status(lid, "done", timeout=25)
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        h = hist["1"]
+        self.assertEqual(h[1].get("executor"), "claude-sonnet")
+        with open(argv_file) as f:
+            argvs = [json.loads(ln) for ln in f.read().splitlines() if ln.strip()]
+        fb_argvs = [a for a in argvs if a and a[0] == fb]
+        self.assertTrue(fb_argvs)
+        self.assertIn("sonnet", fb_argvs[0])
+
+    def test_fallback_off_retries_muse_to_gave_up(self):
+        b = self.write_brief("b1.md", "quota off work")
+        lid = self.start_lane([b], env_extra={
+            "FAKE_MODE": "quota",
+            "MUSE_LANE_QUOTA_FALLBACK": "off",
+        })
+        self.wait_status(lid, "gave_up", timeout=40)
+        st = self.read_state(lid)
+        self.assertEqual(st["attempt"], 6)
+        self.assertEqual(st.get("executor"), "muse")
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        h = hist["1"]
+        self.assertEqual(len(h), 6)
+        for e in h:
+            self.assertEqual(e.get("executor"), "muse")
+        with open(self.lane_path(lid, "summary.md")) as f:
+            summ = f.read()
+        self.assertNotIn("claude-", summ)
+        self.assertNotIn("Quota fallback", summ)
+
+    def test_claude_is_error_is_failed_attempt(self):
+        fb = self._write_fallback_claude()
+        b = self.write_brief("b1.md", "claude error work")
+        lid = self.start_lane([b], env_extra={
+            "FAKE_MODE": "quota",
+            "CLAUDE_BIN": fb,
+            "FAKE_FALLBACK_MODE": "is_error",
+            "FAKE_FALLBACK_ERROR": "claude blew up 99",
+        })
+        self.wait_status(lid, "gave_up", timeout=40)
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        h = hist["1"]
+        # Attempt 1 fails on muse quota; attempts 2-3 fail on Claude and the
+        # second "once" gives up, still on the fallback.
+        self.assertEqual(len(h), 3)
+        self.assertEqual(h[0].get("executor"), "muse")
+        self.assertEqual(h[1].get("executor"), "claude-haiku")
+        self.assertFalse(h[1].get("ok"))
+        self.assertEqual(h[1].get("class"), "once")
+        self.assertIn("claude blew up 99", h[1].get("reason") or "")
+        self.assertEqual(h[2].get("executor"), "claude-haiku")
+        self.assertFalse(h[2].get("ok"))
+
+    def test_claude_missing_result_is_failed_attempt(self):
+        fb = self._write_fallback_claude()
+        b = self.write_brief("b1.md", "claude missing result work")
+        lid = self.start_lane([b], env_extra={
+            "FAKE_MODE": "quota",
+            "CLAUDE_BIN": fb,
+            "FAKE_FALLBACK_MODE": "no_result",
+        })
+        self.wait_status(lid, "gave_up", timeout=60)
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        h = hist["1"]
+        self.assertEqual(len(h), 6)
+        self.assertEqual(h[0].get("executor"), "muse")
+        for e in h[1:]:
+            self.assertEqual(e.get("executor"), "claude-haiku")
+            self.assertFalse(e.get("ok"))
+
+    def test_plain_429_never_falls_back(self):
+        fb = self._write_fallback_claude()
+        argv_file = os.path.join(self.state_dir, "argv-plain.log")
+        b = self.write_brief("b1.md", "plain 429 work")
+        lid = self.start_lane([b], env_extra={
+            "FAKE_MODE": "plain429",
+            "CLAUDE_BIN": fb,
+            "FAKE_ARGV_FILE": argv_file,
+        })
+        self.wait_status(lid, "gave_up", timeout=40)
+        with open(self.lane_path(lid, "history.json")) as f:
+            hist = json.load(f)
+        h = hist["1"]
+        self.assertEqual(len(h), 6)
+        for e in h:
+            self.assertEqual(e.get("executor"), "muse")
+        if os.path.exists(argv_file):
+            with open(argv_file) as f:
+                argvs = [json.loads(ln) for ln in f.read().splitlines()
+                         if ln.strip()]
+            self.assertFalse([a for a in argvs if a and a[0] == fb],
+                             "fallback claude must never run for a plain 429")
 
 
 if __name__ == "__main__":

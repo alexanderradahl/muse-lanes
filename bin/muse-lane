@@ -1707,6 +1707,131 @@ def _mentions_network(text):
     return bool(_NETWORK_RE.search(text))
 
 
+_QUOTA_RE = re.compile(r"quota exhausted|usage window resets", re.IGNORECASE)
+QUOTA_FALLBACK_DEFAULT_MODEL = "haiku"
+QUOTA_FALLBACK_QUOTA_WORDS = ("quota exhausted", "usage window resets")
+
+
+def _mentions_quota_exhausted(text):
+    """True when text names Muse subscription quota exhaustion.
+
+    Only the quota words count: a bare 429 or 5xx without them is not
+    quota exhaustion and keeps today's retry behavior.
+    """
+    if not text:
+        return False
+    return bool(_QUOTA_RE.search(text))
+
+
+def quota_fallback_enabled(env):
+    """False only when MUSE_LANE_QUOTA_FALLBACK=off (case-insensitive)."""
+    try:
+        v = (env.get("MUSE_LANE_QUOTA_FALLBACK", "") or "").strip().lower()
+    except Exception:
+        return True
+    return v != "off"
+
+
+def quota_fallback_model(env):
+    """Model for the Claude quota fallback (default haiku)."""
+    try:
+        m = (env.get("MUSE_LANE_QUOTA_FALLBACK_MODEL", "") or "").strip()
+    except Exception:
+        m = ""
+    return m or QUOTA_FALLBACK_DEFAULT_MODEL
+
+
+def build_fallback_cmd(model, claude_bin=None):
+    """Argv for a Claude quota-fallback attempt; stdin carries the brief.
+
+    $CLAUDE_BIN overrides argv[0], the same way build_advisor_cmd does.
+    """
+    cmd = ["claude", "-p", "--model", str(model),
+           "--output-format", "stream-json", "--verbose",
+           "--permission-mode", "acceptEdits",
+           "--allowedTools", "Bash,Read,Edit,Write,Glob,Grep"]
+    override = (claude_bin or "").strip() if isinstance(claude_bin, str) else ""
+    if override:
+        cmd[0] = override
+    return cmd
+
+
+def history_executor(entry):
+    """Executor tag for a history entry; old entries without the key are muse."""
+    try:
+        return entry.get("executor") or "muse"
+    except Exception:
+        return "muse"
+
+
+def get_claude_result(jsonl_path):
+    """Last {"type": "result"} event in a Claude stream-json log, or None."""
+    last = None
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (FileNotFoundError, OSError):
+        return None
+    for line in content.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            last = obj
+    return last
+
+
+def check_claude_completion(jsonl_path):
+    """(ok, text) for a Claude fallback attempt.
+
+    Ok only when the last result event has subtype "success" and
+    is_error false; text is then the result field. A missing result
+    event is a failure.
+    """
+    res = get_claude_result(jsonl_path)
+    if not isinstance(res, dict):
+        return (False, None)
+    if res.get("subtype") == "success" and not res.get("is_error"):
+        text = res.get("result") or ""
+        if not isinstance(text, str):
+            try:
+                text = str(text)
+            except Exception:
+                text = ""
+        return (True, text)
+    return (False, None)
+
+
+def claude_failure_reason(jsonl_path):
+    """Reason text from the last Claude result event, or "" when missing."""
+    res = get_claude_result(jsonl_path)
+    if not isinstance(res, dict):
+        return ""
+    parts = []
+    subtype = res.get("subtype")
+    if isinstance(subtype, str) and subtype.strip():
+        parts.append(subtype.strip()[:200])
+    for key in ("result", "error", "message"):
+        v = res.get(key)
+        if isinstance(v, str) and v.strip():
+            parts.append(v.strip()[:500])
+    errors = res.get("errors")
+    if isinstance(errors, list):
+        for e in errors:
+            if isinstance(e, str) and e.strip():
+                parts.append(e.strip()[:500])
+            elif isinstance(e, dict):
+                try:
+                    parts.append(json.dumps(e)[:500])
+                except Exception:
+                    pass
+    return "\n".join(parts)
+
+
 def _stderr_tail(stderr_text, max_lines=CLASSIFY_TAIL_LINES):
     return "\n".join((stderr_text or "").splitlines()[-max_lines:])
 
@@ -1990,16 +2115,23 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
                 n = int(e.get("attempt", "?"))
             except Exception:
                 n = "?"
+            ex_tag = ""
+            try:
+                _ex = e.get("executor") or "muse"
+            except Exception:
+                _ex = "muse"
+            if _ex != "muse":
+                ex_tag = " [%s]" % _ex
             if e.get("ok"):
-                parts.append("attempt %s: ok" % n)
+                parts.append("attempt %s: ok%s" % (n, ex_tag))
             else:
                 xc = e.get("exit")
                 term = e.get("terminal")
                 cls = e.get("class")
                 rsn = e.get("reason") or "failed"
-                parts.append("attempt %s: exit %s terminal %s class %s %s" % (
+                parts.append("attempt %s: exit %s terminal %s class %s %s%s" % (
                     n, xc if xc is not None else "?", term or "none",
-                    cls or "?", rsn))
+                    cls or "?", rsn, ex_tag))
         lines.append("- Step %d: %d attempt(s) (%s)" % (k, len(h), "; ".join(parts)))
         for e in h:
             try:
@@ -2010,9 +2142,38 @@ def write_summary_file(ldir, final_status, ended_at=None, final_state=None,
             term = e.get("terminal")
             cls = e.get("class")
             rsn = e.get("reason") or ("ok" if e.get("ok") else "failed")
-            lines.append("  - step %d attempt %s: exit=%s terminal=%s class=%s reason=%s" % (
-                k, n, xc if xc is not None else "-", term or "-",
-                cls or ("ok" if e.get("ok") else "-"), rsn))
+            try:
+                _ex = e.get("executor") or "muse"
+            except Exception:
+                _ex = "muse"
+            if _ex != "muse":
+                lines.append("  - step %d attempt %s: exit=%s terminal=%s class=%s reason=%s executor=%s" % (
+                    k, n, xc if xc is not None else "-", term or "-",
+                    cls or ("ok" if e.get("ok") else "-"), rsn, _ex))
+            else:
+                lines.append("  - step %d attempt %s: exit=%s terminal=%s class=%s reason=%s" % (
+                    k, n, xc if xc is not None else "-", term or "-",
+                    cls or ("ok" if e.get("ok") else "-"), rsn))
+    fallback_runs = []
+    for k in range(1, steps + 1):
+        h = history.get(str(k)) or history.get(k) or []
+        by_exec = {}
+        for e in h:
+            ex = history_executor(e)
+            if ex == "muse":
+                continue
+            try:
+                n = int(e.get("attempt", "?"))
+            except Exception:
+                n = "?"
+            by_exec.setdefault(ex, []).append(n)
+        for ex in sorted(by_exec):
+            ns = ", ".join(str(n) for n in by_exec[ex])
+            fallback_runs.append("Step %d attempt(s) %s ran on %s" % (k, ns, ex))
+    if fallback_runs:
+        lines.append("")
+        lines.append("## Quota fallback (Muse quota exhausted)")
+        lines.extend("- %s" % r for r in fallback_runs)
     # Last 15 redacted stderr lines of the final attempt.
     try:
         fk, fn = None, None
@@ -2563,6 +2724,11 @@ def cmd_start(args):
         exec_env["PATH"] = os.environ.get("PATH", "") or ""
     except Exception:
         exec_env["PATH"] = ""
+    for _qk in ("MUSE_LANE_QUOTA_FALLBACK", "MUSE_LANE_QUOTA_FALLBACK_MODEL"):
+        try:
+            exec_env[_qk] = os.environ.get(_qk, "") or ""
+        except Exception:
+            exec_env[_qk] = ""
     for k, v in os.environ.items():
         if k.startswith("MUSE_LANE_"):
             try:
@@ -2642,6 +2808,7 @@ def cmd_start(args):
         "box_move_refusals": [],
         "evidence": None,
         "advisor_calls": 0,
+        "executor": "muse",
     }
     atomic_write_json(os.path.join(ldir, "state.json"), queued_state)
     pid = spawn_supervisor(lane_id)
@@ -3665,6 +3832,9 @@ def cmd_run(lane_id):
     if advisor_timeout_sec <= 0:
         advisor_timeout_sec = 1.0
     claude_bin = (eff.get("CLAUDE_BIN", "") or "").strip()
+    quota_fallback_on = quota_fallback_enabled(eff)
+    quota_fallback_model_name = quota_fallback_model(eff)
+    quota_fallback_tag = "claude-%s" % quota_fallback_model_name
     try:
         box_wait_max_sec = float(lane_config_early.get("box_wait_max_min", 30)) * 60.0
     except (TypeError, ValueError):
@@ -3802,6 +3972,12 @@ def cmd_run(lane_id):
         _ac = 0
     advisor_calls_holder = {"v": _ac}
     evidence_holder = {"v": (prev_state or {}).get("evidence")}
+    executor_holder = {"v": (prev_state or {}).get("executor") or "muse"}
+    try:
+        _resumed_step = int((prev_state or {}).get("step") or 0)
+    except (TypeError, ValueError):
+        _resumed_step = 0
+    _resumed_executor = (prev_state or {}).get("executor") or "muse"
     lane_scope = list(lane.get("scope") or []) if isinstance(lane.get("scope"), list) else []
     lane_config = lane.get("config") if isinstance(lane.get("config"), dict) else {}
     current_last_event = (prev_state or {}).get("last_event")
@@ -3995,6 +4171,7 @@ def cmd_run(lane_id):
             "box_move_refusals": list(box_refusals_holder["v"]),
             "evidence": evidence_holder["v"],
             "advisor_calls": advisor_calls_holder["v"],
+            "executor": executor_holder["v"],
         }
         for k, v in list(st.items()):
             if isinstance(v, str):
@@ -4073,6 +4250,7 @@ def cmd_run(lane_id):
             "box_move_refusals": list(box_refusals_holder["v"]),
             "evidence": evidence_holder["v"],
             "advisor_calls": advisor_calls_holder["v"],
+            "executor": executor_holder["v"],
         }
         # Summary BEFORE terminal state on every exit path.
         try:
@@ -4559,6 +4737,11 @@ def cmd_run(lane_id):
         if stop_requested["flag"] or _stop_marker_present():
             return finish_terminal("stopped", k, n_start,
                                    "stopped", accept_exit, current_last_event, "")
+        # Quota fallback: while Muse is out of quota the rest of this step
+        # runs on Claude. Each step tries Muse first; a resume mid-step
+        # stays on the executor the step was already using.
+        use_fallback = bool(quota_fallback_on and _resumed_executor != "muse"
+                             and k == _resumed_step)
         step_done = False
         for n in range(n_start, MAX_ATTEMPTS + 1):
             if stop_requested["flag"] or _stop_marker_present():
@@ -4576,13 +4759,20 @@ def cmd_run(lane_id):
                         pass
             jsonl_path = os.path.join(ldir, "step%d-attempt%d.jsonl" % (k, n))
             err_path = os.path.join(ldir, "step%d-attempt%d.err" % (k, n))
-            cmd = [muse_bin, "exec", "--prompt-file", brief_path,
-                   "--trust-workspace", "--approval-mode", "never",
-                   "--disable-approval", "--reasoning-effort", effort, "--json",
-                   # Owner 2026-10-16: no network from inside Muse's shell sandbox (two lanes built ssh stand-ins
-                   # to reach the lab runner with ~/.ssh keys). Remote steps run in the unsandboxed accept.
-                   "--sandbox-network", os.environ.get("MUSE_LANE_SANDBOX_NETWORK", "restricted")]
-            slog("step %d attempt %d: %s" % (k, n, " ".join(cmd)))
+            executor = quota_fallback_tag if use_fallback else "muse"
+            executor_holder["v"] = executor
+            if use_fallback:
+                cmd = build_fallback_cmd(quota_fallback_model_name, claude_bin)
+                slog("step %d attempt %d on %s (Muse quota exhausted): %s" % (
+                    k, n, executor, " ".join(cmd)))
+            else:
+                cmd = [muse_bin, "exec", "--prompt-file", brief_path,
+                       "--trust-workspace", "--approval-mode", "never",
+                       "--disable-approval", "--reasoning-effort", effort, "--json",
+                       # Owner 2026-10-16: no network from inside Muse's shell sandbox (two lanes built ssh stand-ins
+                       # to reach the lab runner with ~/.ssh keys). Remote steps run in the unsandboxed accept.
+                       "--sandbox-network", os.environ.get("MUSE_LANE_SANDBOX_NETWORK", "restricted")]
+                slog("step %d attempt %d: %s" % (k, n, " ".join(cmd)))
             head0, commits0 = git_snapshot()
             last_activity_iso = now_iso()
             write_state("running", k, n, None, last_activity_iso, current_last_event,
@@ -4611,15 +4801,49 @@ def cmd_run(lane_id):
                 last_reason = reason
                 history.setdefault(str(k), []).append({
                     "attempt": n, "reason": reason, "ok": False,
-                    "class": "fatal", "terminal": None, "exit": None})
+                    "class": "fatal", "terminal": None, "exit": None,
+                    "executor": executor})
                 save_history()
                 return finish_terminal("gave_up", k, n, reason, accept_exit,
                                        current_last_event, "")
+            stdin_arg = subprocess.DEVNULL
+            brief_in = None
+            if use_fallback:
+                # The brief goes over stdin, never argv (it may hold secrets).
+                try:
+                    brief_in = open(brief_path, "r", encoding="utf-8",
+                                    errors="replace")
+                except OSError as e:
+                    brief_in = None
+                    try:
+                        jf.close()
+                    except Exception:
+                        pass
+                    try:
+                        ef.close()
+                    except Exception:
+                        pass
+                    reason = redact_text(
+                        "cannot open brief for fallback stdin: %s" % e, secrets)
+                    last_reason = reason
+                    history.setdefault(str(k), []).append({
+                        "attempt": n, "reason": reason, "ok": False,
+                        "class": "fatal", "terminal": None, "exit": None,
+                        "executor": executor})
+                    save_history()
+                    return finish_terminal("gave_up", k, n, reason, accept_exit,
+                                           current_last_event, "")
+                stdin_arg = brief_in
             try:
                 proc = subprocess.Popen(cmd, cwd=cwd, env=muse_env,
-                                        stdin=subprocess.DEVNULL, stdout=jf, stderr=ef,
+                                        stdin=stdin_arg, stdout=jf, stderr=ef,
                                         start_new_session=True)
             except Exception as e:
+                if brief_in is not None:
+                    try:
+                        brief_in.close()
+                    except Exception:
+                        pass
                 try:
                     jf.close()
                 except Exception:
@@ -4635,12 +4859,19 @@ def cmd_run(lane_id):
                 last_reason = reason
                 history.setdefault(str(k), []).append({
                     "attempt": n, "reason": reason, "ok": False,
-                    "class": cls, "terminal": None, "exit": None})
+                    "class": cls, "terminal": None, "exit": None,
+                    "executor": executor})
                 save_history()
                 redact_file_inplace(jsonl_path, secrets)
                 redact_file_inplace(err_path, secrets)
                 return finish_terminal("gave_up", k, n, reason, accept_exit,
                                        current_last_event, "")
+            if brief_in is not None:
+                # The child has its own copy of the fd; ours can close now.
+                try:
+                    brief_in.close()
+                except Exception:
+                    pass
             # Poll loop for this attempt.
             try:
                 muse_started = get_start_time(proc.pid)
@@ -4757,7 +4988,10 @@ def cmd_run(lane_id):
                             # Completed-then-hung: the JSONL already has a
                             # completion, the process just never exited. Kill
                             # it and treat the attempt as completed.
-                            hung_ok, _ = check_completion(jsonl_path)
+                            if use_fallback:
+                                hung_ok, _ = check_claude_completion(jsonl_path)
+                            else:
+                                hung_ok, _ = check_completion(jsonl_path)
                             slog("step %d attempt %d stalled after %.1fs; killing pgid %d" % (k, n, now_m - last_activity_m, proc.pid))
                             _kill_process_group(proc, signal.SIGTERM)
                             try:
@@ -4815,9 +5049,18 @@ def cmd_run(lane_id):
             ev, _ = read_last_json_info(jsonl_path)
             if ev is not None:
                 current_last_event = redact_text(ev, secrets)
-            verdict = get_terminal_verdict(jsonl_path)
-            v_term = verdict.get("terminal") if verdict.get("has_event") else None
-            v_reason = verdict.get("reason") or ""
+            if use_fallback:
+                # A Claude error result classifies like a muse model
+                # failure (auth fatal, 429/5xx/network retryable, else
+                # once); a missing result classifies like a crash.
+                if get_claude_result(jsonl_path) is None:
+                    v_term, v_reason = None, ""
+                else:
+                    v_term, v_reason = "failed", claude_failure_reason(jsonl_path)
+            else:
+                verdict = get_terminal_verdict(jsonl_path)
+                v_term = verdict.get("terminal") if verdict.get("has_event") else None
+                v_reason = verdict.get("reason") or ""
             if stalled:
                 cls, reason = classify_failure(v_term, v_reason or "stalled",
                                                stderr_full, exit_code, stalled=True)
@@ -4827,7 +5070,8 @@ def cmd_run(lane_id):
                 redact_file_inplace(err_path, secrets)
                 history.setdefault(str(k), []).append({
                     "attempt": n, "reason": reason, "ok": False,
-                    "class": cls, "terminal": v_term, "exit": exit_code})
+                    "class": cls, "terminal": v_term, "exit": exit_code,
+                    "executor": executor})
                 save_history()
                 slog("step %d attempt %d failed: %s [%s]" % (k, n, reason, cls))
                 if cls == "fatal":
@@ -4854,7 +5098,10 @@ def cmd_run(lane_id):
                     return finish_terminal("stopped", k, n, "stopped", accept_exit,
                                            current_last_event, tail_final)
                 continue
-            ok, text = check_completion(jsonl_path)
+            if use_fallback:
+                ok, text = check_claude_completion(jsonl_path)
+            else:
+                ok, text = check_completion(jsonl_path)
             redact_file_inplace(jsonl_path, secrets)
             redact_file_inplace(err_path, secrets)
             tail_final = "\n".join(read_tail_filtered(err_path))
@@ -4872,7 +5119,8 @@ def cmd_run(lane_id):
                     slog("failed to write final: %s" % e)
                 history.setdefault(str(k), []).append({
                     "attempt": n, "reason": None, "ok": True,
-                    "class": "ok", "terminal": "completed", "exit": exit_code})
+                    "class": "ok", "terminal": "completed", "exit": exit_code,
+                    "executor": executor})
                 save_history()
                 slog("step %d completed on attempt %d" % (k, n))
                 step_done = True
@@ -4891,9 +5139,24 @@ def cmd_run(lane_id):
             last_reason = reason
             history.setdefault(str(k), []).append({
                 "attempt": n, "reason": reason, "ok": False,
-                "class": cls, "terminal": v_term, "exit": exit_code})
+                "class": cls, "terminal": v_term, "exit": exit_code,
+                "executor": executor})
             save_history()
             slog("step %d attempt %d failed: %s [%s terminal=%s]" % (k, n, reason, cls, v_term))
+            if (not use_fallback and quota_fallback_on and cls != "fatal"
+                    and _mentions_quota_exhausted(
+                        base_reason + "\n" + _stderr_tail(stderr_full))):
+                # Muse is out of quota: the next attempt of this step runs
+                # on Claude instead, with no backoff wait. Auth (fatal)
+                # never switches.
+                use_fallback = True
+                executor_holder["v"] = quota_fallback_tag
+                slog("step %d: Muse quota exhausted; attempt %d runs on %s" % (
+                    k, n + 1, quota_fallback_tag))
+                if n >= MAX_ATTEMPTS:
+                    return finish_terminal("gave_up", k, n, reason, accept_exit,
+                                           current_last_event, tail_final)
+                continue
             if cls == "fatal":
                 return finish_terminal("gave_up", k, n, reason, accept_exit,
                                        current_last_event, tail_final)

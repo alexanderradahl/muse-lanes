@@ -169,6 +169,22 @@ reads files only, runs with mods and hooks off, and sees the lane's accept comma
 either: a question that needs a different acceptance, scope or product decision comes back `ESCALATE:` and
 wakes the lead. Every call is logged in the summary with who answered and whether it escalated.
 
+## Quota fallback
+
+When Muse reports subscription quota exhaustion (`quota exhausted` or `usage window resets` in an
+attempt's failure), the lane runs the rest of that step on Claude Haiku through the Claude CLI instead of
+burning retries on Muse. Each step tries Muse first; the switch happens with no backoff wait, and the
+attempt cap, stall detection, accept, pre-review and box handling are unchanged. A plain 429 or 5xx
+without the quota words keeps today's retry behavior, and auth failures never switch.
+
+The fallback runs `claude -p` with the brief on stdin, in the same directory and environment as the Muse
+attempt. An attempt counts only when the last stream-json `result` event reports success. History,
+`state.json` and the summary record which executor ran each attempt (`muse` or `claude-<model>`).
+
+- `MUSE_LANE_QUOTA_FALLBACK_MODEL` picks the model (default `haiku`); `CLAUDE_BIN` picks the binary.
+- `MUSE_LANE_QUOTA_FALLBACK=off` disables the feature. Both are stored with the lane, so resumes keep them.
+- Pre-review and consult helpers always stay on Muse.
+
 ## Boxes
 
 `box` on `lane_start` hands the lane a gate box. Before each accept the supervisor takes a ticket in

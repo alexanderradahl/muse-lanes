@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.1 — 2026-11-26
+
+- Quota fallback: while Muse reports subscription quota exhaustion (`quota exhausted` / `usage window
+  resets`), the rest of the step runs on Claude Haiku through the Claude CLI instead of burning retries to
+  `gave_up`. Each step tries Muse first; the switch skips the backoff wait and the attempt cap, stall
+  detection, accept, pre-review and box handling are unchanged.
+- The fallback runs `claude -p --model <model> --output-format stream-json` with the brief on stdin. An
+  attempt counts only when the last `result` event has subtype `success` and `is_error` false; other
+  results classify through the existing rules (429/5xx/network retryable, auth fatal, else once), and a
+  missing result is a failure.
+- History entries and `state.json` record the executor (`muse` or `claude-<model>`); the summary names
+  which steps and attempts ran on the fallback and why.
+- `MUSE_LANE_QUOTA_FALLBACK_MODEL` (default `haiku`) picks the model, `CLAUDE_BIN` picks the binary, and
+  `MUSE_LANE_QUOTA_FALLBACK=off` disables the feature. Both settings are stored with the lane, so resumes
+  keep them. Pre-review and consult helpers stay on Muse.
+
 ## 0.3.0 — 2026-11-06
 
 One lead runs a fleet of lanes directly. Design: [docs/v0.3-plan.md](docs/v0.3-plan.md).
